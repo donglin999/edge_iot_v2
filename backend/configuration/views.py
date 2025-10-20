@@ -60,6 +60,87 @@ class DeviceViewSet(viewsets.ModelViewSet):
             return Response(serializer.data)
         return super().list(request, *args, **kwargs)
 
+    @extend_schema(summary="获取设备的所有测点", responses=serializers.PointSerializer(many=True))
+    @action(detail=True, methods=["get"], url_path="points")
+    def list_points(self, request, pk=None):
+        """获取设备下的所有测点"""
+        device = self.get_object()
+        points = device.points.select_related("template", "channel").order_by("code")
+        serializer = serializers.PointSerializer(points, many=True, context={"request": request})
+        return Response(serializer.data)
+
+    @extend_schema(summary="获取设备统计信息")
+    @action(detail=True, methods=["get"], url_path="stats")
+    def stats(self, request, pk=None):
+        """获取设备统计信息"""
+        device = self.get_object()
+
+        # 统计测点数量
+        total_points = device.points.count()
+
+        # 统计关联的任务
+        related_tasks = models.AcqTask.objects.filter(points__device=device).distinct()
+        task_count = related_tasks.count()
+
+        # 查找最近的采集会话
+        from acquisition import models as acq_models
+        recent_session = acq_models.AcquisitionSession.objects.filter(
+            task__points__device=device
+        ).order_by("-started_at").first()
+
+        last_acquisition = None
+        if recent_session and recent_session.started_at:
+            last_acquisition = recent_session.started_at.isoformat()
+
+        stats = {
+            "total_points": total_points,
+            "task_count": task_count,
+            "last_acquisition": last_acquisition,
+            "related_tasks": [
+                {
+                    "id": task.id,
+                    "code": task.code,
+                    "name": task.name,
+                    "is_active": task.is_active,
+                }
+                for task in related_tasks[:5]  # 最多返回5个
+            ]
+        }
+
+        return Response(stats)
+
+    @extend_schema(summary="测试设备连接")
+    @action(detail=True, methods=["post"], url_path="test-connection")
+    def test_connection(self, request, pk=None):
+        """测试设备连接"""
+        device = self.get_object()
+
+        # 调用采集模块的连接测试
+        from acquisition import tasks as acq_tasks
+
+        try:
+            # 异步测试连接
+            result = acq_tasks.test_protocol_connection.delay(
+                protocol=device.protocol,
+                host=device.ip_address,
+                port=device.port or 502,
+            )
+
+            # 等待结果（最多5秒）
+            test_result = result.get(timeout=5)
+
+            return Response({
+                "success": test_result.get("success", False),
+                "message": test_result.get("message", "连接测试完成"),
+                "details": test_result
+            })
+        except Exception as e:
+            return Response({
+                "success": False,
+                "message": f"连接测试失败: {str(e)}",
+                "details": {}
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 @extend_schema_view(
     list=extend_schema(summary="列出通道"),
@@ -167,6 +248,33 @@ class AcqTaskViewSet(viewsets.ModelViewSet):
         task: models.AcqTask = self.get_object()
         serializer = serializers.TaskControlSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        # 检查是否已有运行中的会话（使用acquisition模块的模型）
+        from acquisition import models as acq_models
+        active_session = acq_models.AcquisitionSession.objects.filter(
+            task=task,
+            status__in=[
+                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_RUNNING,
+            ]
+        ).first()
+
+        if active_session:
+            return Response(
+                {
+                    "detail": f"任务 {task.code} 已在运行中",
+                    "session_id": active_session.id,
+                    "status": active_session.status,
+                    "started_at": active_session.started_at,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 启动Celery任务
+        from acquisition import tasks as acq_tasks
+        celery_result = acq_tasks.start_acquisition_task.delay(task.id)
+
+        # 创建TaskRun记录（兼容旧系统）
         worker_identifier = serializer.validated_data.get("worker")
         worker = None
         if worker_identifier:
@@ -179,9 +287,18 @@ class AcqTaskViewSet(viewsets.ModelViewSet):
             worker=worker,
             status=models.TaskRun.STATUS_RUNNING,
             started_at=timezone.now(),
-            context={"note": serializer.validated_data.get("note")},
+            context={
+                "note": serializer.validated_data.get("note"),
+                "celery_task_id": celery_result.id,
+            },
         )
-        return Response({"detail": "任务已启动", "run_id": run.id})
+
+        return Response({
+            "detail": "任务已启动",
+            "run_id": run.id,
+            "celery_task_id": celery_result.id,
+            "message": "请通过 /api/acquisition/sessions/active/ 查询会话状态"
+        })
 
     @extend_schema(summary="停止采集任务", request=serializers.TaskControlSerializer)
     @action(detail=True, methods=["post"], url_path="stop")
@@ -189,18 +306,44 @@ class AcqTaskViewSet(viewsets.ModelViewSet):
         task: models.AcqTask = self.get_object()
         serializer = serializers.TaskControlSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+
+        # 查找运行中的会话（使用acquisition模块的模型）
+        from acquisition import models as acq_models, tasks as acq_tasks
+        active_session = acq_models.AcquisitionSession.objects.filter(
+            task=task,
+            status__in=[
+                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_RUNNING,
+            ]
+        ).order_by("-started_at").first()
+
+        if not active_session:
+            return Response(
+                {"detail": "未找到运行中的会话"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 发送停止Celery任务
+        acq_tasks.stop_acquisition_task.delay(active_session.id)
+
+        # 更新TaskRun记录（兼容旧系统）
         run = task.runs.filter(status=models.TaskRun.STATUS_RUNNING).order_by("-created_at").first()
-        if not run:
-            return Response({"detail": "未找到运行中的任务实例"}, status=status.HTTP_400_BAD_REQUEST)
-        run.status = models.TaskRun.STATUS_STOPPED
-        run.finished_at = timezone.now()
-        context = run.context or {}
-        note = serializer.validated_data.get("note")
-        if note:
-            context["note"] = note
-        run.context = context
-        run.save(update_fields=["status", "finished_at", "context", "updated_at"])
-        return Response({"detail": "任务已停止", "run_id": run.id})
+        if run:
+            run.status = models.TaskRun.STATUS_STOPPED
+            run.finished_at = timezone.now()
+            context = run.context or {}
+            note = serializer.validated_data.get("note")
+            if note:
+                context["note"] = note
+            context["stopped_via_api"] = True
+            run.context = context
+            run.save(update_fields=["status", "finished_at", "context", "updated_at"])
+
+        return Response({
+            "detail": "停止指令已发送",
+            "session_id": active_session.id,
+            "run_id": run.id if run else None,
+        })
 
 
 @extend_schema_view(
@@ -259,9 +402,17 @@ class ImportJobViewSet(
 
         site_code = request.data.get("site_code") or summary.get("site_code") or "default"
         created_by = request.data.get("created_by") or job.triggered_by or (request.user.username if request.user.is_authenticated else "system")
+        mode = request.data.get("mode", "merge")  # Default to merge mode
+
+        # Validate mode
+        if mode not in ("replace", "merge", "append"):
+            return Response(
+                {"detail": f"无效的导入模式: {mode}，必须是 replace、merge 或 append"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         service = ExcelImportService(job, path)
-        result = service.apply(site_code=site_code, created_by=created_by)
+        result = service.apply(site_code=site_code, created_by=created_by, mode=mode)
         return Response({"detail": "配置已写入", "result": result})
 
     @extend_schema(summary="查看导入差异", responses=serializers.ImportDiffSerializer)
@@ -292,3 +443,58 @@ class ConfigVersionViewSet(
 
     queryset = models.ConfigVersion.objects.select_related("task").order_by("-created_at")
     serializer_class = serializers.ConfigVersionSerializer
+
+    def get_queryset(self):
+        """Filter by task_id if provided."""
+        queryset = super().get_queryset()
+        task_id = self.request.query_params.get("task_id")
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
+        return queryset
+
+    @extend_schema(summary="回滚到指定配置版本")
+    @action(detail=True, methods=["post"], url_path="rollback")
+    def rollback(self, request, pk=None):
+        """回滚到指定版本的配置."""
+        version = self.get_object()
+        task = version.task
+
+        # 检查任务是否在运行中
+        from acquisition import models as acq_models
+        active_session = acq_models.AcquisitionSession.objects.filter(
+            task=task,
+            status__in=[
+                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_RUNNING,
+            ]
+        ).first()
+
+        if active_session:
+            return Response(
+                {"detail": f"任务 {task.code} 正在运行中，无法回滚配置。请先停止任务。"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 创建新版本作为回滚版本
+        latest = task.versions.order_by("-version").first()
+        next_version = (latest.version if latest else 0) + 1
+
+        created_by = (
+            request.user.username if request.user.is_authenticated
+            else request.data.get("created_by", "system")
+        )
+
+        new_version = models.ConfigVersion.objects.create(
+            task=task,
+            version=next_version,
+            summary=f"回滚到版本 {version.version}",
+            created_by=created_by,
+            payload=version.payload,  # Copy payload from the target version
+        )
+
+        return Response({
+            "detail": f"已回滚到版本 {version.version}",
+            "new_version_id": new_version.id,
+            "new_version_number": new_version.version,
+            "rollback_from_version": version.version,
+        })

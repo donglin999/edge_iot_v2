@@ -66,16 +66,31 @@ const DeviceListPage = () => {
       <div className="device-grid">
         {devices.map((device) => (
           <article key={device.id} className="card">
-            <h3>{device.name || device.code}</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3>{device.name || device.code}</h3>
+              <a
+                href={`/devices/${device.id}`}
+                style={{
+                  padding: '0.3rem 0.8rem',
+                  backgroundColor: '#007bff',
+                  color: 'white',
+                  textDecoration: 'none',
+                  borderRadius: '4px',
+                  fontSize: '0.9rem',
+                }}
+              >
+                查看详情
+              </a>
+            </div>
             <p>
               <strong>协议：</strong> {device.protocol.toUpperCase()}
             </p>
             <p>
               <strong>地址：</strong> {device.ip_address}:{device.port ?? '-'}
             </p>
-            <h4>测点列表</h4>
+            <h4>测点列表 ({(points[device.id] || []).length} 个)</h4>
             <ul>
-              {(points[device.id] || []).map((point) => (
+              {(points[device.id] || []).slice(0, 5).map((point) => (
                 <li key={point.id}>
                   <span>{point.code}</span>
                   <span className={`status-tag ${point.to_kafka ? 'status-tag--success' : ''}`}>
@@ -85,6 +100,11 @@ const DeviceListPage = () => {
                 </li>
               ))}
               {!(points[device.id]?.length) && <li>暂无测点</li>}
+              {(points[device.id]?.length || 0) > 5 && (
+                <li style={{ color: '#666', fontStyle: 'italic' }}>
+                  ... 还有 {(points[device.id]?.length || 0) - 5} 个测点，<a href={`/devices/${device.id}`}>查看全部</a>
+                </li>
+              )}
             </ul>
           </article>
         ))}

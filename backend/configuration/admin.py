@@ -25,8 +25,8 @@ class ChannelAdmin(admin.ModelAdmin):
 
 @admin.register(models.Point)
 class PointAdmin(admin.ModelAdmin):
-    list_display = ("code", "device", "address", "to_kafka")
-    list_filter = ("device", "to_kafka")
+    list_display = ("code", "device", "address")
+    list_filter = ("device",)
     search_fields = ("code", "address")
 
 

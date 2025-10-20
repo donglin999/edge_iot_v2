@@ -29,7 +29,6 @@ const DashboardPage = () => {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
 
   const fetchOverview = useCallback(async () => {
     const response = await fetch('/api/config/tasks/overview/?site_code=default');
@@ -65,22 +64,6 @@ const DashboardPage = () => {
     load();
   }, [fetchOverview, fetchTasks]);
 
-  const triggerTaskAction = async (taskId: number, action: 'start' | 'stop') => {
-    setActionError(null);
-    try {
-      const response = await fetch(`/api/config/tasks/${taskId}/${action}/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ worker: 'frontend-ui' }),
-      });
-      if (!response.ok) {
-        throw new Error(await response.text());
-      }
-      await Promise.all([fetchOverview(), fetchTasks()]);
-    } catch (err) {
-      setActionError((err as Error).message);
-    }
-  };
 
   return (
     <section>
@@ -112,14 +95,15 @@ const DashboardPage = () => {
       )}
 
       <h3>任务列表</h3>
-      {actionError && <p className="error">操作失败：{actionError}</p>}
+      <p style={{ marginBottom: '1rem' }}>
+        查看任务列表，前往 <a href="/acquisition" style={{ color: '#007bff', textDecoration: 'underline' }}>采集控制</a> 页面进行启动/停止操作。
+      </p>
       <table className="table">
         <thead>
           <tr>
             <th>任务编码</th>
             <th>名称</th>
             <th>启用状态</th>
-            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -128,19 +112,11 @@ const DashboardPage = () => {
               <td>{task.code}</td>
               <td>{task.name}</td>
               <td>{task.is_active ? '启用' : '停用'}</td>
-              <td>
-                <button type="button" onClick={() => triggerTaskAction(task.id, 'start')} className="action-btn">
-                  启动
-                </button>
-                <button type="button" onClick={() => triggerTaskAction(task.id, 'stop')} className="action-btn action-btn--secondary">
-                  停止
-                </button>
-              </td>
             </tr>
           ))}
           {!tasks.length && (
             <tr>
-              <td colSpan={4}>暂无任务</td>
+              <td colSpan={3}>暂无任务</td>
             </tr>
           )}
         </tbody>

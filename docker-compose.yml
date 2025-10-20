@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis-iot
+    ports:
+      - "6379:6379"
+    networks:
+      - iot-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb-iot
+    ports:
+      - "8086:8086"
+    networks:
+      - iot-network
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
+      - DOCKER_INFLUXDB_INIT_ORG=edge-iot
+      - DOCKER_INFLUXDB_INIT_BUCKET=iot-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  django:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: django-iot
+    ports:
+      - "8000:8000"
+    networks:
+      - iot-network
+    volumes:
+      - ./backend:/app
+      - ./backend/db.sqlite3:/app/db.sqlite3
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=redis-iot
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+    command: python manage.py runserver 0.0.0.0:8000
+
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: celery-iot
+    networks:
+      - iot-network
+    volumes:
+      - ./backend:/app
+      - ./backend/db.sqlite3:/app/db.sqlite3
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=redis-iot
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+    command: celery -A control_plane worker -l info --pool=solo
+
+networks:
+  iot-network:
+    driver: bridge
+
+volumes:
+  influxdb-data:
+  influxdb-config:

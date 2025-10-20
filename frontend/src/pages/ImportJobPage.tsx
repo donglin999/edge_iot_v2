@@ -28,6 +28,7 @@ const ImportJobPage = () => {
   const [applyResult, setApplyResult] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [importMode, setImportMode] = useState<'replace' | 'merge' | 'append'>('merge');
   const dropRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -105,7 +106,7 @@ const ImportJobPage = () => {
       const response = await fetch(`/api/config/import-jobs/${result.id}/apply/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ mode: importMode }),
       });
       if (!response.ok) {
         throw new Error(await response.text());
@@ -159,6 +160,29 @@ const ImportJobPage = () => {
         <div className="card">
           <h3>校验结果</h3>
           <pre>{JSON.stringify(result.summary, null, 2)}</pre>
+
+          <div style={{ marginTop: '1rem', marginBottom: '1rem' }}>
+            <label htmlFor="import-mode" style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
+              导入模式：
+            </label>
+            <select
+              id="import-mode"
+              value={importMode}
+              onChange={(e) => setImportMode(e.target.value as 'replace' | 'merge' | 'append')}
+              style={{ padding: '0.5rem', fontSize: '1rem', marginRight: '1rem' }}
+            >
+              <option value="merge">合并模式（默认）- 更新已有记录，创建新记录</option>
+              <option value="replace">替换模式 - 删除站点所有数据后重新导入</option>
+              <option value="append">追加模式 - 仅创建新记录，不修改已有记录</option>
+            </select>
+          </div>
+
+          {importMode === 'replace' && (
+            <p style={{ color: '#d32f2f', marginBottom: '1rem', padding: '0.5rem', backgroundColor: '#fff3e0', border: '1px solid #ff9800' }}>
+              ⚠️ 警告：替换模式将删除站点下所有设备、测点和任务，请谨慎操作！
+            </p>
+          )}
+
           <button onClick={handleApply} disabled={loading}>写入配置库</button>
         </div>
       )}

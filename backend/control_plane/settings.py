@@ -25,15 +25,18 @@ ALLOWED_HOSTS = env.list("ALLOWED_HOSTS") or _default_allowed_hosts
 SECRET_KEY = env("SECRET_KEY")
 
 INSTALLED_APPS = [
+    "daphne",  # Must be first for ASGI support
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "channels",  # WebSocket support
     "rest_framework",
     "drf_spectacular",
     "configuration.apps.ConfigurationConfig",
+    "acquisition.apps.AcquisitionConfig",
 ]
 
 MIDDLEWARE = [
@@ -107,6 +110,105 @@ SPECTACULAR_SETTINGS = {
 
 CELERY_BROKER_URL = env.str("CELERY_BROKER_URL", default="redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = env.str("CELERY_RESULT_BACKEND", default=CELERY_BROKER_URL)
-CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=DEBUG)
+# IMPORTANT: Always use Celery worker for async tasks, never run in Django process
+CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
 CELERY_TASK_EAGER_PROPAGATES = env.bool("CELERY_TASK_EAGER_PROPAGATES", default=True)
 CELERY_TASK_TIME_LIMIT = env.int("CELERY_TASK_TIME_LIMIT", default=600)
+
+# InfluxDB Settings
+INFLUXDB_HOST = env.str("INFLUXDB_HOST", default="localhost")
+INFLUXDB_PORT = env.int("INFLUXDB_PORT", default=8086)
+INFLUXDB_TOKEN = env.str("INFLUXDB_TOKEN", default="")
+INFLUXDB_ORG = env.str("INFLUXDB_ORG", default="default")
+INFLUXDB_BUCKET = env.str("INFLUXDB_BUCKET", default="default")
+
+# Kafka Settings (Optional)
+KAFKA_ENABLED = env.bool("KAFKA_ENABLED", default=False)
+KAFKA_BOOTSTRAP_SERVERS = env.str("KAFKA_BOOTSTRAP_SERVERS", default="localhost:9092")
+KAFKA_TOPIC = env.str("KAFKA_TOPIC", default="acquisition_data")
+
+# Logging Configuration
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "{levelname} {asctime} {module} {process:d} {thread:d} {message}",
+            "style": "{",
+        },
+        "simple": {
+            "format": "{levelname} {asctime} {module} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "level": "INFO",
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+        "file": {
+            "level": "INFO",
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(BASE_DIR / "logs" / "application.log"),
+            "maxBytes": 10485760,
+            "backupCount": 5,
+            "formatter": "verbose",
+        },
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+        },
+        "acquisition": {
+            "handlers": ["console", "file"],
+            "level": "DEBUG",
+            "propagate": False,
+        },
+        "storage": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+    "root": {
+        "handlers": ["console", "file"],
+        "level": "INFO",
+    },
+}
+
+
+# ========================================
+# Django Channels Configuration
+# ========================================
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [(
+                env.str("REDIS_HOST", default="127.0.0.1"),
+                env.int("REDIS_PORT", default=6379),
+            )],
+            "capacity": 1500,  # Maximum number of messages in a channel
+            "expiry": 10,  # Message expiry in seconds
+        },
+    },
+}
+
+# ========================================
+# Acquisition Service Configuration
+# ========================================
+
+# Batch size for data collection before writing to storage
+ACQUISITION_BATCH_SIZE = env.int("ACQUISITION_BATCH_SIZE", default=50)
+
+# Maximum time to wait before flushing batch (seconds)
+ACQUISITION_BATCH_TIMEOUT = env.float("ACQUISITION_BATCH_TIMEOUT", default=5.0)
+
+# Connection timeout - mark device as timeout after this period without successful read (seconds)
+ACQUISITION_CONNECTION_TIMEOUT = env.float("ACQUISITION_CONNECTION_TIMEOUT", default=30.0)
+
+# Maximum number of consecutive reconnection attempts before giving up
+ACQUISITION_MAX_RECONNECT_ATTEMPTS = env.int("ACQUISITION_MAX_RECONNECT_ATTEMPTS", default=3)

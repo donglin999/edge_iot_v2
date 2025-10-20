@@ -80,7 +80,6 @@ class PointSerializer(serializers.ModelSerializer):
             "address",
             "description",
             "sample_rate_hz",
-            "to_kafka",
             "extra",
             "created_at",
             "updated_at",

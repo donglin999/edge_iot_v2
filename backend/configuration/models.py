@@ -94,7 +94,6 @@ class Point(TimeStampedModel):
     address = models.CharField(max_length=128)
     description = models.CharField(max_length=255, blank=True)
     sample_rate_hz = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal("1.00"))
-    to_kafka = models.BooleanField(default=False)
     extra = models.JSONField(default=dict, blank=True)
 
     class Meta:

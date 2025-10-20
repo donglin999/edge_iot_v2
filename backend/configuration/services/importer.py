@@ -199,19 +199,63 @@ class ExcelImportService:
         }
 
     @transaction.atomic
-    def apply(self, site_code: str = "default", created_by: str = "") -> Dict[str, object]:
+    def apply(self, site_code: str = "default", created_by: str = "", mode: str = "merge") -> Dict[str, object]:
+        """
+        应用配置到数据库。
+
+        Args:
+            site_code: 站点编码
+            created_by: 创建者
+            mode: 导入模式
+                - "replace": 替换模式 - 删除站点下所有设备和任务后重新导入
+                - "merge": 合并模式 - 更新已有记录，创建新记录（默认）
+                - "append": 追加模式 - 仅创建新记录，不修改已有记录
+
+        Returns:
+            导入结果统计
+        """
         df = self.load_dataframe()
         site, _ = models.Site.objects.get_or_create(
             code=site_code,
             defaults={"name": site_code, "description": "自动创建"},
         )
 
+        # Replace mode: delete all existing data for this site
+        if mode == "replace":
+            # Get all task IDs associated with this site's devices
+            task_ids = list(models.AcqTask.objects.filter(
+                points__device__site=site
+            ).distinct().values_list('id', flat=True))
+
+            # Also find orphaned tasks (tasks with no points)
+            orphaned_task_ids = list(models.AcqTask.objects.filter(
+                points__isnull=True
+            ).distinct().values_list('id', flat=True))
+
+            # Combine both sets of task IDs
+            all_task_ids = list(set(task_ids + orphaned_task_ids))
+
+            deleted_tasks = len(all_task_ids)
+            deleted_devices = models.Device.objects.filter(site=site).count()
+
+            logger.info(f"Replace mode: deleting {deleted_tasks} tasks (including {len(orphaned_task_ids)} orphaned) and {deleted_devices} devices for site {site_code}")
+
+            # Delete tasks first (to avoid orphaned tasks)
+            if all_task_ids:
+                models.AcqTask.objects.filter(id__in=all_task_ids).delete()
+
+            # Then delete devices (cascade deletes points)
+            models.Device.objects.filter(site=site).delete()
+
         device_cache: Dict[Tuple[str, str, int], models.Device] = {}
         created_devices = 0
         updated_devices = 0
         created_points = 0
         updated_points = 0
+        skipped_devices = 0
+        skipped_points = 0
 
+        # Process devices
         for _, row in df.groupby(["protocol_type", "source_ip", "source_port"]).first().reset_index().iterrows():
             protocol = str(row["protocol_type"]).strip().lower()
             ip = str(row["source_ip"]).strip()
@@ -222,18 +266,35 @@ class ExcelImportService:
                 "name": device_name,
                 "code": device_code,
             }
-            device, created = models.Device.objects.update_or_create(
-                site=site,
-                protocol=protocol,
-                ip_address=ip,
-                port=port,
-                defaults=defaults,
-            )
-            device_cache[(protocol, ip, port)] = device
-            if created:
-                created_devices += 1
+
+            if mode == "append":
+                # Append mode: only create new devices
+                device, created = models.Device.objects.get_or_create(
+                    site=site,
+                    protocol=protocol,
+                    ip_address=ip,
+                    port=port,
+                    defaults=defaults,
+                )
+                if created:
+                    created_devices += 1
+                else:
+                    skipped_devices += 1
             else:
-                updated_devices += 1
+                # Merge or Replace mode: update existing or create new
+                device, created = models.Device.objects.update_or_create(
+                    site=site,
+                    protocol=protocol,
+                    ip_address=ip,
+                    port=port,
+                    defaults=defaults,
+                )
+                if created:
+                    created_devices += 1
+                else:
+                    updated_devices += 1
+
+            device_cache[(protocol, ip, port)] = device
 
         template_cache: Dict[str, models.PointTemplate] = {}
         point_records = []
@@ -266,14 +327,6 @@ class ExcelImportService:
                 template_cache[template_key] = template
             template = template_cache[template_key]
 
-            to_kafka_raw = row.get("to_kafka")
-            if pd.isna(to_kafka_raw):
-                to_kafka = False
-            elif isinstance(to_kafka_raw, str):
-                to_kafka = to_kafka_raw.strip().lower() in {"1", "true", "yes", "y", "t"}
-            else:
-                to_kafka = bool(to_kafka_raw)
-
             extra = {
                 "device_a_tag": self._clean_value(row.get("device_a_tag")),
                 "device_name": self._clean_value(row.get("device_name")),
@@ -296,25 +349,44 @@ class ExcelImportService:
                 "address": str(row.get("source_addr") or "").strip(),
                 "description": cn_name,
                 "sample_rate_hz": float(row.get("fs")) if not pd.isna(row.get("fs")) else 1.0,
-                "to_kafka": to_kafka,
                 "extra": extra,
             }
-            point, created = models.Point.objects.update_or_create(
-                device=device,
-                code=en_name,
-                defaults=point_defaults,
-            )
-            if created:
-                created_points += 1
+
+            if mode == "append":
+                # Append mode: only create new points
+                point, created = models.Point.objects.get_or_create(
+                    device=device,
+                    code=en_name,
+                    defaults=point_defaults,
+                )
+                if created:
+                    created_points += 1
+                else:
+                    skipped_points += 1
             else:
-                updated_points += 1
+                # Merge or Replace mode: update existing or create new
+                point, created = models.Point.objects.update_or_create(
+                    device=device,
+                    code=en_name,
+                    defaults=point_defaults,
+                )
+                if created:
+                    created_points += 1
+                else:
+                    updated_points += 1
+
             point_records.append(point)
 
         task_version_ids: List[int] = []
         for device in device_cache.values():
-            task, _ = models.AcqTask.objects.get_or_create(
-                code=f"task-{device.code}",
-                defaults={"name": device.name, "description": f"自动导入任务 {device.code}"},
+            # Use device name as task identifier to maintain task continuity
+            # even when device IP/port changes
+            task_code = f"task-{device.name.replace(' ', '_')}" if device.name else f"task-{device.code}"
+
+            # Use update_or_create to ensure task name/description are updated
+            task, _ = models.AcqTask.objects.update_or_create(
+                code=task_code,
+                defaults={"name": device.name, "description": f"自动导入任务 {device.name}"},
             )
             device_points = list(device.points.all())
             task.points.set(device_points)
@@ -342,10 +414,13 @@ class ExcelImportService:
             task_version_ids.append(version.id)
 
         result = {
+            "mode": mode,
             "device_created": created_devices,
             "device_updated": updated_devices,
+            "device_skipped": skipped_devices,
             "point_created": created_points,
             "point_updated": updated_points,
+            "point_skipped": skipped_points,
             "task_versions": task_version_ids,
         }
 
@@ -354,9 +429,11 @@ class ExcelImportService:
         summary = self.job.summary or {}
         summary["apply_result"] = result
         summary["applied_at"] = timezone.now().isoformat()
+        summary["import_mode"] = mode
         self.job.summary = summary
         self.job.save(update_fields=["status", "related_version", "summary", "updated_at"])
 
+        logger.info(f"Import completed in {mode} mode: {result}")
         return result
 
 
