@@ -115,19 +115,14 @@ class ModbusTCPProtocol(BaseProtocol):
                         })
 
                 except Exception as e:
-                    self.logger.error(
+                    error_msg = (
                         f"Failed to read registers starting at {start_addr}, "
                         f"length {total_length}, func_code {func_code}: {e}"
                     )
-                    # Mark all points in this group as bad quality
-                    for point in group:
-                        results.append({
-                            "code": point["code"],
-                            "value": None,
-                            "timestamp": time.time_ns(),
-                            "quality": "bad",
-                            "error": str(e),
-                        })
+                    self.logger.error(error_msg)
+                    # Don't return None/bad data - raise exception to trigger retry/reconnect
+                    # All data should be real data from devices, never None or fake data
+                    raise ReadError(error_msg) from e
 
         return results
 

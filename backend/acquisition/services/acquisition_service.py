@@ -360,7 +360,7 @@ class AcquisitionService:
             device: Device object
 
         Returns:
-            Formatted data points
+            Formatted data points (only good quality data)
         """
         formatted = []
 
@@ -369,6 +369,10 @@ class AcquisitionService:
             point = self.task.points.filter(code=reading["code"]).first()
             if not point:
                 continue
+
+            # All readings should have good quality and real values
+            # Protocol layer raises exceptions instead of returning bad/None data
+            quality = reading.get("quality", "good")
 
             # Prepare data point
             # Use current time for timestamp (server-side time) instead of device timestamp
@@ -381,7 +385,7 @@ class AcquisitionService:
                     "site": device.site.code,
                     "device": device.code,
                     "point": reading["code"],
-                    "quality": reading.get("quality", "good"),
+                    "quality": quality,
                 },
                 "fields": {
                     reading["code"]: reading["value"],
