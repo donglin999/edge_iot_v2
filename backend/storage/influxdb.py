@@ -29,6 +29,9 @@ class InfluxDBStorage(BaseStorage):
         self.container_name = config.get("container_name", "influxdb")
         self.client = None
         self.write_api = None
+        # Circuit breaker tracking
+        self._consecutive_failures = 0
+        self._last_success_time = 0
 
     def connect(self) -> bool:
         """Connect to InfluxDB."""
@@ -40,6 +43,8 @@ class InfluxDBStorage(BaseStorage):
             )
             self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
             self.is_connected = True
+            # Reset failure counter on successful connection
+            self._consecutive_failures = 0
             self.logger.info(f"Connected to InfluxDB at {self.url}")
             return True
         except Exception as e:
@@ -105,10 +110,14 @@ class InfluxDBStorage(BaseStorage):
             self.write_api.write(bucket=self.bucket, org=self.org, record=points)
 
             self.logger.debug(f"Successfully wrote {len(points)} points to InfluxDB")
+            # Reset failure counter on success
+            self._consecutive_failures = 0
+            self._last_success_time = time.time()
             return True
 
         except Exception as e:
-            self.logger.error(f"Failed to write to InfluxDB: {e}")
+            self._consecutive_failures += 1
+            self.logger.error(f"Failed to write to InfluxDB (attempt {self._consecutive_failures}): {e}")
             # Try docker mode as fallback
             if not self.docker_mode:
                 self.logger.info("Attempting docker exec fallback...")
@@ -130,6 +139,20 @@ class InfluxDBStorage(BaseStorage):
         except Exception as e:
             self.logger.warning(f"Health check failed: {e}")
             return False
+
+    def is_available(self) -> bool:
+        """
+        Quick check if storage is available for writing.
+
+        Returns:
+            True if storage is connected and ready to accept writes.
+        """
+        if not self.is_connected:
+            return False
+        # Check if we've had recent errors that suggest unavailability
+        if hasattr(self, '_consecutive_failures') and self._consecutive_failures >= 10:
+            return False
+        return True
 
     def _format_points(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -329,15 +352,21 @@ class InfluxDBStorage(BaseStorage):
 
             if result.returncode == 0:
                 self.logger.debug(f"Successfully wrote {len(points)} points via docker exec")
+                # Reset failure counter on success
+                self._consecutive_failures = 0
+                self._last_success_time = time.time()
                 return True
             else:
+                self._consecutive_failures += 1
                 error_msg = result.stderr or result.stdout
-                self.logger.error(f"Docker exec write failed: {error_msg}")
+                self.logger.error(f"Docker exec write failed (attempt {self._consecutive_failures}): {error_msg}")
                 raise WriteError(f"Docker exec write failed: {error_msg}")
 
         except subprocess.TimeoutExpired:
+            self._consecutive_failures += 1
             self.logger.error("Docker exec write timed out")
             raise WriteError("Docker exec write timed out")
         except Exception as e:
+            self._consecutive_failures += 1
             self.logger.error(f"Docker exec write error: {e}")
             raise WriteError(f"Docker exec write error: {e}") from e

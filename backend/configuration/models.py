@@ -31,18 +31,28 @@ class Site(TimeStampedModel):
 
 
 class Device(TimeStampedModel):
-    """Represents a data acquisition connection endpoint."""
+    """Represents a data acquisition connection endpoint.
+
+    The full per-protocol connection parameters live in :attr:`metadata` (the
+    schema is declared by the protocol's ``DEVICE_FIELDS``).  ``ip_address``
+    and ``port`` are kept for legacy clients / quick filtering and remain
+    optional — non-IP protocols (Modbus RTU, OPC-UA over named endpoints,
+    ...) leave them blank and store the real connection info in metadata.
+    """
 
     site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="devices")
     name = models.CharField(max_length=128)
-    code = models.CharField(max_length=128)
+    # ``code`` is the stable identity of a device across re-imports. The
+    # importer composes it from the protocol's ``IDENTITY_FIELDS``.
+    code = models.CharField(max_length=255, unique=True)
     protocol = models.CharField(max_length=32)
-    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    # CharField (not GenericIPAddressField) so RTU/OPC-UA can store endpoint
+    # strings here when convenient. Validation is the protocol's job.
+    ip_address = models.CharField(max_length=255, blank=True, default="")
     port = models.PositiveIntegerField(blank=True, null=True)
     metadata = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        unique_together = ("site", "protocol", "ip_address", "port")
         ordering = ["site", "code"]
 
     def __str__(self) -> str:
@@ -110,7 +120,12 @@ class AcqTask(TimeStampedModel):
     code = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=128)
     description = models.TextField(blank=True)
-    schedule = models.CharField(max_length=64, default="continuous")
+    sample_rate_hz = models.DecimalField(
+        max_digits=8,
+        decimal_places=2,
+        default=Decimal("1.00"),
+        help_text="采集频率(Hz)。修改后将自动重启运行中的会话。",
+    )
     is_active = models.BooleanField(default=True)
 
     points = models.ManyToManyField(Point, through="TaskPoint", related_name="tasks")

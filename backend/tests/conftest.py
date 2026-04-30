@@ -18,27 +18,37 @@ django.setup()
 
 
 @pytest.fixture(scope="session")
-def django_db_setup(django_db_blocker):
-    """Setup test database and create tables."""
-    from django.core.management import call_command
+def django_db_modify_db_settings():
+    """Modify database settings to use file-based SQLite for tests."""
+    import tempfile
+    import os
+
+    test_db_path = os.path.join(tempfile.gettempdir(), "test_edge_iot.db")
 
     settings.DATABASES["default"] = {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": ":memory:",
+        "NAME": test_db_path,
+        "ATOMIC_REQUESTS": False,
+        "CONN_MAX_AGE": 0,
+        "OPTIONS": {
+            "timeout": 30,
+        },
     }
-
-    with django_db_blocker.unblock():
-        call_command("migrate", "--run-syncdb", verbosity=0)
+    return settings.DATABASES["default"]
 
 
-@pytest.fixture
-def celery_eager():
-    """Configure Celery to execute tasks synchronously."""
-    settings.CELERY_TASK_ALWAYS_EAGER = True
-    settings.CELERY_TASK_EAGER_PROPAGATES = True
+@pytest.fixture(scope="session", autouse=True)
+def celery_eager_env():
+    """Configure Celery to execute tasks synchronously for all tests."""
+    import os
+    os.environ["CELERY_TASK_ALWAYS_EAGER"] = "True"
+    # Reload celery app to pick up the new setting
+    from celery import current_app
+    current_app.conf.CELERY_TASK_ALWAYS_EAGER = True
+    current_app.conf.CELERY_TASK_EAGER_PROPAGATES = True
     yield
-    settings.CELERY_TASK_ALWAYS_EAGER = False
-    settings.CELERY_TASK_EAGER_PROPAGATES = False
+    current_app.conf.CELERY_TASK_ALWAYS_EAGER = False
+    current_app.conf.CELERY_TASK_EAGER_PROPAGATES = False
 
 
 @pytest.fixture

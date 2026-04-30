@@ -103,7 +103,7 @@ class AcqTaskSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.AcqTask
-        fields = ["id", "code", "name", "description", "schedule", "is_active", "points", "created_at", "updated_at"]
+        fields = ["id", "code", "name", "description", "is_active", "points", "created_at", "updated_at"]
         read_only_fields = ("id", "created_at", "updated_at")
 
     def create(self, validated_data):

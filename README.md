@@ -13,78 +13,58 @@
 
 ## 技术栈
 
-- **后端**: Django 4.2 + Django REST Framework
+- **后端**: Django 4.2 + Django REST Framework + Channels (WebSocket)
 - **任务队列**: Celery + Redis
 - **时序数据库**: InfluxDB 2.x
 - **关系数据库**: SQLite3
-- **前端**: React + TypeScript + Vite
+- **前端**: React 18 + TypeScript + Vite + Ant Design 5
+- **部署**: Docker Compose 一键启动
 
 ## 快速开始
 
-### 1. 环境要求
+### 环境要求
 
-- Python 3.10+
-- Node.js 18+
 - Docker & Docker Compose
-- Redis 7+
 
-### 2. 启动基础服务
+### 一键启动（全栈 Docker）
 
 ```bash
-# 启动Docker服务（Redis, InfluxDB）
-docker-compose up -d
+# 启动所有服务（Django、Celery、前端、Redis、InfluxDB、Mock 设备）
+docker compose up -d
 
-# 检查服务状态
-docker ps
+# 查看运行状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f django
+docker compose logs -f celery
+docker compose logs -f frontend
 ```
 
-### 3. 后端服务
+服务启动后访问：
+
+- 前端: http://localhost:5173
+- 后端 API: http://localhost:8000/api/
+- API 文档: http://localhost:8000/api/schema/swagger-ui/
+- InfluxDB UI: http://localhost:8086
+- Mock Modbus TCP: localhost:5020
+- Mock MQTT Broker: localhost:1883
+
+### 常用命令
 
 ```bash
-cd backend
+# 停止所有服务
+docker compose down
 
-# 安装依赖
-pip install -r requirements.txt
+# 重启某个服务
+docker compose restart django
 
-# 数据库迁移
-python3 manage.py migrate
+# 重新构建镜像（修改 Dockerfile 或 requirements.txt 后）
+docker compose build
 
-# 启动Django服务
-python3 manage.py runserver 0.0.0.0:8000
-```
-
-### 4. Celery Worker
-
-```bash
-cd backend
-
-# 启动Celery Worker
-celery -A control_plane worker -l info --pool=solo
-```
-
-### 5. 前端服务
-
-```bash
-cd frontend
-
-# 安装依赖（首次）
-npm install
-
-# 启动开发服务器
-npm run dev
-```
-
-### 6. 一键启动（推荐）
-
-```bash
-# 启动所有服务
-./start_services.sh
-
-# 访问前端
-# http://localhost:5173
-
-# 访问后端API
-# http://localhost:8000/api/
+# 进入容器执行命令（如数据库迁移）
+docker compose exec django python manage.py migrate
+docker compose exec django python manage.py createsuperuser
 ```
 
 ## 系统架构
@@ -95,24 +75,24 @@ npm run dev
 
 ```
 backend/
-├── acquisition/        # 数据采集模块
-│   ├── models.py       # 采集会话模型
-│   ├── services/       # 采集服务（持久连接、批量上传）
-│   ├── tasks.py        # Celery后台任务
-│   └── views.py        # API接口
-├── configuration/      # 配置管理模块
-│   ├── models.py       # 设备、测点、任务模型
-│   ├── services/       # Excel导入服务
-│   └── views.py        # API接口
-├── storage/           # 存储模块
-│   └── influxdb.py    # InfluxDB存储实现
-├── protocols/         # 协议适配模块
-│   ├── modbus_tcp.py  # Modbus TCP协议
-│   ├── melsec.py      # MELSEC A1E协议
-│   └── mqtt.py        # MQTT协议
-└── control_plane/     # Django配置
-    ├── settings.py    # 项目设置
-    └── celery.py      # Celery配置
+├── acquisition/                 # 数据采集模块
+│   ├── models.py                # 采集会话模型
+│   ├── protocols/               # 协议适配（Modbus、MQTT、OPC UA、S7 等）
+│   ├── services/                # 采集服务（持久连接、批量上传）
+│   ├── tasks.py                 # Celery后台任务
+│   ├── consumers.py             # WebSocket 实时推送
+│   └── views.py                 # API接口
+├── configuration/               # 配置管理模块
+│   ├── models.py                # 设备、测点、任务模型
+│   ├── services/                # Excel导入服务
+│   └── views.py                 # API接口
+├── storage/                     # 存储模块
+│   └── influxdb.py              # InfluxDB存储实现
+├── monitoring/                  # 监控指标
+└── control_plane/               # Django配置
+    ├── settings.py              # 项目设置
+    ├── celery.py                # Celery配置
+    └── asgi.py                  # ASGI（Channels）入口
 
 frontend/
 ├── src/
@@ -173,24 +153,14 @@ GET /api/config/points/
 
 ### 环境变量
 
-在 `backend/.env` 中配置：
+容器内默认配置已写入 `docker-compose.yml`（service hostname：`redis-iot`、`influxdb-iot`），开箱即用。
+
+如需覆盖，可创建 `backend/.env`：
 
 ```bash
 # Django
 SECRET_KEY=your-secret-key
 DEBUG=True
-
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
-# InfluxDB
-INFLUXDB_HOST=localhost
-INFLUXDB_PORT=8086
-INFLUXDB_TOKEN=my-super-secret-auth-token
-INFLUXDB_ORG=edge-iot
-INFLUXDB_BUCKET=iot-data
-INFLUXDB_CONTAINER_NAME=influxdb
 
 # 采集服务配置
 ACQUISITION_BATCH_SIZE=50                    # 批量大小
@@ -199,44 +169,42 @@ ACQUISITION_CONNECTION_TIMEOUT=30.0          # 连接超时（秒）
 ACQUISITION_MAX_RECONNECT_ATTEMPTS=3         # 最大重连次数
 ```
 
-### Docker Compose
+### Docker Compose 服务清单
 
-主要服务配置在 `docker-compose.yml`：
-
-- Redis: `localhost:6379`
-- InfluxDB: `localhost:8086`
+| Service       | 端口          | 说明              |
+| ------------- | ------------- | ----------------- |
+| `django`      | 8000          | Django + DRF API  |
+| `celery`      | -             | 后台任务 Worker   |
+| `frontend`    | 5173          | Vite 开发服务器   |
+| `redis`       | 6379          | Celery broker     |
+| `influxdb`    | 8086          | 时序存储          |
+| `mock-modbus` | 5020          | Mock Modbus TCP   |
+| `mock-mqtt`   | 1883 / 9001   | Mock MQTT Broker  |
 
 ## 测试
 
 ### 后端测试
 
 ```bash
-cd backend
-
-# 运行所有测试
-python3 -m pytest tests/ -v
+# 在 django 容器内运行 pytest
+docker compose exec django python -m pytest tests/ -v
 
 # 运行特定测试
-python3 -m pytest tests/test_protocols.py -v
+docker compose exec django python -m pytest tests/test_acquisition_service.py -v
 ```
 
-### Mock设备
+### Mock 设备
 
-```bash
-# 启动Modbus TCP模拟设备
-python3 mock/modbus_tcp_mock.py --port 5020
-```
+Mock Modbus TCP（端口 5020）和 Mock MQTT Broker（1883/9001）随 `docker compose up` 自动启动，无需单独运行。
 
 ## 监控与运维
 
 ### 查看日志
 
 ```bash
-# Django日志
-tail -f logs/django_final.log
-
-# Celery日志
-tail -f logs/celery_final.log
+docker compose logs -f django
+docker compose logs -f celery
+docker compose logs -f frontend
 ```
 
 ### 查看采集状态
@@ -263,32 +231,10 @@ curl http://localhost:8086/health
 
 ### 添加新协议
 
-1. 在 `backend/protocols/` 下创建新协议文件
+1. 在 `backend/acquisition/protocols/` 下创建新协议文件
 2. 继承 `BaseProtocol` 接口
 3. 实现 `connect()`, `disconnect()`, `read_points()` 方法
-4. 在 `ProtocolRegistry` 中注册
-
-示例:
-```python
-from backend.protocols.base import BaseProtocol
-
-class CustomProtocol(BaseProtocol):
-    def connect(self):
-        # 实现连接逻辑
-        pass
-
-    def disconnect(self):
-        # 实现断开逻辑
-        pass
-
-    def read_points(self, points):
-        # 实现读取逻辑
-        return readings
-
-# 注册协议
-from backend.protocols.registry import ProtocolRegistry
-ProtocolRegistry.register("custom", CustomProtocol)
-```
+4. 在 `acquisition/protocols/__init__.py` 中注册到 `ProtocolRegistry`
 
 ### 添加新存储
 
@@ -333,26 +279,27 @@ ProtocolRegistry.register("custom", CustomProtocol)
 
 ```
 edge_iot_v2/
-├── backend/                # Django后端
-│   ├── acquisition/       # 采集模块
-│   ├── configuration/     # 配置模块
-│   ├── storage/          # 存储模块
-│   ├── protocols/        # 协议模块
-│   ├── common/           # 公共模块
-│   ├── monitoring/       # 监控模块
-│   └── control_plane/    # Django配置
-├── frontend/             # React前端
-│   ├── src/
-│   │   ├── components/  # 组件
-│   │   ├── pages/       # 页面
-│   │   ├── services/    # API服务
-│   │   └── hooks/       # Hooks
-├── mock/                # Mock设备
-├── docs/                # 文档
-├── logs/                # 日志文件
-├── docker-compose.yml   # Docker配置
-├── start_services.sh    # 启动脚本
-└── README.md           # 本文件
+├── backend/                    # Django 后端
+│   ├── acquisition/            # 采集模块（含 protocols/）
+│   ├── configuration/          # 配置模块
+│   ├── storage/                # 存储模块（InfluxDB）
+│   ├── common/                 # 公共模块
+│   ├── monitoring/             # 监控模块
+│   ├── control_plane/          # Django 配置
+│   ├── tests/                  # 后端测试
+│   └── Dockerfile
+├── frontend/                   # React 前端
+│   └── src/
+│       ├── components/
+│       ├── pages/
+│       ├── services/
+│       └── hooks/
+├── mock/                       # Mock 设备（Modbus / MQTT）
+├── docs/                       # 文档（架构、部署、API、开发）
+├── logs/                       # 日志文件
+├── docker-compose.yml          # 全栈编排
+├── reset_influxdb.sh           # InfluxDB 重置工具
+└── README.md
 ```
 
 ## 贡献指南

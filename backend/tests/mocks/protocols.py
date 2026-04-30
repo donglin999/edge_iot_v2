@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 from acquisition.protocols.base import BaseProtocol, ProtocolRegistry
+from acquisition.services.read_plan import Reading
 
 
 class MockModbusTCPProtocol(BaseProtocol):
@@ -20,11 +21,15 @@ class MockModbusTCPProtocol(BaseProtocol):
         self.connection_should_fail = device_config.get("_test_connection_fail", False)
         self.read_should_fail = device_config.get("_test_read_fail", False)
         self.simulated_data = device_config.get("_test_simulated_data", {})
+        self._connection_attempted = False
+        self._connection_failed = False
 
     def connect(self) -> bool:
         """Simulate connection."""
+        self._connection_attempted = True
         if self.connection_should_fail:
             self.is_connected = False
+            self._connection_failed = True
             return False
 
         self.logger.info(f"Mock: Connected to {self.device_config.get('source_ip')}")
@@ -42,6 +47,9 @@ class MockModbusTCPProtocol(BaseProtocol):
 
         Returns predefined test data or random values.
         """
+        if self._connection_failed:
+            raise Exception("Not connected to device")
+
         if self.read_should_fail:
             raise Exception("Simulated read failure")
 
@@ -74,6 +82,23 @@ class MockModbusTCPProtocol(BaseProtocol):
         """Simulate health check."""
         return self.is_connected
 
+    def read_batch(self, group):
+        """New-pipeline shim: build legacy point dicts and reuse read_points."""
+        legacy_points = [
+            {"code": m.code, "address": m.address, "type": m.function_code or 3}
+            for m in group.points
+        ]
+        rows = self.read_points(legacy_points)
+        return [
+            Reading(
+                point_code=r["code"],
+                value=r["value"],
+                timestamp_ns=r.get("timestamp", time.time_ns()),
+                quality=r.get("quality", "good"),
+            )
+            for r in rows
+        ]
+
 
 class MockPLCProtocol(BaseProtocol):
     """Mock Mitsubishi PLC protocol for testing."""
@@ -87,7 +112,7 @@ class MockPLCProtocol(BaseProtocol):
         """Simulate PLC connection."""
         if self.connection_should_fail:
             self.is_connected = False
-            return False
+            raise Exception("Simulated PLC connection failure")
 
         self.is_connected = True
         self.logger.info("Mock PLC: Connected")
@@ -132,6 +157,23 @@ class MockPLCProtocol(BaseProtocol):
     def health_check(self) -> bool:
         """Simulate health check."""
         return self.is_connected
+
+    def read_batch(self, group):
+        """New-pipeline shim: build legacy point dicts and reuse read_points."""
+        legacy_points = [
+            {"code": m.code, "address": m.address, "type": m.data_type or "int16"}
+            for m in group.points
+        ]
+        rows = self.read_points(legacy_points)
+        return [
+            Reading(
+                point_code=r["code"],
+                value=r["value"],
+                timestamp_ns=r.get("timestamp", time.time_ns()),
+                quality=r.get("quality", "good"),
+            )
+            for r in rows
+        ]
 
 
 class MockMQTTProtocol(BaseProtocol):
@@ -180,6 +222,23 @@ class MockMQTTProtocol(BaseProtocol):
     def health_check(self) -> bool:
         """Simulate health check."""
         return self.is_connected
+
+    def read_batch(self, group):
+        """New-pipeline shim: delegate to read_points and wrap as Reading list."""
+        legacy_points = [
+            {"code": m.code, "address": m.address}
+            for m in group.points
+        ]
+        rows = self.read_points(legacy_points)
+        return [
+            Reading(
+                point_code=r["code"],
+                value=r["value"],
+                timestamp_ns=r.get("timestamp", time.time_ns()),
+                quality=r.get("quality", "good"),
+            )
+            for r in rows
+        ]
 
 
 # Register mock protocols for testing

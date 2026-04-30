@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, Link } from 'react-router-dom';
 import {
   fetchDevice,
   fetchDevicePoints,
@@ -10,6 +10,7 @@ import {
   Point,
   DeviceStats,
 } from '../services/deviceApi';
+import './DeviceDetailPage.css';
 
 const DeviceDetailPage = () => {
   const { id } = useParams<{ id: string }>();
@@ -19,10 +20,10 @@ const DeviceDetailPage = () => {
   const [device, setDevice] = useState<Device | null>(null);
   const [points, setPoints] = useState<Point[]>([]);
   const [stats, setStats] = useState<DeviceStats | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [testingConnection, setTestingConnection] = useState(false);
-  const [connectionResult, setConnectionResult] = useState<string | null>(null);
+  const [connectionResult, setConnectionResult] = useState<{ success: boolean; message: string } | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
 
   useEffect(() => {
@@ -56,22 +57,21 @@ const DeviceDetailPage = () => {
 
     try {
       const result = await testDeviceConnection(deviceId);
-      setConnectionResult(result.success ? `✓ ${result.message}` : `✗ ${result.message}`);
+      setConnectionResult({ success: result.success, message: result.message });
     } catch (err) {
-      setConnectionResult(`✗ ${(err as Error).message}`);
+      setConnectionResult({ success: false, message: (err as Error).message });
     } finally {
       setTestingConnection(false);
     }
   };
 
   const handleDelete = async () => {
-    if (!confirm(`确定要删除设备 "${device?.name}" 吗？\n\n注意：删除设备将同时删除其所有测点！`)) {
+    if (!window.confirm(`确定要删除设备 "${device?.name}" 吗？\n\n注意：删除设备将同时删除其所有测点！`)) {
       return;
     }
 
     try {
       await deleteDevice(deviceId);
-      alert('设备已删除');
       navigate('/devices');
     } catch (err) {
       alert(`删除失败: ${(err as Error).message}`);
@@ -84,7 +84,6 @@ const DeviceDetailPage = () => {
       return;
     }
 
-    // 创建 CSV 内容
     const headers = ['编码', '地址', '描述', '采样率(Hz)', '发送到Kafka'];
     const rows = points.map(p => [
       p.code,
@@ -99,7 +98,6 @@ const DeviceDetailPage = () => {
       ...rows.map(row => row.join(',')),
     ].join('\n');
 
-    // 下载文件
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
@@ -107,198 +105,228 @@ const DeviceDetailPage = () => {
     link.click();
   };
 
-  // 过滤测点
   const filteredPoints = points.filter(point =>
     point.code.toLowerCase().includes(searchTerm.toLowerCase()) ||
     point.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
     point.address.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  if (loading) return <p>加载中...</p>;
-  if (error) return <p className="error">错误: {error}</p>;
-  if (!device) return <p>设备不存在</p>;
+  const getProtocolBadgeClass = (protocol: string) => {
+    const p = protocol.toLowerCase();
+    if (p.includes('modbus')) return 'protocol-badge protocol-badge--modbus';
+    if (p.includes('mqtt')) return 'protocol-badge protocol-badge--mqtt';
+    if (p.includes('plc')) return 'protocol-badge protocol-badge--plc';
+    return 'protocol-badge';
+  };
+
+  if (loading) {
+    return (
+      <div className="loading">
+        <div className="loading__spinner" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="error-state">
+        <div className="error-state__title">加载失败</div>
+        <div className="error-state__message">{error}</div>
+      </div>
+    );
+  }
+
+  if (!device) {
+    return (
+      <div className="empty-state">
+        <div className="empty-state__title">设备不存在</div>
+      </div>
+    );
+  }
 
   return (
-    <section>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-        <h2>设备详情: {device.code}</h2>
-        <button onClick={() => navigate('/devices')} className="btn btn-secondary">
-          返回设备列表
-        </button>
-      </div>
-
-      {/* 基本信息卡片 */}
-      <div className="card" style={{ marginBottom: '1.5rem' }}>
-        <h3>基本信息</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
-          <div>
-            <strong>设备名称:</strong> {device.name}
-          </div>
-          <div>
-            <strong>设备编码:</strong> {device.code}
-          </div>
-          <div>
-            <strong>协议类型:</strong> {device.protocol.toUpperCase()}
-          </div>
-          <div>
-            <strong>IP 地址:</strong> {device.ip_address}
-          </div>
-          <div>
-            <strong>端口:</strong> {device.port || 'N/A'}
-          </div>
-          <div>
-            <strong>站点 ID:</strong> {device.site}
-          </div>
-          <div>
-            <strong>创建时间:</strong> {new Date(device.created_at).toLocaleString('zh-CN')}
-          </div>
-          <div>
-            <strong>更新时间:</strong> {new Date(device.updated_at).toLocaleString('zh-CN')}
-          </div>
+    <div className="device-detail-page">
+      {/* Header */}
+      <div className="page-header">
+        <div className="page-header__left">
+          <Link to="/devices" className="back-link">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+            返回设备列表
+          </Link>
+          <h2 className="page-header__title">{device.name}</h2>
+          <span className={getProtocolBadgeClass(device.protocol)}>{device.protocol}</span>
         </div>
-
-        <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
+        <div className="page-header__actions">
           <button
             onClick={handleTestConnection}
             disabled={testingConnection}
-            className="btn btn-primary"
+            className="btn btn--secondary"
           >
-            {testingConnection ? '测试中...' : '测试连接'}
+            {testingConnection ? (
+              <>
+                <div className="loading__spinner" style={{ width: 16, height: 16 }} />
+                测试中...
+              </>
+            ) : (
+              <>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                  <polyline points="22 4 12 14.01 9 11.01" />
+                </svg>
+                测试连接
+              </>
+            )}
           </button>
-          <button
-            onClick={handleDelete}
-            className="btn"
-            style={{ backgroundColor: '#d32f2f', color: 'white' }}
-          >
+          <button onClick={handleDelete} className="btn btn--danger">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="3 6 5 6 21 6" />
+              <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
+            </svg>
             删除设备
           </button>
         </div>
+      </div>
 
-        {connectionResult && (
-          <div
-            style={{
-              marginTop: '1rem',
-              padding: '0.5rem',
-              backgroundColor: connectionResult.startsWith('✓') ? '#e8f5e9' : '#ffebee',
-              border: `1px solid ${connectionResult.startsWith('✓') ? '#4caf50' : '#f44336'}`,
-              borderRadius: '4px',
-            }}
-          >
-            {connectionResult}
+      {/* Connection Result */}
+      {connectionResult && (
+        <div className={`connection-result ${connectionResult.success ? 'connection-result--success' : 'connection-result--error'}`}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            {connectionResult.success ? (
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14M22 4L12 14.01l-3-3" />
+            ) : (
+              <>
+                <circle cx="12" cy="12" r="10" />
+                <line x1="15" y1="9" x2="9" y2="15" />
+                <line x1="9" y1="9" x2="15" y2="15" />
+              </>
+            )}
+          </svg>
+          <span>{connectionResult.message}</span>
+        </div>
+      )}
+
+      {/* Info Grid */}
+      <div className="info-grid">
+        <div className="card">
+          <h3 className="card__title">基本信息</h3>
+          <div className="info-list">
+            <div className="info-item">
+              <span className="info-item__label">设备编码</span>
+              <span className="info-item__value">{device.code}</span>
+            </div>
+            <div className="info-item">
+              <span className="info-item__label">IP 地址</span>
+              <span className="info-item__value">{device.ip_address || 'N/A'}</span>
+            </div>
+            <div className="info-item">
+              <span className="info-item__label">端口</span>
+              <span className="info-item__value">{device.port || 'N/A'}</span>
+            </div>
+            <div className="info-item">
+              <span className="info-item__label">站点 ID</span>
+              <span className="info-item__value">{device.site}</span>
+            </div>
+          </div>
+        </div>
+
+        {stats && (
+          <div className="card">
+            <h3 className="card__title">统计信息</h3>
+            <div className="stats-grid">
+              <div className="stat-item">
+                <div className="stat-item__value">{stats.total_points}</div>
+                <div className="stat-item__label">测点总数</div>
+              </div>
+              <div className="stat-item">
+                <div className="stat-item__value">{stats.task_count}</div>
+                <div className="stat-item__label">关联任务</div>
+              </div>
+              <div className="stat-item stat-item--wide">
+                <div className="stat-item__value stat-item__value--small">
+                  {stats.last_acquisition ? new Date(stats.last_acquisition).toLocaleString('zh-CN') : '从未采集'}
+                </div>
+                <div className="stat-item__label">最近采集</div>
+              </div>
+            </div>
           </div>
         )}
       </div>
 
-      {/* 统计信息卡片 */}
-      {stats && (
-        <div className="card" style={{ marginBottom: '1.5rem' }}>
-          <h3>统计信息</h3>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
-            <div
-              style={{
-                padding: '1rem',
-                backgroundColor: '#e3f2fd',
-                borderRadius: '4px',
-                textAlign: 'center',
-              }}
-            >
-              <div style={{ fontSize: '2rem', fontWeight: 'bold', color: '#1976d2' }}>
-                {stats.total_points}
-              </div>
-              <div style={{ color: '#666' }}>测点总数</div>
-            </div>
-            <div
-              style={{
-                padding: '1rem',
-                backgroundColor: '#f3e5f5',
-                borderRadius: '4px',
-                textAlign: 'center',
-              }}
-            >
-              <div style={{ fontSize: '2rem', fontWeight: 'bold', color: '#7b1fa2' }}>
-                {stats.task_count}
-              </div>
-              <div style={{ color: '#666' }}>关联任务</div>
-            </div>
-            <div
-              style={{
-                padding: '1rem',
-                backgroundColor: '#e8f5e9',
-                borderRadius: '4px',
-                textAlign: 'center',
-              }}
-            >
-              <div style={{ fontSize: '1rem', fontWeight: 'bold', color: '#388e3c' }}>
-                {stats.last_acquisition
-                  ? new Date(stats.last_acquisition).toLocaleString('zh-CN')
-                  : '从未采集'}
-              </div>
-              <div style={{ color: '#666' }}>最近采集时间</div>
-            </div>
+      {/* Related Tasks */}
+      {stats && stats.related_tasks.length > 0 && (
+        <div className="page-section">
+          <h2 className="page-section__title">关联任务 ({stats.task_count})</h2>
+          <div className="table-container">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>任务编码</th>
+                  <th>任务名称</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stats.related_tasks.slice(0, 5).map(task => (
+                  <tr key={task.id}>
+                    <td className="font-medium">{task.code}</td>
+                    <td>{task.name}</td>
+                    <td>
+                      <span className={task.is_active ? 'status-badge status-badge--active' : 'status-badge status-badge--inactive'}>
+                        <span className="status-badge__dot" />
+                        {task.is_active ? '启用' : '停用'}
+                      </span>
+                    </td>
+                    <td>
+                      <Link to="/acquisition" className="btn btn--ghost btn--icon">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polygon points="5 3 19 12 5 21 5 3" />
+                        </svg>
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
 
-      {/* 关联任务列表 */}
-      {stats && stats.related_tasks.length > 0 && (
-        <div className="card" style={{ marginBottom: '1.5rem' }}>
-          <h3>关联任务 ({stats.task_count})</h3>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>任务编码</th>
-                <th>任务名称</th>
-                <th>状态</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stats.related_tasks.map(task => (
-                <tr key={task.id}>
-                  <td>{task.code}</td>
-                  <td>{task.name}</td>
-                  <td>{task.is_active ? '启用' : '停用'}</td>
-                  <td>
-                    <a href={`/acquisition#task-${task.id}`} style={{ color: '#007bff' }}>
-                      查看
-                    </a>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {stats.task_count > 5 && (
-            <p style={{ marginTop: '0.5rem', color: '#666', fontSize: '0.9rem' }}>
-              显示前 5 个任务，共 {stats.task_count} 个
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* 测点列表 */}
-      <div className="card">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-          <h3>测点列表 ({filteredPoints.length} / {points.length})</h3>
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
+      {/* Points List */}
+      <div className="page-section">
+        <div className="page-header">
+          <h2 className="page-section__title">测点列表 ({filteredPoints.length} / {points.length})</h2>
+          <div className="flex gap-sm">
             <input
               type="text"
+              className="input"
               placeholder="搜索测点..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              style={{ padding: '0.5rem', border: '1px solid #ddd', borderRadius: '4px' }}
+              style={{ width: 200 }}
             />
-            <button onClick={handleExportCSV} className="btn btn-secondary">
+            <button onClick={handleExportCSV} className="btn btn--secondary">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
               导出 CSV
             </button>
           </div>
         </div>
 
         {filteredPoints.length === 0 ? (
-          <p style={{ color: '#666', textAlign: 'center', padding: '2rem' }}>
-            {searchTerm ? '没有匹配的测点' : '暂无测点数据'}
-          </p>
+          <div className="empty-state">
+            <svg className="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+            </svg>
+            <div className="empty-state__title">{searchTerm ? '没有匹配的测点' : '暂无测点数据'}</div>
+          </div>
         ) : (
-          <div style={{ overflowX: 'auto' }}>
+          <div className="table-container">
             <table className="table">
               <thead>
                 <tr>
@@ -306,19 +334,29 @@ const DeviceDetailPage = () => {
                   <th>地址</th>
                   <th>描述</th>
                   <th>采样率 (Hz)</th>
-                  <th>发送到 Kafka</th>
-                  <th>创建时间</th>
+                  <th>Kafka</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredPoints.map(point => (
                   <tr key={point.id}>
-                    <td><strong>{point.code}</strong></td>
-                    <td>{point.address}</td>
-                    <td>{point.description}</td>
+                    <td className="font-medium">{point.code}</td>
+                    <td className="text-secondary">{point.address}</td>
+                    <td className="text-secondary">{point.description}</td>
                     <td>{point.sample_rate_hz}</td>
-                    <td>{point.to_kafka ? '✓ 是' : '✗ 否'}</td>
-                    <td>{new Date(point.created_at).toLocaleString('zh-CN')}</td>
+                    <td>
+                      {point.to_kafka ? (
+                        <span className="status-badge status-badge--active">
+                          <span className="status-badge__dot" />
+                          是
+                        </span>
+                      ) : (
+                        <span className="status-badge status-badge--inactive">
+                          <span className="status-badge__dot" />
+                          否
+                        </span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -326,7 +364,7 @@ const DeviceDetailPage = () => {
           </div>
         )}
       </div>
-    </section>
+    </div>
   );
 };
 

@@ -46,7 +46,7 @@ def start_acquisition_task(self, task_id: int, config_version_id: int = None) ->
         session = acq_models.AcquisitionSession.objects.create(
             task=task,
             status=acq_models.AcquisitionSession.STATUS_RUNNING,
-            celery_task_id=self.request.id,
+            celery_task_id=self.request.id or "",
             started_at=timezone.now(),
         )
 
@@ -55,10 +55,17 @@ def start_acquisition_task(self, task_id: int, config_version_id: int = None) ->
             service = AcquisitionService(task, session)
             result = service.run_continuous()
 
-            # Update session status
-            session.status = acq_models.AcquisitionSession.STATUS_STOPPED
-            session.stopped_at = timezone.now()
-            session.save(update_fields=["status", "stopped_at", "updated_at"])
+            # Refresh status — the user may have flipped it to STOPPED or
+            # PAUSED via the API. Only force STOPPED if the loop exited for an
+            # unknown reason while still marked RUNNING.
+            session.refresh_from_db()
+            if session.status == acq_models.AcquisitionSession.STATUS_RUNNING:
+                session.status = acq_models.AcquisitionSession.STATUS_STOPPED
+                session.stopped_at = timezone.now()
+                session.save(update_fields=["status", "stopped_at", "updated_at"])
+            elif session.stopped_at is None:
+                session.stopped_at = timezone.now()
+                session.save(update_fields=["stopped_at", "updated_at"])
 
             logger.info(f"Acquisition task {task_id} completed successfully")
             return result
@@ -119,54 +126,99 @@ def stop_acquisition_task(self, session_id: int) -> Dict[str, Any]:
 
 @shared_task
 def acquire_once(task_id: int) -> Dict[str, Any]:
-    """
-    Perform a single acquisition cycle for a task.
+    """Perform a single read pass for a task (pre-flight validation).
 
-    Useful for testing or one-time data collection.
+    This is the *short* path used by ``/api/acquisition/sessions/start-task/``
+    pre-flight checks and the manual "test connection" button. It is **not**
+    used by the long-running pipeline — see ``start_acquisition_task`` for
+    that.
+
+    The implementation now mirrors the production pipeline: points are
+    grouped by device, a :class:`ReadPlanBuilder` plan is built per device,
+    and ``protocol.read_batch(group)`` is invoked once per group. This keeps
+    pre-flight semantics aligned with what the continuous loop will do.
 
     Args:
-        task_id: ID of the AcqTask
+        task_id: ID of the :class:`configuration.models.AcqTask`.
 
     Returns:
-        Dict with acquisition results
+        On success::
+
+            {
+                "status": "success",
+                "readings": [{"device_code": ..., "point_code": ...,
+                              "value": ..., "quality": ...,
+                              "timestamp_ns": ...}, ...],
+                "count": <int>,
+            }
+
+        On failure (any device errors)::
+
+            {"status": "error", "error": <message>, "device": <code>}
     """
-    logger.info(f"Performing single acquisition for task {task_id}")
+    from .protocols import ProtocolRegistry
+    from .services.read_plan import ReadPlanBuilder
+
+    logger.info("Performing single acquisition for task %s", task_id)
 
     try:
-        task = config_models.AcqTask.objects.prefetch_related(
-            "points__device",
-            "points__template"
-        ).get(pk=task_id)
-
-        # Create temporary session
-        session = acq_models.AcquisitionSession.objects.create(
-            task=task,
-            status=acq_models.AcquisitionSession.STATUS_RUNNING,
-            started_at=timezone.now(),
-        )
-
-        service = AcquisitionService(task, session)
-        result = service.acquire_once()
-
-        # Update session
-        session.status = acq_models.AcquisitionSession.STATUS_STOPPED
-        session.stopped_at = timezone.now()
-        session.metadata = {"single_acquisition": True, "points_read": len(result.get("data", []))}
-        session.save()
-
-        logger.info(f"Single acquisition for task {task_id} completed")
-        return result
-
+        task = config_models.AcqTask.objects.get(pk=task_id)
     except config_models.AcqTask.DoesNotExist:
-        logger.error(f"Task {task_id} does not exist")
+        logger.error("Task %s does not exist", task_id)
         return {"status": "error", "error": "Task not found"}
-    except Exception as e:
-        logger.error(f"Single acquisition failed: {e}", exc_info=True)
-        return {"status": "error", "error": str(e)}
+
+    points_qs = task.points.select_related("device", "template", "channel").all()
+
+    # Group by device — same shape as AcquisitionService._group_points_by_device
+    # but trimmed down to what read_plan needs.
+    by_device: Dict[int, Dict[str, Any]] = {}
+    for point in points_qs:
+        bucket = by_device.setdefault(
+            point.device_id, {"device": point.device, "points": []}
+        )
+        bucket["points"].append(point)
+
+    if not by_device:
+        return {"status": "success", "readings": [], "count": 0}
+
+    results: list[Dict[str, Any]] = []
+    for device_id, group in by_device.items():
+        device = group["device"]
+        cfg = {
+            "source_ip": device.ip_address,
+            "source_port": device.port,
+            "protocol_type": device.protocol,
+            **(device.metadata or {}),
+            # Single-shot probe — we want to fail fast, not block the
+            # caller; the continuous pipeline sets its own timeouts.
+            "timeout": 5.0,
+        }
+        try:
+            protocol = ProtocolRegistry.create(device.protocol, cfg)
+            with protocol:
+                read_groups = ReadPlanBuilder.build(device, group["points"])
+                for rg in read_groups:
+                    readings = protocol.read_batch(rg)
+                    for r in readings:
+                        results.append({
+                            "device_code": device.code,
+                            "point_code": r.point_code,
+                            "value": r.value,
+                            "quality": r.quality,
+                            "timestamp_ns": r.timestamp_ns,
+                        })
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "acquire_once failed on device %s: %s",
+                device.code, exc, exc_info=True,
+            )
+            return {"status": "error", "error": str(exc), "device": device.code}
+
+    return {"status": "success", "readings": results, "count": len(results)}
 
 
 @shared_task
-def test_protocol_connection(protocol_type: str, device_config: Dict[str, Any]) -> Dict[str, Any]:
+def check_protocol_connection(protocol_type: str, device_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Test connection to a device using specified protocol.
 
@@ -202,7 +254,7 @@ def test_protocol_connection(protocol_type: str, device_config: Dict[str, Any]) 
 
 
 @shared_task
-def test_storage_connection(storage_type: str, storage_config: Dict[str, Any]) -> Dict[str, Any]:
+def check_storage_connection(storage_type: str, storage_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Test connection to storage backend.
 

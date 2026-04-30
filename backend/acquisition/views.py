@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, Any
 
 from django.db.models import Count, Q
@@ -11,10 +12,55 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from django.http import HttpResponse
+from rest_framework import viewsets
+
 from acquisition import models as acq_models, serializers, tasks
+from acquisition.protocols import ProtocolRegistry
+from acquisition.services.templates import build_template
 from configuration import models as config_models
 
 logger = logging.getLogger(__name__)
+
+
+class ProtocolViewSet(viewsets.ViewSet):
+    """Read-only registry of supported acquisition protocols.
+
+    The frontend uses this to render dynamic device/point forms (one form
+    layout per protocol). Adding a new protocol class is enough to make it
+    appear here — no view code changes required.
+    """
+
+    @extend_schema(summary="列出已注册协议", description="返回每个协议的字段 schema,用于前端动态表单")
+    def list(self, request):
+        return Response(ProtocolRegistry.describe_all())
+
+    @extend_schema(summary="查看单个协议 schema")
+    def retrieve(self, request, pk=None):
+        try:
+            return Response(ProtocolRegistry.describe(pk))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+    @extend_schema(
+        summary="下载协议 Excel 配置模板",
+        description="生成包含必填/可选列、字段注释、示例行的 .xlsx;protocols 查询参数可指定多个协议(逗号分隔),省略则包含全部",
+    )
+    @action(detail=False, methods=["get"], url_path="template")
+    def template(self, request):
+        protos_param = request.query_params.get("protocols", "")
+        protos = [p.strip() for p in protos_param.split(",") if p.strip()] or None
+        try:
+            blob = build_template(protos or [])
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        filename = "edge_iot_excel_template.xlsx"
+        resp = HttpResponse(
+            blob,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return resp
 
 
 @extend_schema_view(
@@ -105,11 +151,11 @@ class AcquisitionSessionViewSet(
             if device_groups[device_id]["device"] is None:
                 device_groups[device_id]["device"] = point.device
 
+            extras = dict(point.extra or {})
             point_config = {
+                **extras,
                 "code": point.code,
                 "address": point.address,
-                "type": point.extra.get("type", "int16") if point.extra else "int16",
-                "num": point.extra.get("num", 1) if point.extra else 1,
             }
             device_groups[device_id]["points"].append(point_config)
 
@@ -292,20 +338,33 @@ class AcquisitionSessionViewSet(
         serializer = serializers.StopSessionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # 发送停止任务
-        tasks.stop_acquisition_task.delay(session.id)
-
-        # 记录停止原因
         reason = serializer.validated_data.get('reason', '')
-        if reason:
-            metadata = session.metadata or {}
-            metadata['stop_reason'] = reason
-            metadata['stopped_by'] = request.user.username if request.user.is_authenticated else 'anonymous'
-            metadata['stopped_at_client'] = timezone.now().isoformat()
-            session.metadata = metadata
-            session.save(update_fields=['metadata'])
 
-        logger.info(f"Stop signal sent for session {session.id}, reason: {reason}")
+        # The acquisition loop polls session.status from DB each cycle, so
+        # flipping it here is the single source of truth for graceful stop.
+        # We don't dispatch stop_acquisition_task because under --pool=solo the
+        # running start_acquisition_task occupies the only worker slot, so the
+        # stop task would never get consumed.
+        metadata = session.metadata or {}
+        if reason:
+            metadata['stop_reason'] = reason
+        metadata['stopped_by'] = request.user.username if request.user.is_authenticated else 'anonymous'
+        metadata['stopped_at_client'] = timezone.now().isoformat()
+        session.metadata = metadata
+        session.status = acq_models.AcquisitionSession.STATUS_STOPPED
+        session.stopped_at = timezone.now()
+        session.save(update_fields=['status', 'stopped_at', 'metadata', 'updated_at'])
+
+        # Best-effort revoke in case the worker is configured with a multi-slot
+        # pool; safe no-op when the task isn't running.
+        if session.celery_task_id:
+            try:
+                from celery import current_app
+                current_app.control.revoke(session.celery_task_id, terminate=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"revoke failed for {session.celery_task_id}: {exc}")
+
+        logger.info(f"Stop signal applied for session {session.id}, reason: {reason}")
 
         return Response({
             "detail": "停止指令已发送",
@@ -313,31 +372,93 @@ class AcquisitionSessionViewSet(
             "current_status": session.status,
         })
 
-    @extend_schema(
-        summary="暂停采集会话（预留）",
-        description="暂停指定的采集会话，暂未实现",
-        responses={501: {"description": "功能未实现"}}
-    )
+    @extend_schema(summary="暂停采集会话",
+                   description="停止当前采集循环但保留 task 关联,resume 会复用同一个任务起新 session")
     @action(detail=True, methods=['post'], url_path='pause')
     def pause(self, request, pk=None):
-        """暂停采集会话 - 方案C功能，暂未实现"""
-        return Response(
-            {"detail": "暂停功能将在方案C中实现"},
-            status=status.HTTP_501_NOT_IMPLEMENTED
-        )
+        """Pause = stop the loop, mark session 'paused', keep history."""
+        session = self.get_object()
+        if session.status != acq_models.AcquisitionSession.STATUS_RUNNING:
+            return Response(
+                {"detail": f"只能暂停运行中的会话,当前状态 {session.status}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-    @extend_schema(
-        summary="恢复采集会话（预留）",
-        description="恢复已暂停的采集会话，暂未实现",
-        responses={501: {"description": "功能未实现"}}
-    )
+        # Flipping status to PAUSED triggers _should_continue() == False on the
+        # next loop tick; the worker disconnects cleanly and the celery task
+        # exits. We don't issue revoke() — we want the loop's finally block to
+        # flush the final batch and update metadata.
+        session.status = acq_models.AcquisitionSession.STATUS_PAUSED
+        session.stopped_at = timezone.now()
+        meta = session.metadata or {}
+        meta["paused_at"] = timezone.now().isoformat()
+        meta["paused_by"] = request.user.username if request.user.is_authenticated else "anonymous"
+        session.metadata = meta
+        session.save(update_fields=["status", "stopped_at", "metadata", "updated_at"])
+
+        logger.info("Pause requested for session %s", session.id)
+        return Response({
+            "detail": "暂停指令已发送",
+            "session_id": session.id,
+            "current_status": session.status,
+        })
+
+    @extend_schema(summary="恢复采集会话",
+                   description="为同一 task 启动一个新的采集 session;旧的 paused session 保留作为历史")
     @action(detail=True, methods=['post'], url_path='resume')
     def resume(self, request, pk=None):
-        """恢复采集会话 - 方案C功能，暂未实现"""
-        return Response(
-            {"detail": "恢复功能将在方案C中实现"},
-            status=status.HTTP_501_NOT_IMPLEMENTED
-        )
+        """Resume by starting a fresh session bound to the same task.
+
+        We don't reuse the paused session because Modbus/MQTT/S7/OPC-UA all
+        rebuild their connection state from scratch on connect(); making
+        "resume" mean "new session for same task" keeps things simple and
+        protocol-agnostic.
+        """
+        session = self.get_object()
+        if session.status != acq_models.AcquisitionSession.STATUS_PAUSED:
+            return Response(
+                {"detail": f"只能从已暂停状态恢复,当前状态 {session.status}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Block if another session for this task is already running
+        active = acq_models.AcquisitionSession.objects.filter(
+            task=session.task,
+            status=acq_models.AcquisitionSession.STATUS_RUNNING,
+        ).first()
+        if active:
+            return Response(
+                {"detail": f"该任务已有运行中的会话 #{active.id}", "session_id": active.id},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Mark old session metadata for traceability (status stays PAUSED).
+        meta = session.metadata or {}
+        meta["resumed_at"] = timezone.now().isoformat()
+        session.metadata = meta
+        session.save(update_fields=["metadata", "updated_at"])
+
+        # Dispatch a brand-new session via the same start_acquisition_task path.
+        # The celery task itself creates the session row.
+        celery_result = tasks.start_acquisition_task.delay(session.task_id)
+        time.sleep(0.5)
+        new_session = acq_models.AcquisitionSession.objects.filter(
+            celery_task_id=celery_result.id,
+        ).first()
+        if new_session is not None:
+            md = new_session.metadata or {}
+            md["resumed_from_session"] = session.id
+            new_session.metadata = md
+            new_session.save(update_fields=["metadata", "updated_at"])
+
+        logger.info("Resumed paused session %s as new session %s",
+                    session.id, new_session.id if new_session else "?")
+        return Response({
+            "detail": "已恢复",
+            "previous_session_id": session.id,
+            "session_id": new_session.id if new_session else None,
+            "celery_task_id": celery_result.id,
+        }, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         summary="查询会话状态详情",
@@ -353,21 +474,30 @@ class AcquisitionSessionViewSet(
         """
         session = self.get_object()
 
-        # 统计数据点
-        data_points_count = acq_models.DataPoint.objects.filter(
-            session=session
-        ).count()
+        # Live counters maintained by the acquisition loop come from
+        # session.metadata (updated every SQLITE_METADATA_INTERVAL seconds).
+        # The DataPoint table is unused for the InfluxDB pipeline, so reading
+        # from it here would always return zero.
+        meta = session.metadata or {}
+        points_read = int(meta.get("total_points_read", 0))
 
-        # 统计错误数据点
-        error_count = acq_models.DataPoint.objects.filter(
-            session=session,
-            quality__in=['bad', 'uncertain']
-        ).count()
+        last_read_ts = meta.get("last_read_time")
+        last_read_time = None
+        if last_read_ts:
+            try:
+                last_read_time = timezone.datetime.fromtimestamp(
+                    float(last_read_ts), tz=timezone.utc
+                )
+            except (TypeError, ValueError):
+                last_read_time = None
 
-        # 获取最后一次读取时间
-        last_data_point = acq_models.DataPoint.objects.filter(
-            session=session
-        ).order_by('-timestamp').first()
+        # Aggregate error count from device health summary (consecutive failures).
+        device_health = meta.get("device_health", {}) or {}
+        error_count = sum(
+            int(v.get("consecutive_failures", 0))
+            for v in device_health.values()
+            if isinstance(v, dict)
+        )
 
         # 计算运行时长
         duration_seconds = None
@@ -384,11 +514,11 @@ class AcquisitionSessionViewSet(
             'started_at': session.started_at,
             'stopped_at': session.stopped_at,
             'duration_seconds': duration_seconds,
-            'points_read': data_points_count,
-            'last_read_time': last_data_point.timestamp if last_data_point else None,
+            'points_read': points_read,
+            'last_read_time': last_read_time,
             'error_count': error_count,
             'error_message': session.error_message,
-            'metadata': session.metadata or {},
+            'metadata': meta,
         }
 
         serializer = serializers.SessionStatusSerializer(status_data)
@@ -477,83 +607,99 @@ class AcquisitionSessionViewSet(
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # 时间范围参数
-        start_time = request.query_params.get('start_time', '-1h')  # Default to last hour
+        start_time = request.query_params.get('start_time', '-1h')
         end_time = request.query_params.get('end_time', 'now()')
         limit = int(request.query_params.get('limit', 1000))
 
-        # Query InfluxDB using Docker CLI (workaround for external auth issue)
-        import subprocess
+        from django.conf import settings as dj_settings
+        from storage import StorageRegistry
 
-        # Build Flux query
-        flux_query = f'from(bucket:"iot-data") |> range(start: {start_time}, stop: {end_time}) |> filter(fn: (r) => r["point"] == "{point_code}") |> limit(n: {limit}) |> sort(columns: ["_time"])'
+        influx_config = {
+            "url": getattr(dj_settings, "INFLUXDB_URL", None),
+            "host": getattr(dj_settings, "INFLUXDB_HOST", "localhost"),
+            "port": getattr(dj_settings, "INFLUXDB_PORT", 8086),
+            "token": getattr(dj_settings, "INFLUXDB_TOKEN", ""),
+            "org": getattr(dj_settings, "INFLUXDB_ORG", "default"),
+            "bucket": getattr(dj_settings, "INFLUXDB_BUCKET", "default"),
+        }
 
+        # Build Flux range clause: relative durations stay bare, RFC3339 stays bare,
+        # `now()` is a function call. Anything else is escaped as a string literal
+        # to prevent Flux injection.
+        def _flux_range_arg(value: str) -> str:
+            v = value.strip()
+            if v == "now()" or v.startswith("-") or v[:1].isdigit():
+                return v
+            return f'"{v}"'
+
+        # Escape user input to prevent Flux injection in the filter.
+        safe_point = point_code.replace("\\", "\\\\").replace('"', '\\"')
+        bucket = influx_config["bucket"]
+        flux_query = (
+            f'from(bucket:"{bucket}") '
+            f'|> range(start: {_flux_range_arg(start_time)}, stop: {_flux_range_arg(end_time)}) '
+            f'|> filter(fn: (r) => r["point"] == "{safe_point}") '
+            f'|> sort(columns: ["_time"]) '
+            f'|> limit(n: {limit})'
+        )
+
+        storage = None
         try:
-            result = subprocess.run(
-                ['docker', 'exec', 'influxdb', 'influx', 'query', flux_query, '--raw'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            storage = StorageRegistry.create("influxdb", influx_config)
+            storage.connect()
+            records = storage.query(flux_query)
 
-            if result.returncode != 0:
-                raise Exception(f"Docker command failed: {result.stderr}")
-
-            # Parse CSV output (InfluxDB format with leading commas for data rows)
             data = []
-            lines = result.stdout.strip().split('\n')
+            for record in records:
+                ts = record.get("_time")
+                value = record.get("_value")
+                if ts is None or value is None:
+                    continue
+                # InfluxDB returns datetime; serialize ISO-8601.
+                if hasattr(ts, "isoformat"):
+                    ts_str = ts.isoformat()
+                else:
+                    ts_str = str(ts)
 
-            # Find header line (starts with ,result,table,...)
-            header_idx = -1
-            for i, line in enumerate(lines):
-                if line.startswith(',result,table,'):
-                    header_idx = i
-                    break
+                # Numeric values pass through as-is; non-numeric stays as string.
+                if isinstance(value, (int, float)):
+                    out_value = value
+                else:
+                    try:
+                        out_value = float(value)
+                    except (TypeError, ValueError):
+                        out_value = value
 
-            if header_idx >= 0 and len(lines) > header_idx + 1:
-                headers = lines[header_idx].split(',')
-                time_idx = headers.index('_time') if '_time' in headers else -1
-                value_idx = headers.index('_value') if '_value' in headers else -1
-
-                for line in lines[header_idx + 1:]:
-                    # Data lines start with double comma ,,
-                    if not line.startswith(',,') or not line.strip():
-                        continue
-
-                    parts = line.split(',')
-                    if len(parts) > max(time_idx, value_idx) and time_idx >= 0 and value_idx >= 0:
-                        try:
-                            # InfluxDB timestamps are in RFC3339 format
-                            timestamp = parts[time_idx] if time_idx < len(parts) else ''
-                            value = float(parts[value_idx]) if value_idx < len(parts) and parts[value_idx] else 0
-
-                            data.append({
-                                'timestamp': timestamp,
-                                'value': value,
-                                'quality': 'good',
-                            })
-                        except (ValueError, IndexError) as e:
-                            logger.debug(f"Failed to parse line: {line}, error: {e}")
-                            continue
+                data.append({
+                    "timestamp": ts_str,
+                    "value": out_value,
+                    "quality": record.get("quality", "good"),
+                })
 
             return Response({
-                'point_code': point_code,
-                'start_time': start_time,
-                'end_time': end_time,
-                'count': len(data),
-                'data': data,
+                "point_code": point_code,
+                "start_time": start_time,
+                "end_time": end_time,
+                "count": len(data),
+                "data": data,
             })
 
-        except Exception as e:
-            logger.error(f"Failed to query InfluxDB: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to query InfluxDB for point {point_code}: {e}")
             return Response({
-                'point_code': point_code,
-                'start_time': start_time,
-                'end_time': end_time,
-                'count': 0,
-                'data': [],
-                'error': str(e),
+                "point_code": point_code,
+                "start_time": start_time,
+                "end_time": end_time,
+                "count": 0,
+                "data": [],
+                "error": str(e),
             })
+        finally:
+            if storage is not None:
+                try:
+                    storage.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
 
     @extend_schema(
         summary="测试单次采集",
@@ -629,7 +775,7 @@ class ConnectionTestViewSet(
         device_config = serializer.validated_data['device_config']
 
         # 异步测试连接
-        celery_result = tasks.test_protocol_connection.delay(protocol_type, device_config)
+        celery_result = tasks.check_protocol_connection.delay(protocol_type, device_config)
 
         # 等待结果（最多5秒）
         try:
@@ -681,7 +827,7 @@ class StorageTestViewSet(
         storage_config = serializer.validated_data['storage_config']
 
         # 异步测试连接
-        celery_result = tasks.test_storage_connection.delay(storage_type, storage_config)
+        celery_result = tasks.check_storage_connection.delay(storage_type, storage_config)
 
         # 等待结果（最多5秒）
         try:
@@ -695,3 +841,66 @@ class StorageTestViewSet(
                 "storage": storage_type,
                 "error": str(e),
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Alarm rules + alarms
+# ---------------------------------------------------------------------------
+
+
+from rest_framework import serializers as drf_serializers
+
+
+class AlarmRuleSerializer(drf_serializers.ModelSerializer):
+    class Meta:
+        model = acq_models.AlarmRule
+        fields = "__all__"
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class AlarmSerializer(drf_serializers.ModelSerializer):
+    rule_name = drf_serializers.CharField(source="rule.name", read_only=True)
+    severity = drf_serializers.CharField(source="rule.severity", read_only=True)
+
+    class Meta:
+        model = acq_models.Alarm
+        fields = "__all__"
+        read_only_fields = (
+            "id", "fired_at", "created_at", "updated_at",
+            "rule_name", "severity",
+        )
+
+
+class AlarmRuleViewSet(viewsets.ModelViewSet):
+    """CRUD for alarm rules."""
+    queryset = acq_models.AlarmRule.objects.all()
+    serializer_class = AlarmRuleSerializer
+
+
+class AlarmViewSet(mixins.ListModelMixin,
+                   mixins.RetrieveModelMixin,
+                   viewsets.GenericViewSet):
+    """List + acknowledge alarms (acked / cleared transitions)."""
+    queryset = acq_models.Alarm.objects.select_related("rule", "session__task")
+    serializer_class = AlarmSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        return qs
+
+    @action(detail=True, methods=["post"], url_path="ack")
+    def acknowledge(self, request, pk=None):
+        alarm = self.get_object()
+        if alarm.status != acq_models.Alarm.STATUS_FIRING:
+            return Response({"detail": "只能确认 firing 状态的告警"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        alarm.status = acq_models.Alarm.STATUS_ACKED
+        alarm.acknowledged_at = timezone.now()
+        alarm.acknowledged_by = (request.user.username
+                                 if request.user.is_authenticated else "anonymous")
+        alarm.save(update_fields=["status", "acknowledged_at",
+                                  "acknowledged_by", "updated_at"])
+        return Response(AlarmSerializer(alarm).data)

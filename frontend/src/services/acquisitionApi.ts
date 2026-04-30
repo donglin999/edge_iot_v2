@@ -45,6 +45,7 @@ export interface AcqTask {
   description: string;
   schedule: string;
   is_active: boolean;
+  sample_rate_hz: number;
   created_at: string;
   updated_at: string;
 }
@@ -56,6 +57,23 @@ export interface StartTaskRequest {
   metadata?: Record<string, unknown>;
 }
 
+export interface DeviceValidationResult {
+  status: 'healthy' | 'partial' | 'error';
+  connected: boolean;
+  total_points: number;
+  successful_points?: number;
+  failed_points?: number;
+  error?: string;
+}
+
+export interface StartTaskValidation {
+  all_healthy: boolean;
+  total_points: number;
+  failed_points_count: number;
+  device_results: Record<string, DeviceValidationResult>;
+  failed_points_sample?: Array<{ device: string; point: string; reason: string }>;
+}
+
 export interface StartTaskResponse {
   detail?: string;
   session_id?: number;
@@ -63,6 +81,8 @@ export interface StartTaskResponse {
   task_id?: number;
   task_code?: string;
   message?: string;
+  validation?: StartTaskValidation;
+  elapsed_seconds?: number;
 }
 
 const API_BASE = '/api';
@@ -197,6 +217,35 @@ export async function stopTaskViaConfig(taskId: number): Promise<unknown> {
   }
 
   return data;
+}
+
+/**
+ * 更新任务采样频率（Hz），后端会在保存后自动重启 running 会话
+ */
+export async function updateTaskSampleRate(
+  taskId: number,
+  rateHz: number
+): Promise<AcqTask> {
+  const response = await fetch(`${API_BASE}/config/tasks/${taskId}/`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ sample_rate_hz: rateHz }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const detail =
+      (data && (data.detail || data.sample_rate_hz)) ||
+      `更新采样频率失败: ${response.statusText}`;
+    throw new Error(
+      Array.isArray(detail) ? detail.join('; ') : String(detail)
+    );
+  }
+
+  return data as AcqTask;
 }
 
 /**

@@ -20,7 +20,7 @@ def _load_env_file() -> None:
 _load_env_file()
 
 DEBUG = env("DEBUG")
-_default_allowed_hosts = ["localhost", "127.0.0.1", "testserver", "0.0.0.0"]
+_default_allowed_hosts = ["localhost", "127.0.0.1", "testserver", "0.0.0.0", "django", "host.docker.internal"]
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS") or _default_allowed_hosts
 SECRET_KEY = env("SECRET_KEY")
 
@@ -74,6 +74,7 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": env.str("DJANGO_DB_NAME", default=str(BASE_DIR / "db.sqlite3")),
+        "ATOMIC_REQUESTS": False,
     }
 }
 
@@ -108,7 +109,7 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,
 }
 
-CELERY_BROKER_URL = env.str("CELERY_BROKER_URL", default="redis://localhost:6379/0")
+CELERY_BROKER_URL = env.str("CELERY_BROKER_URL", default=f"redis://{env('REDIS_HOST', default='localhost')}:{env('REDIS_PORT', default=6379)}/0")
 CELERY_RESULT_BACKEND = env.str("CELERY_RESULT_BACKEND", default=CELERY_BROKER_URL)
 # IMPORTANT: Always use Celery worker for async tasks, never run in Django process
 CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
@@ -169,6 +170,19 @@ LOGGING = {
         "storage": {
             "handlers": ["console", "file"],
             "level": "INFO",
+            "propagate": False,
+        },
+        # modbus_tk emits a benign ERROR each cycle when the upstream Modbus
+        # reply lingers in the socket buffer; the library auto-reconnects and
+        # the next read succeeds. Suppress to CRITICAL to keep logs readable.
+        "modbus_tk": {
+            "handlers": ["console", "file"],
+            "level": "CRITICAL",
+            "propagate": False,
+        },
+        "modbus_tcp": {
+            "handlers": ["console", "file"],
+            "level": "CRITICAL",
             "propagate": False,
         },
     },

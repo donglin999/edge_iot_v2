@@ -38,7 +38,7 @@ class PointTemplateAdmin(admin.ModelAdmin):
 
 @admin.register(models.AcqTask)
 class AcqTaskAdmin(admin.ModelAdmin):
-    list_display = ("code", "name", "schedule", "is_active")
+    list_display = ("code", "name", "is_active")
     list_filter = ("is_active",)
     search_fields = ("code", "name")
 

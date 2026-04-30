@@ -50,6 +50,26 @@ export interface ConnectionTestResult {
   details: Record<string, unknown>;
 }
 
+export interface DeviceLatestPoint {
+  point_code: string;
+  point_name: string;
+  unit: string;
+  data_type: string;
+  value: number | string | boolean | null;
+  quality: string;
+  timestamp: string | null;
+}
+
+export interface DeviceLatestValues {
+  device_id: number;
+  device_code: string;
+  device_name: string;
+  protocol: string;
+  online: boolean;
+  last_activity_at: string | null;
+  points: DeviceLatestPoint[];
+}
+
 /**
  * 获取所有设备列表
  */
@@ -122,6 +142,19 @@ export async function updateDevice(deviceId: number, data: Partial<Device>): Pro
 
   if (!response.ok) {
     throw new Error(`更新设备失败: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+/**
+ * 获取设备所有测点的最新值（含设备元信息和在线状态）
+ */
+export async function fetchDeviceLatestValues(
+  deviceId: number
+): Promise<DeviceLatestValues> {
+  const response = await fetch(`${API_BASE}/devices/${deviceId}/latest-values/`);
+  if (!response.ok) {
+    throw new Error(`获取设备最新值失败: ${response.statusText}`);
   }
   return response.json();
 }

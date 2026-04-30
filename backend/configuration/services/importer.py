@@ -1,24 +1,50 @@
-"""Services for handling configuration import workflows."""
+"""Excel-driven configuration importer.
+
+The importer is **schema-driven**: each row's ``protocol_type`` selects the
+matching :class:`acquisition.protocols.BaseProtocol` subclass, whose
+``DEVICE_FIELDS`` and ``POINT_FIELDS`` declarations drive validation,
+coercion, and the resulting ``Device.metadata`` / ``Point.extra`` payloads.
+
+This means adding a new protocol does NOT require touching this file — once
+the protocol class declares its schema and ``IDENTITY_FIELDS`` the importer
+picks it up automatically.
+"""
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from django.db import transaction
 from django.utils import timezone
 
+from acquisition.protocols import BaseProtocol, ProtocolRegistry
 from configuration import models
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RowError:
+    row: int               # 1-based as a user sees in Excel (header is row 1)
+    column: str = ""
+    message: str = ""
+    protocol: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"row": self.row, "column": self.column, "message": self.message, "protocol": self.protocol}
+
+
 @dataclass
 class ImportSummary:
-    """结构化导入结果，用于前端展示校验信息。"""
-
     rows_parsed: int = 0
     created_points: int = 0
     updated_points: int = 0
@@ -28,13 +54,14 @@ class ImportSummary:
     device_updated: int = 0
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    row_errors: List[RowError] = field(default_factory=list)
     metadata: Dict[str, str] = field(default_factory=dict)
 
     @property
     def is_successful(self) -> bool:
-        return not self.errors
+        return not self.errors and not self.row_errors
 
-    def to_dict(self) -> Dict[str, object]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "rows_parsed": self.rows_parsed,
             "created_points": self.created_points,
@@ -45,371 +72,379 @@ class ImportSummary:
             "device_updated": self.device_updated,
             "warnings": self.warnings,
             "errors": self.errors,
+            "row_errors": [e.to_dict() for e in self.row_errors],
             "metadata": self.metadata,
         }
 
 
-class ExcelImportService:
-    """读取 Excel 配置并生成校验摘要/落库。"""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    REQUIRED_COLUMNS = {"protocol_type", "source_ip", "source_port", "en_name"}
+
+def _device_code(protocol: str, identity: Tuple[Any, ...]) -> str:
+    """Stable, human-recognisable Device.code, max 255 chars (model limit)."""
+    base = f"{protocol}-" + "-".join(str(v) for v in identity if v is not None and v != "")
+    if len(base) <= 255:
+        # Replace characters that would confuse URLs / shells.
+        return base.replace("/", "_").replace(":", "_").replace(" ", "_")
+    digest = hashlib.sha1(base.encode()).hexdigest()[:12]
+    short = base[:200].rstrip("-")
+    return f"{short}-{digest}"
+
+
+def _row_dict(row: pd.Series) -> Dict[str, Any]:
+    """Convert a pandas row into a plain dict, dropping NaN."""
+    out: Dict[str, Any] = {}
+    for k, v in row.items():
+        if pd.isna(v):
+            continue
+        out[str(k)] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ExcelImportService
+# ---------------------------------------------------------------------------
+
+
+class ExcelImportService:
+    """Read an Excel file, validate per-protocol, persist devices/points/tasks."""
+
+    BASE_REQUIRED_COLUMNS = {"protocol_type", "code"}
 
     def __init__(self, job: models.ImportJob, excel_path: Path) -> None:
         self.job = job
         self.excel_path = excel_path
 
-    @staticmethod
-    def _clean_value(value):
-        return None if pd.isna(value) else value
-
+    # ---------- I/O ---------- #
     def load_dataframe(self) -> pd.DataFrame:
         try:
-            return pd.read_excel(self.excel_path, sheet_name=0)
+            df = pd.read_excel(self.excel_path, sheet_name=0)
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"Excel 文件不存在: {self.excel_path}") from exc
+        # Backward compat: older templates used `en_name` for the point code.
+        if "code" not in df.columns and "en_name" in df.columns:
+            df = df.rename(columns={"en_name": "code"})
+        if "description" not in df.columns and "cn_name" in df.columns:
+            df = df.rename(columns={"cn_name": "description"})
+        return df
 
+    # ---------- validation ---------- #
     def run_validation(self) -> ImportSummary:
         summary = ImportSummary()
         try:
             df = self.load_dataframe()
         except FileNotFoundError as exc:
             summary.errors.append(str(exc))
-            logger.exception("Excel 文件读取失败: %s", exc)
             return summary
 
         summary.rows_parsed = len(df.index)
-        missing = [column for column in self.REQUIRED_COLUMNS if column not in df.columns]
+        if summary.rows_parsed == 0:
+            summary.errors.append("Excel 中没有数据行")
+            return summary
+
+        missing = [c for c in self.BASE_REQUIRED_COLUMNS if c not in df.columns]
         if missing:
             summary.errors.append(f"缺少必要列: {', '.join(missing)}")
             return summary
 
-        connections = self._collect_connections(df)
-        device_tags = self._collect_device_tags(df)
+        protocols_seen: set[str] = set()
+        device_keys: set[Tuple[str, Tuple[Any, ...]]] = set()
+        device_tags: set[str] = set()
 
-        summary.connection_count = len(connections)
+        for idx, row in df.iterrows():
+            row_num = idx + 2  # +2 because Excel header is row 1, idx is 0-based
+            row_data = _row_dict(row)
+            protocol = str(row_data.get("protocol_type", "")).strip().lower()
+            if not protocol:
+                summary.row_errors.append(RowError(row_num, "protocol_type", "缺少协议类型"))
+                continue
+
+            try:
+                klass = ProtocolRegistry.get(protocol)
+            except ValueError as exc:
+                summary.row_errors.append(RowError(row_num, "protocol_type", str(exc), protocol=protocol))
+                continue
+
+            protocols_seen.add(klass.META.name)
+
+            device_errors = klass.validate_device(row_data)
+            for msg in device_errors:
+                summary.row_errors.append(RowError(row_num, "", msg, protocol=protocol))
+
+            point_errors = klass.validate_point(row_data)
+            for msg in point_errors:
+                summary.row_errors.append(RowError(row_num, "", msg, protocol=protocol))
+
+            if not device_errors:
+                identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
+                device_keys.add((klass.META.name, identity))
+
+            tag = row_data.get("device_name") or row_data.get("device_a_tag")
+            if tag:
+                device_tags.add(str(tag).strip())
+
+        summary.connection_count = len(device_keys)
         summary.device_tag_count = len(device_tags)
-        summary.created_points = len(df.index)
-        summary.metadata["protocols"] = ",".join(sorted({proto for proto, *_ in connections}))
+        summary.created_points = summary.rows_parsed - len(summary.row_errors)
+        summary.metadata["protocols"] = ",".join(sorted(protocols_seen))
         if device_tags:
             summary.metadata["device_tags"] = ",".join(sorted(device_tags))
 
-        if not connections:
-            summary.warnings.append("未检测到有效的采集连接（协议/IP/端口）。")
-
+        if not device_keys and not summary.row_errors:
+            summary.warnings.append("未检测到有效的采集连接")
         return summary
-
-    @staticmethod
-    def _collect_connections(df: pd.DataFrame) -> Set[Tuple[str, str, int]]:
-        connections: Set[Tuple[str, str, int]] = set()
-        for _, row in df.iterrows():
-            protocol_raw = row.get("protocol_type")
-            ip_raw = row.get("source_ip")
-            port_raw = row.get("source_port")
-
-            if pd.isna(protocol_raw) or pd.isna(ip_raw) or pd.isna(port_raw):
-                continue
-
-            protocol = str(protocol_raw).strip().lower()
-            ip_address = str(ip_raw).strip()
-            try:
-                port = int(port_raw)
-            except (TypeError, ValueError):
-                try:
-                    port = int(float(port_raw))
-                except (TypeError, ValueError):
-                    logger.warning("无法解析端口: %s", port_raw)
-                    continue
-
-            if protocol and ip_address and port >= 0:
-                connections.add((protocol, ip_address, port))
-        return connections
-
-    @staticmethod
-    def _collect_device_tags(df: pd.DataFrame) -> Set[str]:
-        candidates: Set[str] = set()
-        for column in ("device_name", "device_a_tag"):
-            if column in df.columns:
-                tags = {
-                    str(value).strip()
-                    for value in df[column].dropna().unique()
-                    if str(value).strip()
-                }
-                candidates.update(tags)
-        return candidates
 
     def persist_summary(self, summary: ImportSummary) -> models.ImportJob:
         existing = self.job.summary or {}
-        merged_summary = existing.copy()
-        merged_summary.update(summary.to_dict())
+        merged = existing.copy()
+        merged.update(summary.to_dict())
         summary.metadata.setdefault("file_path", existing.get("file_path", str(self.excel_path)))
         summary.metadata.setdefault("site_code", existing.get("site_code", "default"))
-        merged_summary["metadata"] = summary.metadata
-        self.job.status = models.ImportJob.STATUS_VALIDATED if summary.is_successful else models.ImportJob.STATUS_FAILED
-        self.job.summary = merged_summary
+        merged["metadata"] = summary.metadata
+        self.job.status = (
+            models.ImportJob.STATUS_VALIDATED if summary.is_successful else models.ImportJob.STATUS_FAILED
+        )
+        self.job.summary = merged
         self.job.save(update_fields=["status", "summary", "updated_at"])
         return self.job
 
-    def compute_diff(self, site_code: str = 'default') -> Dict[str, object]:
+    # ---------- diff (preview before apply) ---------- #
+    def compute_diff(self, site_code: str = "default") -> Dict[str, Any]:
         df = self.load_dataframe()
-        connection_entries = []
-        connection_keys = []
-        for protocol, ip, port in self._collect_connections(df):
-            connection_entries.append({"protocol": protocol, "ip_address": ip, "port": port})
-            connection_keys.append((protocol, ip, port))
 
-        point_entries = []
-        point_keys = []
-        for _, row in df.iterrows():
-            protocol = str(row['protocol_type']).strip().lower()
-            ip = str(row['source_ip']).strip()
-            port = int(row['source_port'])
-            code = str(row.get('en_name')).strip()
-            entry = {"protocol": protocol, "ip_address": ip, "port": port, "code": code}
-            point_entries.append(entry)
-            point_keys.append((protocol, ip, port, code))
+        connections: List[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        point_entries: List[Dict[str, Any]] = []
+        for idx, row in df.iterrows():
+            row_data = _row_dict(row)
+            protocol = str(row_data.get("protocol_type", "")).strip().lower()
+            try:
+                klass = ProtocolRegistry.get(protocol)
+            except ValueError:
+                continue
+            identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
+            code = _device_code(klass.META.name, identity)
+            if code not in seen_keys:
+                seen_keys.add(code)
+                connections.append({
+                    "protocol": klass.META.name,
+                    "code": code,
+                    "label": str(row_data.get("device_name") or row_data.get("device_a_tag") or code),
+                })
+            point_entries.append({
+                "protocol": klass.META.name,
+                "device_code": code,
+                "code": str(row_data.get("code") or "").strip(),
+            })
 
-        existing_conn_entries = []
-        existing_point_entries = []
-        site = models.Site.objects.filter(code=site_code).first()
-        if site:
-            for device in models.Device.objects.filter(site=site):
-                key = (device.protocol, device.ip_address, device.port or 0)
-                existing_conn_entries.append({"protocol": device.protocol, "ip_address": device.ip_address, "port": device.port or 0})
-                for point in device.points.all():
-                    existing_point_entries.append({"protocol": device.protocol, "ip_address": device.ip_address, "port": device.port or 0, "code": point.code})
-
-        conn_existing_keys = {(c['protocol'], c['ip_address'], c['port']) for c in existing_conn_entries}
-        point_existing_keys = {(p['protocol'], p['ip_address'], p['port'], p['code']) for p in existing_point_entries}
-
-        connections = {
-            'to_create': [c for c in connection_entries if (c['protocol'], c['ip_address'], c['port']) not in conn_existing_keys],
-            'to_remove': [c for c in existing_conn_entries if (c['protocol'], c['ip_address'], c['port']) not in connection_keys],
-            'existing': [c for c in connection_entries if (c['protocol'], c['ip_address'], c['port']) in conn_existing_keys],
-        }
-        points = {
-            'to_create': [p for p in point_entries if (p['protocol'], p['ip_address'], p['port'], p['code']) not in point_existing_keys],
-            'to_remove': [p for p in existing_point_entries if (p['protocol'], p['ip_address'], p['port'], p['code']) not in point_keys],
-            'existing': [p for p in point_entries if (p['protocol'], p['ip_address'], p['port'], p['code']) in point_existing_keys],
-        }
+        existing_devices = list(models.Device.objects.filter(site__code=site_code))
+        existing_codes = {d.code for d in existing_devices}
+        existing_points = []
+        for d in existing_devices:
+            for p in d.points.all():
+                existing_points.append({"device_code": d.code, "code": p.code, "protocol": d.protocol})
+        existing_point_keys = {(p["device_code"], p["code"]) for p in existing_points}
+        new_point_keys = {(p["device_code"], p["code"]) for p in point_entries}
 
         return {
-            'site_code': site_code,
-            'connections': connections,
-            'points': points,
+            "site_code": site_code,
+            "connections": {
+                "to_create": [c for c in connections if c["code"] not in existing_codes],
+                "existing": [c for c in connections if c["code"] in existing_codes],
+                "to_remove": [
+                    {"protocol": d.protocol, "code": d.code, "label": d.name}
+                    for d in existing_devices if d.code not in {c["code"] for c in connections}
+                ],
+            },
+            "points": {
+                "to_create": [p for p in point_entries if (p["device_code"], p["code"]) not in existing_point_keys],
+                "existing": [p for p in point_entries if (p["device_code"], p["code"]) in existing_point_keys],
+                "to_remove": [p for p in existing_points if (p["device_code"], p["code"]) not in new_point_keys],
+            },
         }
 
+    # ---------- apply (write to DB) ---------- #
     @transaction.atomic
-    def apply(self, site_code: str = "default", created_by: str = "", mode: str = "merge") -> Dict[str, object]:
-        """
-        应用配置到数据库。
-
-        Args:
-            site_code: 站点编码
-            created_by: 创建者
-            mode: 导入模式
-                - "replace": 替换模式 - 删除站点下所有设备和任务后重新导入
-                - "merge": 合并模式 - 更新已有记录，创建新记录（默认）
-                - "append": 追加模式 - 仅创建新记录，不修改已有记录
-
-        Returns:
-            导入结果统计
-        """
+    def apply(self, site_code: str = "default", created_by: str = "", mode: str = "merge") -> Dict[str, Any]:
         df = self.load_dataframe()
+        summary = self.run_validation()
+        if summary.row_errors:
+            return {
+                "status": "failed",
+                "row_errors": [e.to_dict() for e in summary.row_errors],
+                "errors": summary.errors,
+            }
+
         site, _ = models.Site.objects.get_or_create(
-            code=site_code,
-            defaults={"name": site_code, "description": "自动创建"},
+            code=site_code, defaults={"name": site_code, "description": "自动创建"},
         )
 
-        # Replace mode: delete all existing data for this site
         if mode == "replace":
-            # Get all task IDs associated with this site's devices
-            task_ids = list(models.AcqTask.objects.filter(
-                points__device__site=site
-            ).distinct().values_list('id', flat=True))
-
-            # Also find orphaned tasks (tasks with no points)
-            orphaned_task_ids = list(models.AcqTask.objects.filter(
-                points__isnull=True
-            ).distinct().values_list('id', flat=True))
-
-            # Combine both sets of task IDs
-            all_task_ids = list(set(task_ids + orphaned_task_ids))
-
-            deleted_tasks = len(all_task_ids)
-            deleted_devices = models.Device.objects.filter(site=site).count()
-
-            logger.info(f"Replace mode: deleting {deleted_tasks} tasks (including {len(orphaned_task_ids)} orphaned) and {deleted_devices} devices for site {site_code}")
-
-            # Delete tasks first (to avoid orphaned tasks)
-            if all_task_ids:
-                models.AcqTask.objects.filter(id__in=all_task_ids).delete()
-
-            # Then delete devices (cascade deletes points)
+            # AcqTask cleanup is handled by the cascade signal on Device.
             models.Device.objects.filter(site=site).delete()
 
-        device_cache: Dict[Tuple[str, str, int], models.Device] = {}
-        created_devices = 0
-        updated_devices = 0
-        created_points = 0
-        updated_points = 0
-        skipped_devices = 0
-        skipped_points = 0
+        device_cache: Dict[str, models.Device] = {}
+        created_devices = updated_devices = skipped_devices = 0
+        created_points = updated_points = skipped_points = 0
 
-        # Process devices
-        for _, row in df.groupby(["protocol_type", "source_ip", "source_port"]).first().reset_index().iterrows():
-            protocol = str(row["protocol_type"]).strip().lower()
-            ip = str(row["source_ip"]).strip()
-            port = int(row["source_port"])
-            device_code = f"{protocol}-{ip}-{port}"
-            device_name = str(row.get("device_name") or row.get("device_a_tag") or device_code)
+        # 1) Build/update devices, one row per (protocol, identity). We process
+        #    the whole sheet first so the second pass can wire up points.
+        device_meta_per_code: Dict[str, Tuple[type[BaseProtocol], Dict[str, Any]]] = {}
+        for _, row in df.iterrows():
+            row_data = _row_dict(row)
+            protocol = str(row_data.get("protocol_type", "")).strip().lower()
+            klass = ProtocolRegistry.get(protocol)
+            identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
+            code = _device_code(klass.META.name, identity)
+            if code in device_cache:
+                continue
+
+            device_metadata = klass.coerce_device(row_data)
+            # Trim to declared fields so we don't leak point columns into
+            # device.metadata.
+            device_metadata = {f.name: device_metadata.get(f.name) for f in klass.DEVICE_FIELDS
+                               if f.name in device_metadata}
+            device_meta_per_code[code] = (klass, device_metadata)
+
+            ip_address = str(device_metadata.get("source_ip") or device_metadata.get("endpoint_url") or device_metadata.get("serial_port") or "")[:255]
+            port = device_metadata.get("source_port")
+            try:
+                port = int(port) if port is not None else None
+            except (TypeError, ValueError):
+                port = None
+
+            label = str(row_data.get("device_name") or row_data.get("device_a_tag") or code)
             defaults = {
-                "name": device_name,
-                "code": device_code,
+                "site": site,
+                "name": label,
+                "protocol": klass.META.name,
+                "ip_address": ip_address,
+                "port": port,
+                "metadata": device_metadata,
             }
 
             if mode == "append":
-                # Append mode: only create new devices
-                device, created = models.Device.objects.get_or_create(
-                    site=site,
-                    protocol=protocol,
-                    ip_address=ip,
-                    port=port,
-                    defaults=defaults,
-                )
+                device, created = models.Device.objects.get_or_create(code=code, defaults=defaults)
                 if created:
                     created_devices += 1
                 else:
                     skipped_devices += 1
             else:
-                # Merge or Replace mode: update existing or create new
-                device, created = models.Device.objects.update_or_create(
-                    site=site,
-                    protocol=protocol,
-                    ip_address=ip,
-                    port=port,
-                    defaults=defaults,
-                )
+                device, created = models.Device.objects.update_or_create(code=code, defaults=defaults)
                 if created:
                     created_devices += 1
                 else:
                     updated_devices += 1
+            device_cache[code] = device
 
-            device_cache[(protocol, ip, port)] = device
+        # 2) Persist points + per-row template
+        for idx, row in df.iterrows():
+            row_data = _row_dict(row)
+            protocol = str(row_data.get("protocol_type", "")).strip().lower()
+            klass = ProtocolRegistry.get(protocol)
+            identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
+            code = _device_code(klass.META.name, identity)
+            device = device_cache[code]
 
-        template_cache: Dict[str, models.PointTemplate] = {}
-        point_records = []
-        for _, row in df.iterrows():
-            protocol = str(row["protocol_type"]).strip().lower()
-            ip = str(row["source_ip"]).strip()
-            port = int(row["source_port"])
-            device = device_cache[(protocol, ip, port)]
+            point_data = klass.coerce_point(row_data)
+            point_code = str(point_data.get("code") or "").strip()
+            if not point_code:
+                continue
 
-            en_name = str(row.get("en_name")).strip()
-            cn_name = str(row.get("cn_name") or en_name).strip()
-            unit = str(row.get("unit") or "").strip()
-            data_type = str(row.get("type") or "float").strip()
-            coefficient_value = row.get("coefficient")
-            coefficient = float(coefficient_value) if not pd.isna(coefficient_value) else 1
-            precision_value = row.get("precision")
-            precision = int(precision_value) if not pd.isna(precision_value) else 2
-            template_key = f"{en_name}:{unit}:{data_type}:{coefficient}:{precision}"
-            if template_key not in template_cache:
-                template, _ = models.PointTemplate.objects.get_or_create(
-                    name=cn_name or en_name,
-                    english_name=en_name,
-                    defaults={
-                        "unit": unit,
-                        "data_type": data_type,
-                        "coefficient": coefficient,
-                        "precision": precision,
-                    },
-                )
-                template_cache[template_key] = template
-            template = template_cache[template_key]
+            data_type = str(point_data.get("data_type") or "float")
+            unit = str(point_data.get("unit") or "")
+            description = str(point_data.get("description") or point_code)
+            try:
+                coefficient = float(point_data.get("coefficient", 1.0))
+            except (TypeError, ValueError):
+                coefficient = 1.0
 
-            extra = {
-                "device_a_tag": self._clean_value(row.get("device_a_tag")),
-                "device_name": self._clean_value(row.get("device_name")),
-                "data_source": self._clean_value(row.get("data_source")),
-                "input_range": [
-                    self._clean_value(row.get("input_data_minimum")),
-                    self._clean_value(row.get("input_data_maximum")),
-                ],
-                "output_range": [
-                    self._clean_value(row.get("output_data_minimum")),
-                    self._clean_value(row.get("output_data_maximum")),
-                ],
-                "num": self._clean_value(row.get("num")),
-                "type": self._clean_value(row.get("type")),
-            }
+            template, _ = models.PointTemplate.objects.get_or_create(
+                name=description or point_code,
+                english_name=point_code,
+                defaults={
+                    "unit": unit,
+                    "data_type": data_type,
+                    "coefficient": coefficient,
+                    "precision": 2,
+                },
+            )
+
+            extra = {f.name: point_data.get(f.name) for f in klass.POINT_FIELDS
+                     if f.name in point_data and f.name != "code"}
+            extra["protocol"] = klass.META.name
 
             point_defaults = {
                 "channel": None,
                 "template": template,
-                "address": str(row.get("source_addr") or "").strip(),
-                "description": cn_name,
-                "sample_rate_hz": float(row.get("fs")) if not pd.isna(row.get("fs")) else 1.0,
+                "address": str(point_data.get("address") or "").strip(),
+                "description": description,
+                "sample_rate_hz": 1.0,
                 "extra": extra,
             }
 
             if mode == "append":
-                # Append mode: only create new points
-                point, created = models.Point.objects.get_or_create(
-                    device=device,
-                    code=en_name,
-                    defaults=point_defaults,
+                _, created = models.Point.objects.get_or_create(
+                    device=device, code=point_code, defaults=point_defaults,
                 )
                 if created:
                     created_points += 1
                 else:
                     skipped_points += 1
             else:
-                # Merge or Replace mode: update existing or create new
-                point, created = models.Point.objects.update_or_create(
-                    device=device,
-                    code=en_name,
-                    defaults=point_defaults,
+                _, created = models.Point.objects.update_or_create(
+                    device=device, code=point_code, defaults=point_defaults,
                 )
                 if created:
                     created_points += 1
                 else:
                     updated_points += 1
 
-            point_records.append(point)
-
+        # 3) Auto-create / update tasks (1 task per device).
         task_version_ids: List[int] = []
         for device in device_cache.values():
-            # Use device name as task identifier to maintain task continuity
-            # even when device IP/port changes
             task_code = f"task-{device.name.replace(' ', '_')}" if device.name else f"task-{device.code}"
 
-            # Use update_or_create to ensure task name/description are updated
-            task, _ = models.AcqTask.objects.update_or_create(
-                code=task_code,
-                defaults={"name": device.name, "description": f"自动导入任务 {device.name}"},
-            )
-            device_points = list(device.points.all())
-            task.points.set(device_points)
+            existing = list(models.AcqTask.objects.filter(points__device_id=device.id).distinct())
+            owned = [
+                t for t in existing
+                if not models.Point.objects.filter(tasks__id=t.id).exclude(device_id=device.id).exists()
+            ]
+            if owned:
+                owned.sort(key=lambda t: t.id)
+                task = owned[0]
+                task.code = task_code
+                task.name = device.name
+                task.description = f"自动导入任务 {device.name}"
+                task.save(update_fields=["code", "name", "description", "updated_at"])
+                for dup in owned[1:]:
+                    dup.delete()
+            else:
+                task, _ = models.AcqTask.objects.update_or_create(
+                    code=task_code,
+                    defaults={"name": device.name, "description": f"自动导入任务 {device.name}"},
+                )
+
+            task.points.set(list(device.points.all()))
             latest = task.versions.order_by("-version").first()
             next_version = (latest.version if latest else 0) + 1
             payload = {
                 "device": device.code,
-                "points": [
-                    {
-                        "code": p.code,
-                        "address": p.address,
-                        "description": p.description,
-                        "sample_rate_hz": float(p.sample_rate_hz),
-                    }
-                    for p in device_points
-                ],
+                "protocol": device.protocol,
+                "metadata": device.metadata,
+                "points": [{
+                    "code": p.code,
+                    "address": p.address,
+                    "description": p.description,
+                    "extra": p.extra,
+                } for p in device.points.all()],
             }
             version = models.ConfigVersion.objects.create(
-                task=task,
-                version=next_version,
+                task=task, version=next_version,
                 summary=f"导入作业 {self.job.id} 自动生成",
-                created_by=created_by,
-                payload=payload,
+                created_by=created_by, payload=payload,
             )
             task_version_ids.append(version.id)
 
@@ -426,24 +461,34 @@ class ExcelImportService:
 
         self.job.status = models.ImportJob.STATUS_APPLIED
         self.job.related_version_id = task_version_ids[0] if task_version_ids else None
-        summary = self.job.summary or {}
-        summary["apply_result"] = result
-        summary["applied_at"] = timezone.now().isoformat()
-        summary["import_mode"] = mode
-        self.job.summary = summary
+        sm = self.job.summary or {}
+        sm["apply_result"] = result
+        sm["applied_at"] = timezone.now().isoformat()
+        sm["import_mode"] = mode
+        self.job.summary = sm
         self.job.save(update_fields=["status", "related_version", "summary", "updated_at"])
 
-        logger.info(f"Import completed in {mode} mode: {result}")
+        logger.info("Import applied (%s): %s", mode, result)
         return result
 
 
-def process_excel(job: models.ImportJob, excel_path: Path, site_code: str | None = None) -> ImportSummary:
-    """用于 Celery 或同步调用的快捷入口。"""
+# Backward-compat helpers referenced by celery tasks / tests
+def import_excel(job: models.ImportJob, excel_path: Path) -> ImportSummary:
+    service = ExcelImportService(job=job, excel_path=excel_path)
+    summary = service.run_validation()
+    service.persist_summary(summary)
+    return summary
 
+
+def process_excel(
+    job: models.ImportJob,
+    excel_path: Path,
+    site_code: str | None = None,
+) -> ImportSummary:
+    """Entrypoint used by ``configuration.tasks.process_excel_import``."""
     service = ExcelImportService(job=job, excel_path=excel_path)
     summary = service.run_validation()
     if site_code:
-        summary.metadata.setdefault("site_code", site_code)
-    summary.metadata.setdefault("file_path", str(excel_path))
+        summary.metadata["site_code"] = site_code
     service.persist_summary(summary)
     return summary

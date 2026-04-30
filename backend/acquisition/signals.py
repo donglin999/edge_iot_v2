@@ -1,6 +1,6 @@
 """Django signals for sending WebSocket notifications."""
 import logging
-from django.db.models.signals import post_save, pre_save
+from django.db.models.signals import post_save
 from django.dispatch import receiver
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
@@ -23,7 +23,9 @@ def session_status_changed(sender, instance, created, **kwargs):
         return
 
     session_data = {
+        'id': instance.id,
         'session_id': instance.id,
+        'task': instance.task.id,
         'task_id': instance.task.id,
         'task_code': instance.task.code,
         'task_name': instance.task.name,
@@ -83,38 +85,8 @@ def session_status_changed(sender, instance, created, **kwargs):
         logger.error(f"Failed to send WebSocket notification to {global_group}: {e}")
 
 
-@receiver(post_save, sender=acq_models.DataPoint)
-def data_point_created(sender, instance, created, **kwargs):
-    """
-    Send WebSocket notification when a new data point is created.
-
-    Note: This can generate a lot of traffic for high-frequency data.
-    Consider batching or sampling if performance is an issue.
-    """
-    if not created:
-        return
-
-    channel_layer = get_channel_layer()
-    if not channel_layer:
-        return
-
-    data_point_data = {
-        'session_id': instance.session.id,
-        'point_code': instance.point_code,
-        'timestamp': instance.timestamp.isoformat(),
-        'value': instance.value,
-        'quality': instance.quality,
-    }
-
-    # Send to session-specific group
-    session_group = f'acquisition_session_{instance.session.id}'
-    try:
-        async_to_sync(channel_layer.group_send)(
-            session_group,
-            {
-                'type': 'data_point_update',
-                'data': data_point_data,
-            }
-        )
-    except Exception as e:
-        logger.error(f"Failed to send data point notification: {e}")
+# Note: the legacy ``data_point_created`` signal that listened on
+# ``acq_models.DataPoint`` was removed — the DataPoint table is no longer
+# written to by the pipeline. Real-time WebSocket pushes happen from the
+# WebSocketSink (see ``services/sinks.py``) instead, with a 1 Hz aggregation
+# window to keep traffic bounded at high sample rates.

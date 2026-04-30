@@ -10,7 +10,14 @@ from typing import Any, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
 
-from .base import BaseProtocol, ConnectionError, ProtocolRegistry, ReadError
+from .base import (
+    BaseProtocol,
+    ConnectionError,
+    FieldSpec,
+    ProtocolMeta,
+    ProtocolRegistry,
+    ReadError,
+)
 
 
 @ProtocolRegistry.register("mqtt")
@@ -21,19 +28,58 @@ class MQTTProtocol(BaseProtocol):
     Unlike request-response protocols, MQTT uses publish-subscribe pattern.
     """
 
+    META = ProtocolMeta(
+        name="mqtt",
+        label="MQTT",
+        category="iot",
+        description="发布订阅型协议,常用于云端/边缘 IoT 网关。需要预先订阅话题,采集循环从消息队列拉数据。",
+        supports_pause=True,
+    )
+
+    DEVICE_FIELDS = (
+        FieldSpec("source_ip", "Broker 地址", required=True, example="broker.example.com"),
+        FieldSpec("source_port", "Broker 端口", kind="int", default=1883, example=1883),
+        FieldSpec("mqtt_topics", "订阅话题", required=True,
+                  help_text="多个话题用逗号或分号分隔,支持 + 与 # 通配", example="sensor/+/temp"),
+        FieldSpec("mqtt_qos", "QoS", kind="enum", choices=(0, 1, 2), default=0),
+        FieldSpec("mqtt_username", "用户名", default=""),
+        FieldSpec("mqtt_password", "密码", kind="secret", default=""),
+        FieldSpec("mqtt_use_tls", "启用 TLS", kind="bool", default=False),
+        FieldSpec("mqtt_client_id", "ClientID", default="",
+                  help_text="留空自动生成"),
+    )
+    IDENTITY_FIELDS = ("source_ip", "source_port", "mqtt_client_id")
+
+    POINT_FIELDS = (
+        FieldSpec("code", "测点编码", required=True,
+                  help_text="若 payload 为 JSON,该 code 即字段名;若 payload 为标量,所有点 code 都收同一个值",
+                  example="temperature"),
+        FieldSpec("topic_filter", "话题过滤", default="",
+                  help_text="可选,只接收指定话题的消息(支持通配)"),
+        FieldSpec("payload_path", "JSON 路径", default="",
+                  help_text="形如 'data.value';留空时按 code 取顶层字段"),
+        FieldSpec("data_type", "数据类型", kind="enum",
+                  choices=("string", "int", "float", "bool"), default="float"),
+        FieldSpec("unit", "单位", default=""),
+        FieldSpec("description", "中文名称", default=""),
+    )
+
     def __init__(self, device_config: Dict[str, Any]) -> None:
         super().__init__(device_config)
         self.broker_ip = device_config.get("source_ip")
-        self.broker_port = device_config.get("source_port", 1883)
+        self.broker_port = int(device_config.get("source_port", 1883))
         self.username = device_config.get("mqtt_username")
         self.password = device_config.get("mqtt_password")
-        self.use_tls = device_config.get("mqtt_use_tls", False)
+        self.use_tls = bool(device_config.get("mqtt_use_tls", False))
+        self.client_id = device_config.get("mqtt_client_id", "") or None
         self.protocol_version = device_config.get("mqtt_protocol", mqtt.MQTTv5)
+        self.qos = int(device_config.get("mqtt_qos", 0))
 
-        # Topics to subscribe
-        self.topics = device_config.get("mqtt_topics", [])
-        if not isinstance(self.topics, list):
-            self.topics = [self.topics]
+        topics = device_config.get("mqtt_topics", [])
+        if isinstance(topics, str):
+            # accept comma- or semicolon-separated topic lists
+            topics = [t.strip() for t in topics.replace(";", ",").split(",") if t.strip()]
+        self.topics = topics
 
         self.client: Optional[mqtt.Client] = None
         self.data_queue = queue.Queue(maxsize=1000)

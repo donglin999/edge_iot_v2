@@ -1,51 +1,120 @@
-"""Integration tests for end-to-end acquisition pipeline."""
-import pytest
+"""End-to-end integration tests for the acquisition pipeline.
+
+After the M2 pipeline refactor the read-format-store path is split across:
+
+* ``AcquisitionService.acquire_once`` — reads via ``ProtocolRegistry``,
+  returns readings; never touches storage.
+* ``InfluxDBSink.consume`` — formats one :class:`Reading` and buffers it.
+* ``InfluxDBSink.flush`` — writes the buffer to the configured storage backend.
+
+These tests stitch those three steps together against the in-memory
+``MockInfluxDBStorage`` to verify the *whole* path (acquire → format → store)
+without the threaded ``run_continuous`` loop, which has its own coverage in
+``tests/test_pipeline_watchdog.py``.
+"""
+from __future__ import annotations
+
+import time
 from unittest.mock import patch
 
+import pytest
+
 from acquisition.services.acquisition_service import AcquisitionService
-from tests.fixtures.factories import *
+from acquisition.services.read_plan import Reading
+from acquisition.services.sinks import InfluxDBSink
+from tests.fixtures.factories import *  # noqa: F401,F403
 from tests.mocks.protocols import register_mock_protocols
-from tests.mocks.storage import register_mock_storage, MockInfluxDBStorage
+from tests.mocks.storage import MockInfluxDBStorage, register_mock_storage
 
 
 @pytest.fixture(autouse=True)
 def setup_mocks():
-    """Setup all mocks."""
+    """Register mock protocols + storage for every test in this module."""
     register_mock_protocols()
     register_mock_storage()
     yield
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_sink_with_mock_storage(
+    session, device_groups, mock_storage,
+):
+    """Build an :class:`InfluxDBSink` wired to ``mock_storage`` directly.
+
+    Bypasses ``InfluxDBSink._init_storage`` (which would try to instantiate
+    the real ``influxdb`` backend via ``StorageRegistry``) so we can inject
+    a known mock and assert against ``mock_storage.get_written_data()``.
+
+    Mirrors the ``_make_sink_skeleton`` helper in
+    ``tests/test_acquisition_service.py`` but uses a real ``MockInfluxDBStorage``
+    rather than a ``MagicMock`` so we exercise the full write path.
+    """
+    import threading
+
+    sink = InfluxDBSink.__new__(InfluxDBSink)
+    sink.session = session
+    sink.device_groups = device_groups
+    sink._lock = threading.Lock()
+    sink._buffer = []
+    sink._last_flush = time.time()
+    sink._storage = mock_storage
+    sink._total_written = 0
+    sink._fail_count = 0
+    sink._next_flush_at = 0.0
+    sink._dropped_total = 0
+    sink._point_meta = {}
+    for _device_id, group in device_groups.items():
+        device = group["device"]
+        for point in group["points"]:
+            sink._point_meta[point["code"]] = {
+                "device": device,
+                "coefficient": float(point.get("coefficient", 1.0) or 1.0),
+                "precision": int(point.get("precision", 2) or 2),
+                "template_name": point.get("cn_name") or point.get("description") or "",
+                "template_unit": point.get("unit", "") or "",
+            }
+    return sink
+
+
+def _feed_readings_through_sink(sink, readings_dicts):
+    """Convert ``acquire_once`` row dicts into :class:`Reading`s and consume.
+
+    ``acquire_once`` returns the legacy list-of-dict shape; the sink consumes
+    :class:`Reading`. We adapt here so the integration tests only deal with
+    one shape.
+    """
+    for row in readings_dicts:
+        reading = Reading(
+            point_code=row["code"],
+            value=row["value"],
+            timestamp_ns=row.get("timestamp", time.time_ns()),
+            quality=row.get("quality", "good"),
+        )
+        sink.consume(reading)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end acquisition (read → format → store)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.django_db
 class TestEndToEndAcquisition:
-    """Test complete acquisition pipeline."""
+    """Verify acquire_once + InfluxDBSink form a working acquisition path."""
 
-    @patch("acquisition.services.acquisition_service.settings")
-    @patch("acquisition.services.acquisition_service.StorageRegistry")
     def test_full_acquisition_pipeline(
         self,
-        mock_storage_registry,
-        mock_settings,
         create_site,
         create_device,
         create_point,
         create_task,
         create_session,
     ):
-        """Test complete acquisition from device to storage."""
-        # Setup settings
-        mock_settings.INFLUXDB_HOST = "localhost"
-        mock_settings.INFLUXDB_PORT = 8086
-        mock_settings.INFLUXDB_TOKEN = "test-token"
-        mock_settings.INFLUXDB_ORG = "test-org"
-        mock_settings.INFLUXDB_BUCKET = "test-bucket"
-        mock_settings.KAFKA_ENABLED = False
-
-        # Create real mock storage to capture data
-        mock_storage = MockInfluxDBStorage({})
-        mock_storage_registry.create.return_value = mock_storage
-
-        # Setup test data
+        """Three points off one modbus device flow into formatted storage points."""
         site = create_site(code="FACTORY_01", name="Test Factory")
         device = create_device(
             site=site,
@@ -62,80 +131,53 @@ class TestEndToEndAcquisition:
                 },
             },
         )
+        temp_point = create_point(device=device, code="TEMP_01", address="D100")
+        pressure_point = create_point(device=device, code="PRESSURE_01", address="D101")
+        flow_point = create_point(device=device, code="FLOW_01", address="D102")
 
-        # Create points
-        temp_point = create_point(
-            device=device,
-            code="TEMP_01",
-            address="D100",
-            extra={"type": 3, "num": 1},
-        )
-        pressure_point = create_point(
-            device=device,
-            code="PRESSURE_01",
-            address="D101",
-            extra={"type": 3, "num": 1},
-        )
-        flow_point = create_point(
-            device=device,
-            code="FLOW_01",
-            address="D102",
-            extra={"type": 3, "num": 1},
-        )
-
-        # Create task
         task = create_task(
             code="SENSOR_MONITORING",
-            name="Sensor Rack Monitoring",
             points=[temp_point, pressure_point, flow_point],
         )
-
-        # Create session
         session = create_session(task=task)
 
-        # Execute acquisition
         service = AcquisitionService(task, session)
         result = service.acquire_once()
 
-        # Verify result
         assert result["status"] == "completed"
         assert result["points_read"] == 3
-        assert len(result["errors"]) == 0
+        assert result["errors"] == []
 
-        # Verify data was written to storage
-        written_data = mock_storage.get_written_data()
-        assert len(written_data) == 3
+        # Hand the readings off to a sink wired to in-memory storage so we
+        # can verify the formatted-and-written shape end-to-end.
+        mock_storage = MockInfluxDBStorage({})
+        mock_storage.connect()
+        sink = _make_sink_with_mock_storage(session, service.device_groups, mock_storage)
 
-        # Verify data structure
-        temp_data = next((d for d in written_data if d["fields"].get("TEMP_01")), None)
+        _feed_readings_through_sink(sink, result["data"])
+        sink.flush()
+
+        written = mock_storage.get_written_data()
+        assert len(written) == 3
+
+        temp_data = next((d for d in written if "TEMP_01" in d["fields"]), None)
         assert temp_data is not None
+        # measurement falls back to device.metadata['device_a_tag'] when set.
         assert temp_data["measurement"] == "SENSOR_RACK_01"
         assert temp_data["tags"]["site"] == "FACTORY_01"
         assert temp_data["tags"]["device"] == "MODBUS_001"
         assert temp_data["fields"]["TEMP_01"] == 25.5
 
-    @patch("acquisition.services.acquisition_service.settings")
-    @patch("acquisition.services.acquisition_service.StorageRegistry")
     def test_multi_device_acquisition(
         self,
-        mock_storage_registry,
-        mock_settings,
         create_site,
         create_device,
         create_point,
         create_task,
         create_session,
     ):
-        """Test acquisition from multiple devices."""
-        mock_settings.INFLUXDB_HOST = "localhost"
-        mock_settings.KAFKA_ENABLED = False
-
-        mock_storage = MockInfluxDBStorage({})
-        mock_storage_registry.create.return_value = mock_storage
-
+        """Two devices on different protocols both produce readings + storage points."""
         site = create_site()
-
-        # Create 2 devices with different protocols
         modbus_device = create_device(
             site=site,
             protocol="mock_modbus",
@@ -149,54 +191,41 @@ class TestEndToEndAcquisition:
             metadata={"_test_simulated_data": {"PLC_P1": 200}},
         )
 
-        # Create points for each device
         mb_point = create_point(device=modbus_device, code="MB_P1")
         plc_point = create_point(device=plc_device, code="PLC_P1")
 
-        # Create task with points from both devices
         task = create_task(points=[mb_point, plc_point])
         session = create_session(task=task)
 
-        # Execute
         service = AcquisitionService(task, session)
         result = service.acquire_once()
 
-        # Should read from both devices
         assert result["status"] == "completed"
         assert result["points_read"] == 2
 
-        # Verify both devices' data
-        written_data = mock_storage.get_written_data()
-        codes = [list(d["fields"].keys())[0] for d in written_data]
+        mock_storage = MockInfluxDBStorage({})
+        mock_storage.connect()
+        sink = _make_sink_with_mock_storage(session, service.device_groups, mock_storage)
+        _feed_readings_through_sink(sink, result["data"])
+        sink.flush()
+
+        codes = [list(d["fields"].keys())[0] for d in mock_storage.get_written_data()]
         assert "MB_P1" in codes
         assert "PLC_P1" in codes
 
-    @patch("acquisition.services.acquisition_service.settings")
-    @patch("acquisition.services.acquisition_service.StorageRegistry")
     def test_partial_failure_handling(
         self,
-        mock_storage_registry,
-        mock_settings,
         create_device,
         create_point,
         create_task,
         create_session,
     ):
-        """Test handling when one device fails."""
-        mock_settings.INFLUXDB_HOST = "localhost"
-        mock_settings.KAFKA_ENABLED = False
-
-        mock_storage = MockInfluxDBStorage({})
-        mock_storage_registry.create.return_value = mock_storage
-
-        # One working device
+        """A failing device must not stop the rest of the task from succeeding."""
         good_device = create_device(
             protocol="mock_modbus",
             code="GOOD_DEV",
             metadata={"_test_simulated_data": {"P1": 100}},
         )
-
-        # One failing device
         bad_device = create_device(
             protocol="mock_modbus",
             code="BAD_DEV",
@@ -209,82 +238,71 @@ class TestEndToEndAcquisition:
         task = create_task(points=[good_point, bad_point])
         session = create_session(task=task)
 
-        # Execute
         service = AcquisitionService(task, session)
         result = service.acquire_once()
 
-        # Should complete but with errors
+        # The good device succeeded; the bad one surfaces in errors[].
         assert result["status"] == "completed"
-        assert result["points_read"] == 1  # Only good device
-        assert len(result["errors"]) == 1  # Bad device error
+        assert result["points_read"] == 1
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["device"] == "BAD_DEV"
 
-        # Only good device's data should be stored
-        written_data = mock_storage.get_written_data()
-        assert len(written_data) == 1
-        assert "P1" in list(written_data[0]["fields"].keys())
+        mock_storage = MockInfluxDBStorage({})
+        mock_storage.connect()
+        sink = _make_sink_with_mock_storage(session, service.device_groups, mock_storage)
+        _feed_readings_through_sink(sink, result["data"])
+        sink.flush()
 
-    @patch("acquisition.services.acquisition_service.settings")
-    @patch("acquisition.services.acquisition_service.StorageRegistry")
+        written = mock_storage.get_written_data()
+        assert len(written) == 1
+        assert "P1" in list(written[0]["fields"].keys())
+
     def test_storage_failure_handling(
         self,
-        mock_storage_registry,
-        mock_settings,
         create_device,
         create_point,
         create_task,
         create_session,
     ):
-        """Test handling when storage write fails."""
-        mock_settings.INFLUXDB_HOST = "localhost"
-        mock_settings.KAFKA_ENABLED = False
-
-        # Storage that will fail
-        mock_storage = MockInfluxDBStorage({"_test_write_fail": True})
-        mock_storage_registry.create.return_value = mock_storage
-
+        """A failing storage write must not raise; the acquire call still succeeds."""
         device = create_device(
             protocol="mock_modbus",
             metadata={"_test_simulated_data": {"P1": 100}},
         )
         point = create_point(device=device, code="P1")
-
         task = create_task(points=[point])
         session = create_session(task=task)
 
-        # Execute
         service = AcquisitionService(task, session)
-
-        # Should not raise exception, just log error
         result = service.acquire_once()
-
-        # Data was read successfully
         assert result["points_read"] == 1
-        # But storage write failed (logged, not in errors)
+
+        # Storage that throws on every write — sink must swallow + retry.
+        mock_storage = MockInfluxDBStorage({"_test_write_fail": True})
+        mock_storage.connect()
+        sink = _make_sink_with_mock_storage(session, service.device_groups, mock_storage)
+        _feed_readings_through_sink(sink, result["data"])
+
+        # Must not raise.
+        sink.flush()
+
+        # Buffer is retained for retry; total_written stays 0.
+        assert sink.total_written == 0
+        assert sink._fail_count == 1
+        assert len(sink._buffer) == 1
 
 
 @pytest.mark.django_db
 class TestProtocolInteroperability:
-    """Test different protocols working together."""
+    """ModbusTCP, PLC, and MQTT all flowing through the same task / session."""
 
-    @patch("acquisition.services.acquisition_service.settings")
-    @patch("acquisition.services.acquisition_service.StorageRegistry")
     def test_mixed_protocol_acquisition(
         self,
-        mock_storage_registry,
-        mock_settings,
         create_device,
         create_point,
         create_task,
         create_session,
     ):
-        """Test acquisition with ModbusTCP, PLC, and MQTT together."""
-        mock_settings.INFLUXDB_HOST = "localhost"
-        mock_settings.KAFKA_ENABLED = False
-
-        mock_storage = MockInfluxDBStorage({})
-        mock_storage_registry.create.return_value = mock_storage
-
-        # Create devices with different protocols
         modbus_dev = create_device(
             protocol="mock_modbus",
             code="MB",
@@ -302,7 +320,7 @@ class TestProtocolInteroperability:
                 "_test_messages": [
                     {
                         "code": "MQTT_SENSOR",
-                        "value": {"humidity": 60.0},
+                        "value": 60.0,
                         "timestamp": 1234567890000000000,
                         "quality": "good",
                     }
@@ -310,7 +328,6 @@ class TestProtocolInteroperability:
             },
         )
 
-        # Create points
         mb_point = create_point(device=modbus_dev, code="MB_TEMP")
         plc_point = create_point(device=plc_dev, code="PLC_PRESSURE")
         mqtt_point = create_point(device=mqtt_dev, code="MQTT_SENSOR")
@@ -318,44 +335,35 @@ class TestProtocolInteroperability:
         task = create_task(points=[mb_point, plc_point, mqtt_point])
         session = create_session(task=task)
 
-        # Execute
         service = AcquisitionService(task, session)
         result = service.acquire_once()
 
-        # All protocols should work
         assert result["status"] == "completed"
         assert result["points_read"] == 3
-        assert len(result["errors"]) == 0
+        assert result["errors"] == []
 
-        # Verify data from all protocols
-        written_data = mock_storage.get_written_data()
-        assert len(written_data) == 3
+        mock_storage = MockInfluxDBStorage({})
+        mock_storage.connect()
+        sink = _make_sink_with_mock_storage(session, service.device_groups, mock_storage)
+        _feed_readings_through_sink(sink, result["data"])
+        sink.flush()
+
+        assert len(mock_storage.get_written_data()) == 3
 
 
 @pytest.mark.django_db
 class TestDataFormatting:
-    """Test data formatting for storage."""
+    """Point template metadata propagates into storage tags."""
 
-    @patch("acquisition.services.acquisition_service.settings")
-    @patch("acquisition.services.acquisition_service.StorageRegistry")
     def test_point_template_applied(
         self,
-        mock_storage_registry,
-        mock_settings,
         create_device,
         create_point,
         create_point_template,
         create_task,
         create_session,
     ):
-        """Test that point template metadata is included."""
-        mock_settings.INFLUXDB_HOST = "localhost"
-        mock_settings.KAFKA_ENABLED = False
-
-        mock_storage = MockInfluxDBStorage({})
-        mock_storage_registry.create.return_value = mock_storage
-
-        # Create point with template
+        # Template carries unit + Chinese name → both end up as tags.
         template = create_point_template(
             name="温度",
             unit="°C",
@@ -363,25 +371,28 @@ class TestDataFormatting:
             coefficient="0.1",
             precision=2,
         )
-
         device = create_device(
             protocol="mock_modbus",
-            metadata={"_test_simulated_data": {"TEMP": 250}},  # Will be *0.1 = 25.0
+            metadata={"_test_simulated_data": {"TEMP": 250}},  # *0.1 = 25.0
         )
-
         point = create_point(device=device, code="TEMP", template=template)
 
         task = create_task(points=[point])
         session = create_session(task=task)
 
-        # Execute
         service = AcquisitionService(task, session)
-        service.acquire_once()
+        result = service.acquire_once()
 
-        # Check formatted data
-        written_data = mock_storage.get_written_data()
-        assert len(written_data) == 1
+        mock_storage = MockInfluxDBStorage({})
+        mock_storage.connect()
+        sink = _make_sink_with_mock_storage(session, service.device_groups, mock_storage)
+        _feed_readings_through_sink(sink, result["data"])
+        sink.flush()
 
-        data = written_data[0]
+        written = mock_storage.get_written_data()
+        assert len(written) == 1
+        data = written[0]
         assert data["tags"]["cn_name"] == "温度"
         assert data["tags"]["unit"] == "°C"
+        # Template coefficient (0.1) is applied: raw 250 → 25.0.
+        assert data["fields"]["TEMP"] == 25.0

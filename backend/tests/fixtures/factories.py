@@ -18,6 +18,10 @@ _device_counter = itertools.count(1)
 _point_counter = itertools.count(1)
 _task_counter = itertools.count(1)
 _template_counter = itertools.count(1)
+_import_job_counter = itertools.count(1)
+_config_version_counter = itertools.count(1)
+_worker_counter = itertools.count(1)
+_task_run_counter = itertools.count(1)
 
 
 @pytest.fixture
@@ -71,8 +75,12 @@ def create_point_template():
     def _create(name: str = None, **kwargs):
         if name is None:
             name = f"TEMPLATE_{next(_template_counter)}"
+        # Use cn_name if explicitly provided, otherwise use name as-is
+        cn_name = kwargs.get("cn_name")
+        if cn_name is None:
+            cn_name = name
         return config_models.PointTemplate.objects.create(
-            name=kwargs.get("cn_name", f"测点_{name}"),
+            name=cn_name,
             english_name=name,
             unit=kwargs.get("unit", "°C"),
             data_type=kwargs.get("data_type", "float"),
@@ -107,7 +115,6 @@ def create_point(create_device, create_point_template):
             address=kwargs.get("address", "D100"),
             description=kwargs.get("description", f"Test point {code}"),
             sample_rate_hz=Decimal(kwargs.get("sample_rate_hz", "1.0")),
-            to_kafka=kwargs.get("to_kafka", False),
             extra=kwargs.get("extra", {"type": "int16", "num": 1}),
         )
     return _create
@@ -128,7 +135,6 @@ def create_task(create_point):
             code=code,
             name=kwargs.get("name", f"Test Task {code}"),
             description=kwargs.get("description", "Test acquisition task"),
-            schedule=kwargs.get("schedule", "continuous"),
             is_active=kwargs.get("is_active", True),
         )
 
@@ -223,3 +229,92 @@ def sample_storage_config():
         "org": "test-org",
         "bucket": "test-bucket",
     }
+
+
+@pytest.fixture
+def create_import_job():
+    """Factory for creating ImportJob instances."""
+    def _create(
+        status: str = "pending",
+        source_name: str = None,
+        **kwargs
+    ):
+        if source_name is None:
+            source_name = f"test_import_{next(_import_job_counter)}.xlsx"
+
+        return config_models.ImportJob.objects.create(
+            source_name=source_name,
+            triggered_by=kwargs.get("triggered_by", "test_user"),
+            status=status,
+            summary=kwargs.get("summary", {}),
+            related_version=kwargs.get("related_version"),
+        )
+    return _create
+
+
+@pytest.fixture
+def create_config_version():
+    """Factory for creating ConfigVersion instances."""
+    def _create(
+        task: config_models.AcqTask = None,
+        version: int = None,
+        **kwargs
+    ):
+        if task is None:
+            task = create_task()
+        if version is None:
+            version = next(_config_version_counter)
+
+        return config_models.ConfigVersion.objects.create(
+            task=task,
+            version=version,
+            summary=kwargs.get("summary", f"Test version {version}"),
+            created_by=kwargs.get("created_by", "test_user"),
+            payload=kwargs.get("payload", {}),
+        )
+    return _create
+
+
+@pytest.fixture
+def create_worker_endpoint():
+    """Factory for creating WorkerEndpoint instances."""
+    def _create(
+        identifier: str = None,
+        host: str = "127.0.0.1",
+        **kwargs
+    ):
+        if identifier is None:
+            identifier = f"worker-{next(_worker_counter)}"
+
+        return config_models.WorkerEndpoint.objects.create(
+            identifier=identifier,
+            host=host,
+            description=kwargs.get("description", "Test worker"),
+            status=kwargs.get("status", "unknown"),
+            metadata=kwargs.get("metadata", {}),
+        )
+    return _create
+
+
+@pytest.fixture
+def create_task_run(create_task):
+    """Factory for creating TaskRun instances."""
+    def _create(
+        task: config_models.AcqTask = None,
+        worker: config_models.WorkerEndpoint = None,
+        status: str = "pending",
+        **kwargs
+    ):
+        if task is None:
+            task = create_task()
+
+        return config_models.TaskRun.objects.create(
+            task=task,
+            worker=worker,
+            status=status,
+            started_at=kwargs.get("started_at", timezone.now()),
+            finished_at=kwargs.get("finished_at"),
+            log_reference=kwargs.get("log_reference", ""),
+            context=kwargs.get("context", {}),
+        )
+    return _create

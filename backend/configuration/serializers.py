@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from django.conf import settings
@@ -96,15 +97,94 @@ class TaskPointSerializer(serializers.ModelSerializer):
         read_only_fields = ("id",)
 
 
+# Physical / practical upper bound for sample_rate_hz per protocol.
+# A task whose points span multiple protocols is constrained by the
+# *minimum* of the involved protocols' caps.
+PROTOCOL_MAX_HZ = {
+    "modbus_tcp": 50.0,    # 50ms 周期，TCP 极限
+    "modbus_rtu": 5.0,     # 串口 9600bps 物理极限
+    "mqtt": 100.0,         # 推送，没有 polling 概念，宽松
+    "opcua": 50.0,         # subscription 也按 50ms 起
+    "siemens_s7": 20.0,    # snap7 sync ~20Hz 稳
+}
+
+
 class AcqTaskSerializer(serializers.ModelSerializer):
     """采集任务序列化：定义任务编码、调度及测点集合。"""
 
     points = serializers.PrimaryKeyRelatedField(queryset=models.Point.objects.all(), many=True, required=False)
+    sample_rate_hz = serializers.DecimalField(
+        max_digits=8,
+        decimal_places=2,
+        min_value=Decimal("0.1"),
+        max_value=Decimal("100"),
+        required=False,
+        help_text="采集频率(Hz)，0.1~100，修改后将自动重启运行中的会话。",
+    )
 
     class Meta:
         model = models.AcqTask
-        fields = ["id", "code", "name", "description", "schedule", "is_active", "points", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "code",
+            "name",
+            "description",
+            "sample_rate_hz",
+            "is_active",
+            "points",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        # Determine the requested rate. On PATCH/PUT we compare against the
+        # incoming value if present, else fall back to the existing instance.
+        rate = attrs.get("sample_rate_hz")
+        if rate is None and self.instance is not None:
+            rate = getattr(self.instance, "sample_rate_hz", None)
+        if rate is None:
+            return attrs
+
+        # Determine the protocols actually in play. Prefer the points being
+        # assigned in this request; otherwise fall back to the instance's
+        # current M2M membership. New tasks with no points yet skip this
+        # validation entirely (we have nothing concrete to constrain).
+        incoming_points = attrs.get("points")
+        if incoming_points:
+            protocols = {p.device.protocol for p in incoming_points if p.device_id}
+        elif self.instance is not None and self.instance.pk:
+            protocols = set(
+                self.instance.points
+                .values_list("device__protocol", flat=True)
+                .distinct()
+            )
+        else:
+            protocols = set()
+
+        if not protocols:
+            return attrs
+
+        rate_f = float(rate)
+        # Find the tightest protocol constraint and the protocol that
+        # imposed it, so the error message can name the offender.
+        worst_protocol = None
+        worst_limit = None
+        for proto in protocols:
+            cap = PROTOCOL_MAX_HZ.get(proto, 100.0)
+            if worst_limit is None or cap < worst_limit:
+                worst_limit = cap
+                worst_protocol = proto
+
+        if worst_limit is not None and rate_f > worst_limit:
+            raise serializers.ValidationError({
+                "sample_rate_hz": (
+                    f"协议 {worst_protocol} 不支持高于 {worst_limit} Hz 的采集频率"
+                ),
+            })
+        return attrs
 
     def create(self, validated_data):
         points = validated_data.pop("points", [])

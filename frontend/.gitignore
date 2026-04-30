@@ -1,0 +1,7 @@
+node_modules
+dist
+build
+.vite
+
+# stale tsc build artifacts that would shadow .tsx/.ts at runtime
+src/**/*.js

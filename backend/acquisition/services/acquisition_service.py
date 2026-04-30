@@ -1,4 +1,11 @@
-"""Core acquisition service for data collection orchestration."""
+"""Core acquisition service for data collection orchestration.
+
+The service is now a thin shell over :class:`AcquisitionPipeline`. Per-device
+read loops, batching, and sink writes live in
+``acquisition/services/pipeline.py`` and ``acquisition/services/sinks.py``;
+this class only owns lifecycle (status transitions, startup validation, and
+periodic health snapshots into ``session.metadata``).
+"""
 from __future__ import annotations
 
 import logging
@@ -6,136 +13,116 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List
 
-from django.conf import settings
-
 from acquisition import models as acq_models
-from acquisition.protocols import ProtocolRegistry
+from acquisition.protocols import ProtocolRegistry  # noqa: F401  (kept for legacy imports)
 from configuration import models as config_models
-from storage import StorageRegistry
+
+from .pipeline import AcquisitionPipeline, ReadWorker
+from .sinks import WebSocketSink
 
 logger = logging.getLogger(__name__)
 
+# Per-device restart tracking. A device that crashes >= MAX_RESTARTS times
+# within RESTART_WINDOW_S seconds is marked fatal and is not restarted again.
+# These are soft limits — sized to absorb transient post-fork hiccups while
+# still cutting off pathological crash loops.
+MAX_RESTARTS_PER_WINDOW = 5
+RESTART_WINDOW_S = 600.0  # 10 minutes
+
+# Minimum interval between InfluxDB health writes (seconds)
+HEALTH_WRITE_INTERVAL = 5.0
+# Minimum interval between SQLite metadata updates (seconds)
+SQLITE_METADATA_INTERVAL = 10.0
+# Minimum interval between in-loop ``_update_session_health`` invocations.
+# Bumped from 2s -> 5s so high-frequency (20 Hz) sessions don't pay the
+# SQLite metadata-write cost too often. The InfluxDB and SQLite writes
+# inside ``_update_session_health`` are themselves rate-limited by
+# HEALTH_WRITE_INTERVAL / SQLITE_METADATA_INTERVAL above.
+METADATA_WRITE_INTERVAL_S = 5.0
+
 
 class AcquisitionService:
-    """
-    Orchestrates data acquisition from devices and storage.
-
-    Manages protocol connections, data reading, and storage writes.
-    """
+    """Orchestrates data acquisition lifecycle for a single session."""
 
     def __init__(
         self,
         task: config_models.AcqTask,
-        session: acq_models.AcquisitionSession
+        session: acq_models.AcquisitionSession,
     ) -> None:
-        """
-        Initialize acquisition service.
-
-        Args:
-            task: Acquisition task configuration
-            session: Active session tracking
-        """
         self.task = task
         self.session = session
         self.logger = logging.getLogger(f"{__name__}.{task.code}")
 
-        # Initialize storage backends
-        self.storages = self._init_storages()
-
-        # Group points by device for efficient reading
+        # Group points by device; this is the input to the pipeline.
         self.device_groups = self._group_points_by_device()
 
-    def _init_storages(self) -> Dict[str, Any]:
-        """Initialize configured storage backends."""
-        storages = {}
+        # Health-update bookkeeping
+        self._last_influxdb_health_write = 0.0
+        self._last_sqlite_metadata_update = 0.0
 
-        # InfluxDB storage - using HTTP API mode for remote server
-        influx_config = {
-            "url": getattr(settings, "INFLUXDB_URL", None),  # Full URL if provided
-            "host": getattr(settings, "INFLUXDB_HOST", "localhost"),
-            "port": getattr(settings, "INFLUXDB_PORT", 8086),
-            "token": getattr(settings, "INFLUXDB_TOKEN", ""),
-            "org": getattr(settings, "INFLUXDB_ORG", "default"),
-            "bucket": getattr(settings, "INFLUXDB_BUCKET", "default"),
-            "docker_mode": False,  # Use HTTP API for remote InfluxDB
-        }
-        try:
-            influx = StorageRegistry.create("influxdb", influx_config)
-            influx.connect()
-            storages["influxdb"] = influx
-            self.logger.info("InfluxDB storage initialized")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize InfluxDB: {e}")
+        # Watchdog: per-device restart history. device_id -> (count, first_ts).
+        # Keyed by device id so we can correlate across worker re-construction.
+        self._restart_history: Dict[int, Dict[str, Any]] = {}
+        # device_ids whose crash budget is exhausted; we stop trying to
+        # restart these but the rest of the session keeps running.
+        self._fatal_devices: set = set()
 
-        return storages
-
+    # ------------------------------------------------------------------ setup
     def _group_points_by_device(self) -> Dict[int, Dict[str, Any]]:
-        """
-        Group points by device for batch reading.
-
-        Returns:
-            Dict mapping device_id to device info and points
-        """
-        groups = defaultdict(lambda: {"device": None, "points": [], "protocol": None})
+        """Group points by device for batch reading."""
+        groups: Dict[int, Dict[str, Any]] = defaultdict(
+            lambda: {"device": None, "points": []}
+        )
 
         for point in self.task.points.select_related("device", "template").all():
             device_id = point.device.id
             if groups[device_id]["device"] is None:
                 groups[device_id]["device"] = point.device
 
-            # Convert point to protocol-readable format
+            extras = dict(point.extra or {})
             point_config = {
+                **extras,
                 "code": point.code,
                 "address": point.address,
-                "type": point.extra.get("type", "int16") if point.extra else "int16",
-                "num": point.extra.get("num", 1) if point.extra else 1,
                 "coefficient": float(point.template.coefficient) if point.template else 1.0,
                 "precision": int(point.template.precision) if point.template else 2,
             }
+            if point.template:
+                point_config.setdefault("cn_name", point.template.name)
+                point_config.setdefault("unit", point.template.unit)
             groups[device_id]["points"].append(point_config)
 
         return dict(groups)
 
+    # ------------------------------------------------------------- single-shot
     def acquire_once(self) -> Dict[str, Any]:
-        """
-        Perform single acquisition cycle.
+        """Perform a single read pass for every device.
 
-        Returns:
-            Dict with acquisition results
+        Used by ``acquire_once`` celery task / debug commands. Re-uses the
+        legacy ``read_points`` path for simplicity — the pipeline machinery
+        is overkill for one-shot reads.
         """
-        self.logger.info(f"Starting single acquisition for task {self.task.code}")
-
-        all_data = []
-        errors = []
+        self.logger.info("Starting single acquisition for task %s", self.task.code)
+        all_data: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
 
         for device_id, group in self.device_groups.items():
             device = group["device"]
             points = group["points"]
-
             try:
-                # Create protocol instance
-                device_config = {
+                cfg = {
                     "source_ip": device.ip_address,
                     "source_port": device.port,
                     "protocol_type": device.protocol,
-                    **(device.metadata or {})
+                    **(device.metadata or {}),
                 }
-
-                protocol = ProtocolRegistry.create(device.protocol, device_config)
-
-                # Read data
+                protocol = ProtocolRegistry.create(device.protocol, cfg)
                 with protocol:
                     readings = protocol.read_points(points)
-                    all_data.extend(self._format_for_storage(readings, device))
-
-            except Exception as e:
-                error_msg = f"Failed to read from device {device.code}: {e}"
-                self.logger.error(error_msg)
-                errors.append({"device": device.code, "error": str(e)})
-
-        # Write to storage
-        if all_data:
-            self._write_to_storage(all_data)
+                    all_data.extend(readings)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error("Failed to read from device %s: %s", device.code, exc)
+                errors.append({"device": device.code, "error": str(exc)})
 
         return {
             "status": "completed",
@@ -144,296 +131,302 @@ class AcquisitionService:
             "data": all_data,
         }
 
+    # ----------------------------------------------------------- continuous
     def run_continuous(self) -> Dict[str, Any]:
-        """
-        Run continuous acquisition loop with persistent connections.
+        """Run the producer-consumer pipeline until the session is stopped."""
+        self.logger.info("Starting pipeline acquisition for task %s", self.task.code)
 
-        Keeps protocol connections open for efficient data collection.
-        Implements batching, timeout detection, and auto-reconnection.
-
-        Returns:
-            Dict with execution summary
-        """
-        self.logger.info(f"Starting continuous acquisition for task {self.task.code}")
-
-        # Update session status
         self.session.status = acq_models.AcquisitionSession.STATUS_RUNNING
         self.session.save(update_fields=["status", "updated_at"])
 
-        total_cycles = 0
-        total_points = 0
-        errors = []
+        sample_rate = float(self.task.sample_rate_hz)
+        pipeline = AcquisitionPipeline(self.session, sample_rate_hz=sample_rate)
+        pipeline.start(self.device_groups)
 
-        # Configuration
-        batch_size = getattr(settings, "ACQUISITION_BATCH_SIZE", 50)
-        batch_timeout = getattr(settings, "ACQUISITION_BATCH_TIMEOUT", 5.0)  # seconds
-        connection_timeout = getattr(settings, "ACQUISITION_CONNECTION_TIMEOUT", 30.0)  # seconds
-        max_reconnect_attempts = getattr(settings, "ACQUISITION_MAX_RECONNECT_ATTEMPTS", 3)
+        # Block briefly so the first read completes before we report status.
+        self._run_startup_validation(pipeline, timeout=2.0)
 
-        # Initialize persistent protocol connections
-        device_protocols = {}
-        device_health = {}  # Track last successful read time
-
+        last_meta_update = 0.0
+        # Stash the pipeline so helpers (watchdog) can reach it.
+        self.pipeline = pipeline
         try:
-            # Establish all protocol connections upfront
-            for device_id, group in self.device_groups.items():
-                device = group["device"]
-                try:
-                    device_config = {
-                        "source_ip": device.ip_address,
-                        "source_port": device.port,
-                        "protocol_type": device.protocol,
-                        **(device.metadata or {})
-                    }
-                    protocol = ProtocolRegistry.create(device.protocol, device_config)
-                    protocol.connect()
-                    device_protocols[device_id] = protocol
-                    device_health[device_id] = {
-                        "last_success": time.time(),
-                        "consecutive_failures": 0,
-                        "status": "healthy"
-                    }
-                    self.logger.info(f"Connected to device {device.code}")
-                except Exception as e:
-                    self.logger.error(f"Failed to connect to device {device.code}: {e}")
-                    device_health[device_id] = {
-                        "last_success": None,
-                        "consecutive_failures": 1,
-                        "status": "disconnected"
-                    }
-
-            # Batch data buffer
-            batch_buffer = []
-            batch_start_time = time.time()
-
-            # Main acquisition loop
-            while self._should_continue():
-                cycle_start = time.time()
-
-                # Read from all devices
-                for device_id, group in self.device_groups.items():
-                    device = group["device"]
-                    points = group["points"]
-                    protocol = device_protocols.get(device_id)
-
-                    if not protocol:
-                        # Try to reconnect
-                        if device_health[device_id]["consecutive_failures"] < max_reconnect_attempts:
-                            try:
-                                device_config = {
-                                    "source_ip": device.ip_address,
-                                    "source_port": device.port,
-                                    "protocol_type": device.protocol,
-                                    **(device.metadata or {})
-                                }
-                                protocol = ProtocolRegistry.create(device.protocol, device_config)
-                                protocol.connect()
-                                device_protocols[device_id] = protocol
-                                device_health[device_id]["status"] = "healthy"
-                                self.logger.info(f"Reconnected to device {device.code}")
-                            except Exception as e:
-                                device_health[device_id]["consecutive_failures"] += 1
-                                self.logger.warning(f"Reconnect failed for {device.code}: {e}")
-                                continue
-                        else:
-                            continue
-
-                    try:
-                        # Read data without disconnecting
-                        readings = protocol.read_points(points)
-                        formatted_data = self._format_for_storage(readings, device)
-                        batch_buffer.extend(formatted_data)
-
-                        # Update health status
-                        device_health[device_id]["last_success"] = time.time()
-                        device_health[device_id]["consecutive_failures"] = 0
-                        device_health[device_id]["status"] = "healthy"
-
-                    except Exception as e:
-                        error_msg = f"Failed to read from device {device.code}: {e}"
-                        self.logger.error(error_msg)
-                        errors.append({"device": device.code, "error": str(e), "time": time.time()})
-
-                        # Update health status
-                        device_health[device_id]["consecutive_failures"] += 1
-
-                        # Check for timeout
-                        last_success = device_health[device_id]["last_success"]
-                        if last_success and (time.time() - last_success) > connection_timeout:
-                            device_health[device_id]["status"] = "timeout"
-                            self.logger.warning(f"Device {device.code} timeout detected")
-
-                            # Disconnect and attempt reconnect on next cycle
-                            try:
-                                protocol.disconnect()
-                            except:
-                                pass
-                            device_protocols[device_id] = None
-                        else:
-                            device_health[device_id]["status"] = "error"
-
-                # Write batch to storage if buffer is full or timeout reached
-                batch_elapsed = time.time() - batch_start_time
-                if batch_buffer and (len(batch_buffer) >= batch_size or batch_elapsed >= batch_timeout):
-                    self._write_to_storage(batch_buffer)
-                    total_points += len(batch_buffer)
-                    batch_buffer = []
-                    batch_start_time = time.time()
-
-                total_cycles += 1
-
-                # Update session with health info
-                self._update_session_health(device_health)
-
-                # Sleep based on task schedule
-                cycle_duration = time.time() - cycle_start
-                sleep_time = max(0, self._get_cycle_interval() - cycle_duration)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
+            while self._should_continue() and pipeline.is_alive():
+                time.sleep(0.5)
+                now = time.time()
+                if now - last_meta_update >= METADATA_WRITE_INTERVAL_S:
+                    self._supervise_workers(pipeline)
+                    self._update_session_health(pipeline)
+                    last_meta_update = now
         except KeyboardInterrupt:
             self.logger.info("Acquisition interrupted by user")
-        except Exception as e:
-            self.logger.error(f"Acquisition loop failed: {e}", exc_info=True)
-            raise
         finally:
-            # Write any remaining buffered data
-            if batch_buffer:
-                try:
-                    self._write_to_storage(batch_buffer)
-                    total_points += len(batch_buffer)
-                except Exception as e:
-                    self.logger.error(f"Failed to write final batch: {e}")
-
-            # Disconnect all protocols
-            for device_id, protocol in device_protocols.items():
-                if protocol:
-                    try:
-                        protocol.disconnect()
-                        device = self.device_groups[device_id]["device"]
-                        self.logger.info(f"Disconnected from device {device.code}")
-                    except Exception as e:
-                        self.logger.warning(f"Error disconnecting protocol: {e}")
-
-            # Clean up storage connections
-            for storage in self.storages.values():
-                try:
-                    storage.disconnect()
-                except Exception as e:
-                    self.logger.warning(f"Error disconnecting storage: {e}")
+            pipeline.stop(timeout=10.0)
+            try:
+                self._update_session_health(pipeline, force_sqlite=True)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Final metadata update failed: %s", exc)
 
         return {
             "status": "completed",
-            "total_cycles": total_cycles,
-            "total_points": total_points,
-            "errors": errors[-10:],  # Last 10 errors
-            "device_health": device_health,
+            "device_health": pipeline.health,
         }
 
+    # ----------------------------------------------------------- helpers
     def _should_continue(self) -> bool:
-        """Check if acquisition loop should continue."""
-        # Refresh session from DB
-        self.session.refresh_from_db()
-
-        # Continue only if session is still running
+        """Re-read session status from the DB on every loop iteration."""
+        try:
+            self.session.refresh_from_db()
+        except Exception:  # noqa: BLE001
+            return False
         return self.session.status == acq_models.AcquisitionSession.STATUS_RUNNING
 
-    def _get_cycle_interval(self) -> float:
-        """Get acquisition cycle interval in seconds."""
-        # Parse schedule (simple implementation)
-        schedule = self.task.schedule
-        if schedule == "continuous":
-            return 1.0  # Default 1 second
-        # Add more schedule parsing logic as needed
-        return 1.0
+    def _run_startup_validation(self, pipeline: AcquisitionPipeline, timeout: float) -> None:
+        """Wait briefly for the workers to take their first reading.
 
-    def _format_for_storage(
-        self,
-        readings: List[Dict[str, Any]],
-        device: config_models.Device
-    ) -> List[Dict[str, Any]]:
+        Records a snapshot of per-device health into
+        ``session.metadata.startup_validation`` so the API can surface a
+        first-cycle status without polling InfluxDB.
         """
-        Format readings for storage backends.
+        deadline = time.time() + max(0.1, float(timeout))
+        # Poll until either every device has a successful read or we time out.
+        while time.time() < deadline:
+            if self.device_groups and all(
+                pipeline.health.get(d_id, {}).get("last_success")
+                for d_id in self.device_groups
+            ):
+                break
+            time.sleep(0.1)
 
-        Args:
-            readings: Raw protocol readings
-            device: Device object
+        snapshot: Dict[str, Any] = {
+            "checked_at": time.time(),
+            "devices": {},
+        }
+        all_healthy = True
+        for device_id, group in self.device_groups.items():
+            device = group["device"]
+            health = pipeline.health.get(device_id, {})
+            status = health.get("status", "init")
+            snapshot["devices"][device.code] = {
+                "status": status,
+                "consecutive_failures": health.get("consecutive_failures", 0),
+                "last_success": health.get("last_success"),
+            }
+            if status != "healthy":
+                all_healthy = False
+        snapshot["all_healthy"] = all_healthy
 
-        Returns:
-            Formatted data points (only good quality data)
+        try:
+            self.session.refresh_from_db(fields=["metadata"])
+            meta = self.session.metadata or {}
+            meta["startup_validation"] = snapshot
+            self.session.metadata = meta
+            self.session.save(update_fields=["metadata", "updated_at"])
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Failed to persist startup_validation: %s", exc)
+
+    # ----------------------------------------------------------- watchdog
+    def _supervise_workers(self, pipeline: AcquisitionPipeline) -> None:
+        """Detect dead ReadWorker threads and restart them in place.
+
+        Bounded by ``MAX_RESTARTS_PER_WINDOW`` per device per
+        ``RESTART_WINDOW_S`` window — a device that crashes too often is
+        considered fatal and is left dead so the rest of the session can
+        continue without an infinite restart loop.
+
+        Emits a ``worker_died`` connection_event through the WebSocketSink
+        on each restart so the operator UI can render a lifecycle entry
+        (we emit from the supervisor's vantage point because the worker
+        thread is, by definition, no longer alive to emit it itself).
         """
-        formatted = []
+        dead = pipeline.dead_workers()
+        if not dead:
+            return
 
-        for reading in readings:
-            # Get point details
-            point = self.task.points.filter(code=reading["code"]).first()
-            if not point:
+        ws_sink = next((s for s in pipeline.sinks if isinstance(s, WebSocketSink)), None)
+        now = time.time()
+
+        for worker in dead:
+            device = worker.device
+            if device.id in self._fatal_devices:
                 continue
 
-            # All readings should have good quality and real values
-            # Protocol layer raises exceptions instead of returning bad/None data
-            quality = reading.get("quality", "good")
+            # --- update restart-window history --------------------------
+            history = self._restart_history.get(device.id)
+            if history is None or (now - history["first_ts"]) > RESTART_WINDOW_S:
+                history = {"count": 0, "first_ts": now}
+                self._restart_history[device.id] = history
+            history["count"] += 1
 
-            # Prepare data point
-            # Use current time for timestamp (server-side time) instead of device timestamp
-            # This ensures timestamps are always valid and in sync with the data collection system
-            current_timestamp = int(time.time() * 1e9)  # Convert to nanoseconds
+            self.logger.warning(
+                "ReadWorker[%s] died unexpectedly, restarting (attempt %d/%d in %.0fs window)",
+                device.code,
+                history["count"],
+                MAX_RESTARTS_PER_WINDOW,
+                RESTART_WINDOW_S,
+            )
 
-            data_point = {
-                "measurement": device.metadata.get("device_a_tag", device.code) if device.metadata else device.code,
+            # --- broadcast worker_died event to the operator UI ---------
+            if ws_sink is not None:
+                try:
+                    ws_sink.consume_event({
+                        "event": "worker_died",
+                        "device_code": device.code,
+                        "device_id": device.id,
+                        "restart_count": history["count"],
+                        "max_restarts": MAX_RESTARTS_PER_WINDOW,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning(
+                        "WebSocketSink emit worker_died failed for %s: %s",
+                        device.code, exc,
+                    )
+
+            # --- enforce restart cap ------------------------------------
+            if history["count"] > MAX_RESTARTS_PER_WINDOW:
+                self.logger.error(
+                    "ReadWorker[%s] exceeded restart budget (%d in %.0fs); "
+                    "marking device fatal — no further restarts",
+                    device.code, history["count"], RESTART_WINDOW_S,
+                )
+                self._fatal_devices.add(device.id)
+                if ws_sink is not None:
+                    try:
+                        ws_sink.consume_event({
+                            "event": "worker_fatal",
+                            "device_code": device.code,
+                            "device_id": device.id,
+                            "restart_count": history["count"],
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+
+            # --- construct a fresh worker with the same config ----------
+            try:
+                new_worker = ReadWorker(
+                    device=worker.device,
+                    points=worker.points,
+                    sinks=worker.sinks,
+                    sample_rate_hz=1.0 / worker.cycle_interval if worker.cycle_interval else pipeline.sample_rate_hz,
+                    shutdown_event=pipeline.shutdown_event,
+                    health_dict=pipeline.health,
+                    max_reconnect=worker.max_reconnect,
+                    connection_timeout=worker.connection_timeout,
+                    reconnect_backoff=worker.reconnect_backoff,
+                )
+                pipeline.replace_worker(old=worker, new=new_worker)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(
+                    "Failed to construct replacement worker for %s: %s",
+                    device.code, exc,
+                )
+
+    # ----------------------------------------------------------- health writes
+    def _update_session_health(
+        self,
+        pipeline: AcquisitionPipeline,
+        *,
+        force_sqlite: bool = False,
+    ) -> None:
+        """Push health into InfluxDB (frequent) and SQLite (every ~10 s)."""
+        now = time.time()
+        device_health = pipeline.health
+
+        if (now - self._last_influxdb_health_write) >= HEALTH_WRITE_INTERVAL and pipeline.influx_sink:
+            health_points = self._format_health_data(device_health, now)
+            try:
+                pipeline.influx_sink.write_health_points(health_points)
+                self._last_influxdb_health_write = now
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Failed to write health to InfluxDB: %s", exc)
+
+        if force_sqlite or (now - self._last_sqlite_metadata_update) >= SQLITE_METADATA_INTERVAL:
+            self._update_sqlite_metadata(device_health, now)
+            self._last_sqlite_metadata_update = now
+
+    def _format_health_data(
+        self,
+        device_health: Dict[int, Dict[str, Any]],
+        timestamp: float,
+    ) -> List[Dict[str, Any]]:
+        """Build per-device + aggregate health points for InfluxDB."""
+        health_points: List[Dict[str, Any]] = []
+
+        for device_id, health in device_health.items():
+            device = self.device_groups.get(device_id, {}).get("device")
+            if device is None:
+                continue
+            health_points.append({
+                "measurement": "session_health",
                 "tags": {
-                    "site": device.site.code,
-                    "device": device.code,
-                    "point": reading["code"],
-                    "quality": quality,
+                    "session_id": str(self.session.id),
+                    "task_code": self.task.code,
+                    "device_code": device.code,
+                    "device_ip": device.ip_address or "unknown",
+                    "status": health.get("status", "unknown"),
                 },
                 "fields": {
-                    reading["code"]: reading["value"],
+                    "consecutive_failures": health.get("consecutive_failures", 0),
+                    "last_success_ts": health.get("last_success") or 0,
+                    "session_status": self.session.status,
                 },
-                "time": current_timestamp,
-            }
+                "time": int(timestamp * 1e9),
+            })
 
-            # Add template info if available
-            if point.template:
-                data_point["tags"]["cn_name"] = point.template.name
-                data_point["tags"]["unit"] = point.template.unit
+        total_failures = sum(h.get("consecutive_failures", 0) for h in device_health.values())
+        healthy_devices = sum(1 for h in device_health.values() if h.get("status") == "healthy")
+        health_points.append({
+            "measurement": "session_health",
+            "tags": {
+                "session_id": str(self.session.id),
+                "task_code": self.task.code,
+                "device_code": "_aggregate",
+                "device_ip": "N/A",
+                "status": "aggregate",
+            },
+            "fields": {
+                "total_devices": len(device_health),
+                "healthy_devices": healthy_devices,
+                "total_consecutive_failures": total_failures,
+                "session_status": self.session.status,
+            },
+            "time": int(timestamp * 1e9),
+        })
+        return health_points
 
-            formatted.append(data_point)
-
-        return formatted
-
-    def _write_to_storage(self, data: List[Dict[str, Any]]) -> None:
-        """Write data to all configured storage backends (InfluxDB)."""
-        for storage_name, storage in self.storages.items():
-            try:
-                storage.write(data)
-                self.logger.debug(f"Wrote {len(data)} points to {storage_name}")
-            except Exception as e:
-                self.logger.error(f"Failed to write to {storage_name}: {e}")
-
-    def _update_session_health(self, device_health: Dict[int, Dict[str, Any]]) -> None:
-        """
-        Update session metadata with device health information.
-
-        Args:
-            device_health: Dict mapping device_id to health status
-        """
+    def _update_sqlite_metadata(
+        self,
+        device_health: Dict[int, Dict[str, Any]],
+        timestamp: float,
+    ) -> None:
+        """Persist a health summary into ``session.metadata`` (SQLite)."""
         try:
-            # Format health info for storage
-            health_summary = {}
+            health_summary: Dict[str, Any] = {}
             for device_id, health in device_health.items():
-                device = self.device_groups[device_id]["device"]
+                device = self.device_groups.get(device_id, {}).get("device")
+                if device is None:
+                    continue
                 health_summary[device.code] = {
-                    "status": health["status"],
-                    "consecutive_failures": health["consecutive_failures"],
-                    "last_success": health["last_success"],
+                    "status": health.get("status", "unknown"),
+                    "consecutive_failures": health.get("consecutive_failures", 0),
+                    "last_success": health.get("last_success"),
                 }
 
-            # Update session metadata
-            self.session.metadata = self.session.metadata or {}
-            self.session.metadata["device_health"] = health_summary
-            self.session.metadata["last_health_update"] = time.time()
+            self.session.refresh_from_db(fields=["metadata"])
+            meta = self.session.metadata or {}
+            meta["device_health"] = health_summary
+            meta["last_health_update"] = timestamp
+            # Pick the most recent successful read across devices as a
+            # rough "last_read_time" — used by the recovery heartbeat.
+            last_reads = [h.get("last_success") for h in device_health.values() if h.get("last_success")]
+            if last_reads:
+                meta["last_read_time"] = max(last_reads)
+            # Surface cumulative successful-write count to the API. Pulled
+            # straight from the pipeline (= InfluxDBSink.total_written).
+            pipeline = getattr(self, "pipeline", None)
+            if pipeline is not None:
+                meta["total_points_read"] = pipeline.total_points_read
+            self.session.metadata = meta
             self.session.save(update_fields=["metadata", "updated_at"])
-
-        except Exception as e:
-            self.logger.warning(f"Failed to update session health: {e}")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Failed to update SQLite metadata: %s", exc)

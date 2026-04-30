@@ -11,8 +11,10 @@ router.register(r"channels", views.ChannelViewSet, basename="channel")
 router.register(r"points", views.PointViewSet, basename="point")
 router.register(r"tasks", views.AcqTaskViewSet, basename="task")
 router.register(r"import-jobs", views.ImportJobViewSet, basename="import-job")
-router.register(r"config-versions", views.ConfigVersionViewSet, basename="config-version")
+router.register(r"versions", views.ConfigVersionViewSet, basename="config-version")
 
 urlpatterns = [
+    # Bare route — must precede router include so it isn't shadowed.
+    path("export-excel/", views.ConfigExportView.as_view(), name="config-export-excel"),
     path("", include(router.urls)),
 ]

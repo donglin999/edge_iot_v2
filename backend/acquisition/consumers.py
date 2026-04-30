@@ -87,6 +87,17 @@ class AcquisitionConsumer(AsyncWebsocketConsumer):
             'data': event['data']
         }))
 
+    async def connection_event(self, event):
+        """Handle a ReadWorker connection lifecycle event.
+
+        Forwards the payload built by ``WebSocketSink.consume_event`` to
+        the browser as ``{"type": "connection_event", "data": {...}}``.
+        """
+        await self.send(text_data=json.dumps({
+            'type': 'connection_event',
+            'data': event['data'],
+        }))
+
     @database_sync_to_async
     def get_session_status(self):
         """Fetch current session status from database."""
@@ -203,6 +214,22 @@ class GlobalAcquisitionConsumer(AsyncWebsocketConsumer):
         await self.send(text_data=json.dumps({
             'type': 'session_stopped',
             'data': event['data']
+        }))
+
+    async def connection_event(self, event):
+        """Forward a ReadWorker connection lifecycle event globally."""
+        await self.send(text_data=json.dumps({
+            'type': 'connection_event',
+            'data': event['data'],
+        }))
+
+    async def data_point_update(self, event):
+        """Forward aggregated data point updates globally (silently — global
+        consumer subscribers may or may not care, but absence of handler raises
+        ValueError on every channel layer message)."""
+        await self.send(text_data=json.dumps({
+            'type': 'data_point_update',
+            'data': event['data'],
         }))
 
     @database_sync_to_async

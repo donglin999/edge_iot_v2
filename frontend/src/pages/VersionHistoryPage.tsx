@@ -1,208 +1,457 @@
-import { useEffect, useState } from 'react';
-import { fetchTaskVersions, fetchAllTasks, rollbackToVersion, ConfigVersion } from '../services/versionApi';
+/**
+ * 配置版本管理页。
+ *
+ * 展示所有任务的配置版本，支持：
+ * - 顶栏：导出当前站点配置（按 site 选择）、按任务过滤、批量删除
+ * - 行级：查看 payload 详情、下载该版本 Excel、回滚、删除
+ * - 表格：分页 + 行选择
+ */
+import { useEffect, useMemo, useState } from 'react';
+import {
+  App,
+  Button,
+  Card,
+  Descriptions,
+  Drawer,
+  Dropdown,
+  Empty,
+  Popconfirm,
+  Select,
+  Space,
+  Table,
+  Tag,
+  Typography,
+} from 'antd';
+import {
+  CloudDownloadOutlined,
+  DeleteOutlined,
+  DownOutlined,
+  DownloadOutlined,
+  FileSearchOutlined,
+  RollbackOutlined,
+} from '@ant-design/icons';
+import type { ColumnsType, TableRowSelection } from 'antd/es/table/interface';
+
+import {
+  bulkDeleteVersions,
+  deleteVersion,
+  exportCurrentConfig,
+  exportVersion,
+  fetchAllTasks,
+  fetchSites,
+  fetchTaskVersions,
+  rollbackToVersion,
+  type ConfigVersion,
+  type Site,
+} from '../services/versionApi';
+import './VersionHistoryPage.css';
+
+const { Text, Title } = Typography;
+
+interface TaskOption {
+  id: number;
+  code: string;
+  name: string;
+}
+
+const formatDateTime = (iso: string): string => {
+  if (!iso) return '-';
+  try {
+    return new Date(iso).toLocaleString('zh-CN');
+  } catch {
+    return iso;
+  }
+};
 
 const VersionHistoryPage = () => {
-  const [tasks, setTasks] = useState<Array<{ id: number; code: string; name: string }>>([]);
-  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
+  const { message } = App.useApp();
+
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
-  const [selectedVersion, setSelectedVersion] = useState<ConfigVersion | null>(null);
+  const [tasks, setTasks] = useState<TaskOption[]>([]);
+  const [sites, setSites] = useState<Site[]>([]);
+  const [filterTaskId, setFilterTaskId] = useState<number | null>(null);
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [detailVersion, setDetailVersion] = useState<ConfigVersion | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
 
-  // Load tasks on mount
-  useEffect(() => {
-    const loadTasks = async () => {
-      try {
-        const taskList = await fetchAllTasks();
-        setTasks(taskList);
-        if (taskList.length > 0) {
-          setSelectedTaskId(taskList[0].id);
-        }
-      } catch (err) {
-        setError((err as Error).message);
-      }
-    };
-    loadTasks();
-  }, []);
-
-  // Load versions when task is selected
-  useEffect(() => {
-    if (selectedTaskId === null) return;
-
-    const loadVersions = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const versionList = await fetchTaskVersions(selectedTaskId);
-        setVersions(versionList);
-        setSelectedVersion(null);
-      } catch (err) {
-        setError((err as Error).message);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    loadVersions();
-  }, [selectedTaskId]);
-
-  const handleRollback = async (versionId: number) => {
-    if (!confirm('确定要回滚到此版本吗？这将创建一个新版本作为回滚记录。')) {
-      return;
-    }
-
+  const loadVersions = async (taskId: number | null) => {
     setLoading(true);
-    setError(null);
-    setSuccess(null);
-
     try {
-      const result = await rollbackToVersion(versionId);
-      setSuccess(result.detail);
-      // Reload versions
-      if (selectedTaskId) {
-        const versionList = await fetchTaskVersions(selectedTaskId);
-        setVersions(versionList);
-      }
+      const list = await fetchTaskVersions(taskId);
+      setVersions(list);
+      setSelectedRowKeys((prev) => prev.filter((k) => list.some((v) => v.id === k)));
     } catch (err) {
-      setError((err as Error).message);
+      message.error((err as Error).message || '加载版本列表失败');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleViewDetails = (version: ConfigVersion) => {
-    setSelectedVersion(selectedVersion?.id === version.id ? null : version);
+  // initial load: tasks, sites, all versions
+  useEffect(() => {
+    fetchAllTasks()
+      .then(setTasks)
+      .catch((err) => message.error((err as Error).message || '加载任务列表失败'));
+    fetchSites()
+      .then(setSites)
+      .catch((err) => message.error((err as Error).message || '加载站点列表失败'));
+    loadVersions(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleFilterChange = (value: number | null) => {
+    setFilterTaskId(value);
+    loadVersions(value);
   };
 
-  return (
-    <section>
-      <h2>配置版本历史</h2>
+  const handleExportCurrent = async (siteCode: string) => {
+    setExporting(true);
+    try {
+      await exportCurrentConfig(siteCode);
+      message.success(`已导出站点 ${siteCode} 的当前配置`);
+    } catch (err) {
+      message.error((err as Error).message || '导出失败');
+    } finally {
+      setExporting(false);
+      setSiteDropdownOpen(false);
+    }
+  };
 
-      <div style={{ marginBottom: '1.5rem' }}>
-        <label htmlFor="task-select" style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
-          选择任务：
-        </label>
-        <select
-          id="task-select"
-          value={selectedTaskId || ''}
-          onChange={(e) => setSelectedTaskId(Number(e.target.value))}
-          style={{ padding: '0.5rem', fontSize: '1rem', width: '100%', maxWidth: '400px' }}
-        >
-          {tasks.map((task) => (
-            <option key={task.id} value={task.id}>
-              {task.code} - {task.name}
-            </option>
-          ))}
-        </select>
-      </div>
+  const handleExportClick = async () => {
+    if (sites.length <= 1) {
+      // 0 或 1 个 site 直接导出 default / 唯一站点
+      const code = sites[0]?.code ?? 'default';
+      await handleExportCurrent(code);
+      return;
+    }
+    setSiteDropdownOpen(true);
+  };
 
-      {error && <p className="error">错误：{error}</p>}
-      {success && <p style={{ color: 'green', padding: '0.5rem', backgroundColor: '#e8f5e9', border: '1px solid #4caf50' }}>✓ {success}</p>}
+  const handleExportVersion = async (version: ConfigVersion) => {
+    try {
+      await exportVersion(version.id);
+      message.success(`已下载版本 v${version.version}`);
+    } catch (err) {
+      message.error((err as Error).message || '下载失败');
+    }
+  };
 
-      {loading && <p>加载中...</p>}
+  const handleRollback = async (version: ConfigVersion) => {
+    try {
+      const result = await rollbackToVersion(version.id);
+      message.success(result.detail || '回滚成功');
+      loadVersions(filterTaskId);
+    } catch (err) {
+      message.error((err as Error).message || '回滚失败');
+    }
+  };
 
-      {!loading && versions.length === 0 && (
-        <p style={{ color: '#666' }}>暂无版本历史</p>
-      )}
+  const handleDelete = async (version: ConfigVersion) => {
+    try {
+      await deleteVersion(version.id);
+      message.success(`已删除版本 v${version.version}`);
+      loadVersions(filterTaskId);
+    } catch (err) {
+      message.error((err as Error).message || '删除失败');
+    }
+  };
 
-      {!loading && versions.length > 0 && (
-        <div style={{ marginTop: '1rem' }}>
-          <h3>版本时间线（共 {versions.length} 个版本）</h3>
-          <div style={{ borderLeft: '3px solid #007bff', paddingLeft: '1rem', marginTop: '1rem' }}>
-            {versions.map((version, index) => (
-              <div
-                key={version.id}
-                style={{
-                  marginBottom: '1.5rem',
-                  padding: '1rem',
-                  backgroundColor: index === 0 ? '#e3f2fd' : '#f5f5f5',
-                  border: '1px solid #ddd',
-                  borderRadius: '4px',
-                  position: 'relative',
-                }}
+  const handleBulkDelete = async () => {
+    if (selectedRowKeys.length === 0) return;
+    try {
+      const result = await bulkDeleteVersions(selectedRowKeys.map((k) => Number(k)));
+      const deletedCount = result.deleted.length;
+      const skippedCount = result.skipped.length;
+      if (deletedCount > 0 && skippedCount === 0) {
+        message.success(`已删除 ${deletedCount} 个版本`);
+      } else if (deletedCount > 0 && skippedCount > 0) {
+        const reasons = result.skipped.map((s) => `#${s.id}: ${s.reason}`).join('；');
+        message.warning(`成功删除 ${deletedCount} 个，跳过 ${skippedCount} 个 (${reasons})`);
+      } else if (skippedCount > 0) {
+        const reasons = result.skipped.map((s) => `#${s.id}: ${s.reason}`).join('；');
+        message.error(`未删除任何版本：${reasons}`);
+      } else {
+        message.info('未删除任何版本');
+      }
+      setSelectedRowKeys([]);
+      loadVersions(filterTaskId);
+    } catch (err) {
+      message.error((err as Error).message || '批量删除失败');
+    }
+  };
+
+  const taskOptions = useMemo(
+    () => [
+      { value: 'all', label: '全部任务' },
+      ...tasks.map((t) => ({
+        value: String(t.id),
+        label: `${t.code} - ${t.name}`,
+      })),
+    ],
+    [tasks],
+  );
+
+  // newest version per task is "latest"; we mark it so users see which one is current
+  const latestPerTask = useMemo(() => {
+    const map = new Map<number, number>();
+    versions.forEach((v) => {
+      const cur = map.get(v.task);
+      if (cur === undefined || v.version > cur) map.set(v.task, v.version);
+    });
+    return map;
+  }, [versions]);
+
+  const columns: ColumnsType<ConfigVersion> = [
+    {
+      title: '版本',
+      dataIndex: 'version',
+      key: 'version',
+      width: 120,
+      render: (v: number, record) => (
+        <Space size={6}>
+          <Text strong>v{v}</Text>
+          {latestPerTask.get(record.task) === v && <Tag color="blue">最新</Tag>}
+        </Space>
+      ),
+      sorter: (a, b) => a.version - b.version,
+    },
+    {
+      title: '任务',
+      dataIndex: 'task_code',
+      key: 'task_code',
+      width: 220,
+      render: (code: string | undefined, record) => {
+        const fallback = tasks.find((t) => t.id === record.task);
+        const display = code || fallback?.code || `#${record.task}`;
+        return <Tag color="geekblue">{display}</Tag>;
+      },
+      filters: tasks.map((t) => ({ text: `${t.code} - ${t.name}`, value: t.id })),
+      onFilter: (value, record) => record.task === value,
+    },
+    {
+      title: '摘要',
+      dataIndex: 'summary',
+      key: 'summary',
+      ellipsis: true,
+      render: (s: string) => s || <Text type="secondary">-</Text>,
+    },
+    {
+      title: '创建人',
+      dataIndex: 'created_by',
+      key: 'created_by',
+      width: 140,
+      render: (u: string) => u || <Text type="secondary">未知</Text>,
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 180,
+      render: formatDateTime,
+      sorter: (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+      defaultSortOrder: 'descend',
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 280,
+      fixed: 'right',
+      render: (_, record) => {
+        const isLatest = latestPerTask.get(record.task) === record.version;
+        return (
+          <Space size={4} wrap>
+            <Button
+              type="link"
+              size="small"
+              icon={<FileSearchOutlined />}
+              onClick={() => setDetailVersion(record)}
+            >
+              详情
+            </Button>
+            <Button
+              type="link"
+              size="small"
+              icon={<DownloadOutlined />}
+              onClick={() => handleExportVersion(record)}
+            >
+              下载
+            </Button>
+            <Popconfirm
+              title="回滚到此版本"
+              description="将基于该版本创建一条新的版本记录。是否继续？"
+              okText="回滚"
+              cancelText="取消"
+              onConfirm={() => handleRollback(record)}
+              disabled={isLatest}
+            >
+              <Button
+                type="link"
+                size="small"
+                icon={<RollbackOutlined />}
+                disabled={isLatest}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <div>
-                    <strong style={{ fontSize: '1.1rem' }}>版本 {version.version}</strong>
-                    {index === 0 && (
-                      <span style={{ marginLeft: '0.5rem', padding: '0.2rem 0.5rem', backgroundColor: '#4caf50', color: 'white', fontSize: '0.8rem', borderRadius: '3px' }}>
-                        最新
-                      </span>
-                    )}
-                    <p style={{ margin: '0.5rem 0', color: '#666' }}>
-                      {new Date(version.created_at).toLocaleString('zh-CN')}
-                    </p>
-                    <p style={{ margin: '0.5rem 0' }}>
-                      <strong>备注：</strong>{version.summary || '无'}
-                    </p>
-                    <p style={{ margin: '0.5rem 0', color: '#666' }}>
-                      <strong>创建者：</strong>{version.created_by || '未知'}
-                    </p>
-                    <p style={{ margin: '0.5rem 0', color: '#666' }}>
-                      <strong>测点数量：</strong>{version.payload?.points?.length || 0}
-                    </p>
-                  </div>
-                  <div style={{ display: 'flex', gap: '0.5rem' }}>
-                    <button
-                      type="button"
-                      onClick={() => handleViewDetails(version)}
-                      style={{ padding: '0.5rem 1rem' }}
-                    >
-                      {selectedVersion?.id === version.id ? '收起详情' : '查看详情'}
-                    </button>
-                    {index !== 0 && (
-                      <button
-                        type="button"
-                        onClick={() => handleRollback(version.id)}
-                        disabled={loading}
-                        style={{ padding: '0.5rem 1rem', backgroundColor: '#ff9800', color: 'white' }}
-                      >
-                        回滚到此版本
-                      </button>
-                    )}
-                  </div>
-                </div>
+                回滚
+              </Button>
+            </Popconfirm>
+            <Popconfirm
+              title="删除此版本"
+              description="删除后无法恢复。任务运行中将被后端阻止。"
+              okText="删除"
+              okType="danger"
+              cancelText="取消"
+              onConfirm={() => handleDelete(record)}
+            >
+              <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
+    },
+  ];
 
-                {selectedVersion?.id === version.id && (
-                  <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: 'white', border: '1px solid #ddd', borderRadius: '4px' }}>
-                    <h4>配置详情</h4>
-                    <p><strong>设备：</strong>{version.payload?.device}</p>
-                    <h5 style={{ marginTop: '1rem' }}>测点列表（{version.payload?.points?.length || 0}）：</h5>
-                    <table className="table" style={{ marginTop: '0.5rem' }}>
-                      <thead>
-                        <tr>
-                          <th>编码</th>
-                          <th>地址</th>
-                          <th>描述</th>
-                          <th>采样率(Hz)</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {version.payload?.points?.map((point, idx) => (
-                          <tr key={idx}>
-                            <td>{point.code}</td>
-                            <td>{point.address}</td>
-                            <td>{point.description}</td>
-                            <td>{point.sample_rate_hz}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    <details style={{ marginTop: '1rem' }}>
-                      <summary style={{ cursor: 'pointer', fontWeight: 'bold' }}>查看完整JSON配置</summary>
-                      <pre style={{ marginTop: '0.5rem', padding: '1rem', backgroundColor: '#f5f5f5', overflow: 'auto' }}>
-                        {JSON.stringify(version.payload, null, 2)}
-                      </pre>
-                    </details>
-                  </div>
-                )}
-              </div>
-            ))}
+  const rowSelection: TableRowSelection<ConfigVersion> = {
+    selectedRowKeys,
+    onChange: setSelectedRowKeys,
+  };
+
+  const exportButton =
+    sites.length > 1 ? (
+      <Dropdown
+        open={siteDropdownOpen}
+        onOpenChange={setSiteDropdownOpen}
+        trigger={['click']}
+        menu={{
+          items: sites.map((s) => ({
+            key: s.code,
+            label: `${s.code} - ${s.name}`,
+            onClick: () => handleExportCurrent(s.code),
+          })),
+        }}
+      >
+        <Button type="primary" icon={<CloudDownloadOutlined />} loading={exporting}>
+          <Space>
+            导出当前配置
+            <DownOutlined />
+          </Space>
+        </Button>
+      </Dropdown>
+    ) : (
+      <Button
+        type="primary"
+        icon={<CloudDownloadOutlined />}
+        loading={exporting}
+        onClick={handleExportClick}
+      >
+        导出当前配置
+      </Button>
+    );
+
+  return (
+    <div className="version-history-page">
+      <Card variant="borderless" className="version-history-page__header">
+        <div className="version-history-page__header-row">
+          <div>
+            <Title level={3} style={{ margin: 0 }}>
+              配置版本管理
+            </Title>
+            <Text type="secondary">
+              查看、导出、回滚、删除站点下所有任务的配置版本快照。
+            </Text>
           </div>
+          <Space wrap>
+            {exportButton}
+            <Select
+              style={{ minWidth: 220 }}
+              value={filterTaskId === null ? 'all' : String(filterTaskId)}
+              onChange={(v) => handleFilterChange(v === 'all' ? null : Number(v))}
+              options={taskOptions}
+              placeholder="任务过滤"
+            />
+            <Popconfirm
+              title="批量删除版本"
+              description={`将删除 ${selectedRowKeys.length} 个选中版本，运行中的任务版本会被后端跳过。`}
+              okText="删除"
+              okType="danger"
+              cancelText="取消"
+              onConfirm={handleBulkDelete}
+              disabled={selectedRowKeys.length === 0}
+            >
+              <Button
+                danger
+                icon={<DeleteOutlined />}
+                disabled={selectedRowKeys.length === 0}
+              >
+                批量删除{selectedRowKeys.length > 0 ? ` (${selectedRowKeys.length})` : ''}
+              </Button>
+            </Popconfirm>
+          </Space>
         </div>
-      )}
-    </section>
+      </Card>
+
+      <Card variant="borderless">
+        <Table<ConfigVersion>
+          rowKey="id"
+          columns={columns}
+          dataSource={versions}
+          loading={loading}
+          rowSelection={rowSelection}
+          pagination={{
+            defaultPageSize: 20,
+            pageSizeOptions: [10, 20, 50, 100],
+            showSizeChanger: true,
+            showTotal: (total) => `共 ${total} 个版本`,
+          }}
+          scroll={{ x: 1100 }}
+          locale={{
+            emptyText: (
+              <Empty description="暂无配置版本，请先到 /import 导入 Excel" />
+            ),
+          }}
+        />
+      </Card>
+
+      <Drawer
+        title={
+          detailVersion
+            ? `版本详情 - ${detailVersion.task_code ?? `#${detailVersion.task}`} v${detailVersion.version}`
+            : '版本详情'
+        }
+        width={720}
+        open={detailVersion !== null}
+        onClose={() => setDetailVersion(null)}
+        destroyOnClose
+      >
+        {detailVersion && (
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <Descriptions column={1} bordered size="small">
+              <Descriptions.Item label="任务">
+                {detailVersion.task_code ?? `#${detailVersion.task}`}
+              </Descriptions.Item>
+              <Descriptions.Item label="版本号">v{detailVersion.version}</Descriptions.Item>
+              <Descriptions.Item label="创建人">
+                {detailVersion.created_by || '未知'}
+              </Descriptions.Item>
+              <Descriptions.Item label="创建时间">
+                {formatDateTime(detailVersion.created_at)}
+              </Descriptions.Item>
+              <Descriptions.Item label="摘要">
+                {detailVersion.summary || '-'}
+              </Descriptions.Item>
+            </Descriptions>
+            <div>
+              <Text strong>Payload</Text>
+              <pre className="version-history-page__payload">
+                {JSON.stringify(detailVersion.payload, null, 2)}
+              </pre>
+            </div>
+          </Space>
+        )}
+      </Drawer>
+    </div>
   );
 };
 

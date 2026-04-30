@@ -2,6 +2,60 @@
  * API service for data visualization
  */
 
+export interface PointLatestValue {
+  point_code: string;
+  point_name: string;
+  unit: string;
+  data_type: string;
+  device_id: number;
+  device_name: string;
+  value: number | string | boolean | null;
+  quality: string;
+  timestamp: string | null;
+}
+
+export interface PointsLatestValuesFilter {
+  taskId?: number | null;
+  deviceId?: number | null;
+  pointCode?: string | null;
+}
+
+export interface PointsLatestValuesResponse {
+  filter: {
+    task_id: number | null;
+    device_id: number | null;
+    point_code: string | null;
+  };
+  count: number;
+  points: PointLatestValue[];
+}
+
+/**
+ * Fetch the latest value for every point matching the given (task / device / point) filter.
+ * Backed by `GET /api/config/points/latest-values/`.
+ */
+export async function fetchPointsLatestValues(
+  filter: PointsLatestValuesFilter = {}
+): Promise<PointsLatestValuesResponse> {
+  const params = new URLSearchParams();
+  if (filter.taskId !== undefined && filter.taskId !== null) {
+    params.set('task_id', String(filter.taskId));
+  }
+  if (filter.deviceId !== undefined && filter.deviceId !== null) {
+    params.set('device_id', String(filter.deviceId));
+  }
+  if (filter.pointCode) {
+    params.set('point_code', filter.pointCode);
+  }
+  const qs = params.toString();
+  const url = `/api/config/points/latest-values/${qs ? `?${qs}` : ''}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`获取测点最新值失败: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export interface DataPoint {
   timestamp: string;
   value: number | string | boolean;
