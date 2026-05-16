@@ -1,10 +1,24 @@
 """WebSocket consumers for real-time acquisition updates."""
 import json
 import logging
+import threading
+import time as _time
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 
 logger = logging.getLogger(__name__)
+
+
+# Short-lived in-memory cache for get_session_status(). Clients can poll
+# status rapidly (and connect storms hit the same session at once); caching
+# the assembled payload for a fraction of a second collapses bursts of
+# identical reads into a single set of DB queries. Each query takes a SQLite
+# read lock, so this directly relieves lock contention with the writer
+# threads. Entries are keyed by session id and expire after the TTL.
+_STATUS_CACHE_TTL_S = 1.5
+_STATUS_CACHE_MAX = 64
+_status_cache: dict = {}
+_status_cache_lock = threading.Lock()
 
 
 class AcquisitionConsumer(AsyncWebsocketConsumer):
@@ -100,28 +114,37 @@ class AcquisitionConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def get_session_status(self):
-        """Fetch current session status from database."""
+        """Fetch current session status from database.
+
+        DataPoint statistics (total, error count, latest timestamp) are
+        collected in a *single* ``aggregate()`` query rather than three
+        separate table scans, and the assembled payload is served from a
+        short-lived in-memory cache — both reduce the SQLite read locks taken
+        while acquisition worker threads are writing.
+        """
         from acquisition import models as acq_models
         from django.core.exceptions import ObjectDoesNotExist
+        from django.db.models import Count, Max, Q
+
+        cache_key = str(self.session_id)
+        now = _time.monotonic()
+        with _status_cache_lock:
+            cached = _status_cache.get(cache_key)
+            if cached is not None and (now - cached[0]) < _STATUS_CACHE_TTL_S:
+                return cached[1]
 
         try:
             session = acq_models.AcquisitionSession.objects.select_related('task').get(
                 pk=self.session_id
             )
 
-            # Count data points
-            data_points_count = acq_models.DataPoint.objects.filter(
-                session=session
-            ).count()
-
-            error_count = acq_models.DataPoint.objects.filter(
-                session=session,
-                quality__in=['bad', 'uncertain']
-            ).count()
-
-            last_data_point = acq_models.DataPoint.objects.filter(
-                session=session
-            ).order_by('-timestamp').first()
+            # One pass over DataPoint: total count, error count and latest
+            # timestamp in a single aggregate query.
+            stats = acq_models.DataPoint.objects.filter(session=session).aggregate(
+                total=Count('id'),
+                errors=Count('id', filter=Q(quality__in=['bad', 'uncertain'])),
+                last_ts=Max('timestamp'),
+            )
 
             duration_seconds = None
             if session.started_at:
@@ -129,7 +152,8 @@ class AcquisitionConsumer(AsyncWebsocketConsumer):
                 end_time = session.stopped_at or timezone.now()
                 duration_seconds = (end_time - session.started_at).total_seconds()
 
-            return {
+            last_ts = stats['last_ts']
+            result = {
                 'session_id': session.id,
                 'task_code': session.task.code,
                 'task_name': session.task.name,
@@ -137,17 +161,27 @@ class AcquisitionConsumer(AsyncWebsocketConsumer):
                 'started_at': session.started_at.isoformat() if session.started_at else None,
                 'stopped_at': session.stopped_at.isoformat() if session.stopped_at else None,
                 'duration_seconds': duration_seconds,
-                'points_read': data_points_count,
-                'last_read_time': last_data_point.timestamp.isoformat() if last_data_point else None,
-                'error_count': error_count,
+                'points_read': stats['total'] or 0,
+                'last_read_time': last_ts.isoformat() if last_ts else None,
+                'error_count': stats['errors'] or 0,
                 'error_message': session.error_message,
             }
 
         except ObjectDoesNotExist:
-            return {
+            result = {
                 'error': 'Session not found',
-                'session_id': self.session_id
+                'session_id': self.session_id,
             }
+
+        with _status_cache_lock:
+            # Evict expired entries before inserting so the cache stays bounded.
+            if len(_status_cache) >= _STATUS_CACHE_MAX:
+                stale = [k for k, v in _status_cache.items()
+                         if (now - v[0]) >= _STATUS_CACHE_TTL_S]
+                for k in stale:
+                    _status_cache.pop(k, None)
+            _status_cache[cache_key] = (now, result)
+        return result
 
 
 class GlobalAcquisitionConsumer(AsyncWebsocketConsumer):
