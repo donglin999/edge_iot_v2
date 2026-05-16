@@ -103,6 +103,19 @@ def _row_dict(row: pd.Series) -> Dict[str, Any]:
     return out
 
 
+# Persistence is chunked so SQLite's write lock is never held for the whole
+# sheet at once (see ExcelImportService.apply). ~100 rows / devices per
+# transaction keeps each lock hold short while still amortising commit cost.
+_IMPORT_CHUNK_ROWS = 100
+_IMPORT_CHUNK_DEVICES = 100
+
+
+def _chunked(seq: List[Any], size: int):
+    """Yield successive ``size``-length slices of ``seq``."""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
 # ---------------------------------------------------------------------------
 # ExcelImportService
 # ---------------------------------------------------------------------------
@@ -119,10 +132,51 @@ class ExcelImportService:
 
     # ---------- I/O ---------- #
     def load_dataframe(self) -> pd.DataFrame:
+        """Load the first worksheet into a DataFrame via a streaming reader.
+
+        ``openpyxl`` is opened with ``read_only=True``: the worksheet is never
+        materialised into a full in-memory cell tree — rows are pulled lazily
+        by ``iter_rows`` — so importer memory stays roughly proportional to a
+        single row rather than the whole file.
+        """
+        from openpyxl import load_workbook
+        from openpyxl.utils.exceptions import InvalidFileException
+
+        if not Path(self.excel_path).exists():
+            raise FileNotFoundError(f"Excel 文件不存在: {self.excel_path}")
+
         try:
-            df = pd.read_excel(self.excel_path, sheet_name=0)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"Excel 文件不存在: {self.excel_path}") from exc
+            wb = load_workbook(self.excel_path, read_only=True, data_only=True)
+        except InvalidFileException as exc:
+            raise ValueError(f"无法解析 Excel 文件: {self.excel_path}") from exc
+
+        try:
+            ws = wb.worksheets[0]
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header = next(rows_iter)
+            except StopIteration:
+                header = None
+            if not header:
+                return pd.DataFrame()
+            columns = [str(h).strip() if h is not None else f"_col{i}"
+                       for i, h in enumerate(header)]
+            width = len(columns)
+            records: List[Tuple[Any, ...]] = []
+            for row in rows_iter:
+                # openpyxl yields trailing empty rows and pads short rows with
+                # None — drop wholly-empty rows and normalise the width.
+                if row is None or all(v is None for v in row):
+                    continue
+                if len(row) < width:
+                    row = tuple(row) + (None,) * (width - len(row))
+                elif len(row) > width:
+                    row = tuple(row[:width])
+                records.append(row)
+        finally:
+            wb.close()
+
+        df = pd.DataFrame.from_records(records, columns=columns)
         # Backward compat: older templates used `en_name` for the point code.
         if "code" not in df.columns and "en_name" in df.columns:
             df = df.rename(columns={"en_name": "code"})
@@ -266,9 +320,18 @@ class ExcelImportService:
         }
 
     # ---------- apply (write to DB) ---------- #
-    @transaction.atomic
     def apply(self, site_code: str = "default", created_by: str = "", mode: str = "merge") -> Dict[str, Any]:
-        df = self.load_dataframe()
+        """Validate, then persist devices/points/tasks to the database.
+
+        The persistence phase is deliberately split into many *small*
+        transactions (≈100 rows / devices each) instead of one sheet-wide
+        ``transaction.atomic``. SQLite holds a database-level write lock for
+        the entire life of a transaction, so a single long transaction
+        starves every other writer (acquisition workers, the API) for the
+        whole duration of the import. Chunking keeps each lock hold short.
+        Validation runs first and fully outside any transaction.
+        """
+        # ---- phase 1: validate (no transaction held) ----
         summary = self.run_validation()
         if summary.row_errors:
             return {
@@ -277,13 +340,16 @@ class ExcelImportService:
                 "errors": summary.errors,
             }
 
-        site, _ = models.Site.objects.get_or_create(
-            code=site_code, defaults={"name": site_code, "description": "自动创建"},
-        )
+        rows = [_row_dict(row) for _, row in self.load_dataframe().iterrows()]
 
-        if mode == "replace":
-            # AcqTask cleanup is handled by the cascade signal on Device.
-            models.Device.objects.filter(site=site).delete()
+        # ---- phase 2: persist in bounded chunks ----
+        with transaction.atomic():
+            site, _ = models.Site.objects.get_or_create(
+                code=site_code, defaults={"name": site_code, "description": "自动创建"},
+            )
+            if mode == "replace":
+                # AcqTask cleanup is handled by the cascade signal on Device.
+                models.Device.objects.filter(site=site).delete()
 
         device_cache: Dict[str, models.Device] = {}
         created_devices = updated_devices = skipped_devices = 0
@@ -292,161 +358,166 @@ class ExcelImportService:
         # 1) Build/update devices, one row per (protocol, identity). We process
         #    the whole sheet first so the second pass can wire up points.
         device_meta_per_code: Dict[str, Tuple[type[BaseProtocol], Dict[str, Any]]] = {}
-        for _, row in df.iterrows():
-            row_data = _row_dict(row)
-            protocol = str(row_data.get("protocol_type", "")).strip().lower()
-            klass = ProtocolRegistry.get(protocol)
-            identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
-            code = _device_code(klass.META.name, identity)
-            if code in device_cache:
-                continue
+        for chunk in _chunked(rows, _IMPORT_CHUNK_ROWS):
+            with transaction.atomic():
+                for row_data in chunk:
+                    protocol = str(row_data.get("protocol_type", "")).strip().lower()
+                    klass = ProtocolRegistry.get(protocol)
+                    identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
+                    code = _device_code(klass.META.name, identity)
+                    if code in device_cache:
+                        continue
 
-            device_metadata = klass.coerce_device(row_data)
-            # Trim to declared fields so we don't leak point columns into
-            # device.metadata.
-            device_metadata = {f.name: device_metadata.get(f.name) for f in klass.DEVICE_FIELDS
-                               if f.name in device_metadata}
-            device_meta_per_code[code] = (klass, device_metadata)
+                    device_metadata = klass.coerce_device(row_data)
+                    # Trim to declared fields so we don't leak point columns
+                    # into device.metadata.
+                    device_metadata = {f.name: device_metadata.get(f.name)
+                                       for f in klass.DEVICE_FIELDS
+                                       if f.name in device_metadata}
+                    device_meta_per_code[code] = (klass, device_metadata)
 
-            ip_address = str(device_metadata.get("source_ip") or device_metadata.get("endpoint_url") or device_metadata.get("serial_port") or "")[:255]
-            port = device_metadata.get("source_port")
-            try:
-                port = int(port) if port is not None else None
-            except (TypeError, ValueError):
-                port = None
+                    ip_address = str(device_metadata.get("source_ip") or device_metadata.get("endpoint_url") or device_metadata.get("serial_port") or "")[:255]
+                    port = device_metadata.get("source_port")
+                    try:
+                        port = int(port) if port is not None else None
+                    except (TypeError, ValueError):
+                        port = None
 
-            label = str(row_data.get("device_name") or row_data.get("device_a_tag") or code)
-            defaults = {
-                "site": site,
-                "name": label,
-                "protocol": klass.META.name,
-                "ip_address": ip_address,
-                "port": port,
-                "metadata": device_metadata,
-            }
+                    label = str(row_data.get("device_name") or row_data.get("device_a_tag") or code)
+                    defaults = {
+                        "site": site,
+                        "name": label,
+                        "protocol": klass.META.name,
+                        "ip_address": ip_address,
+                        "port": port,
+                        "metadata": device_metadata,
+                    }
 
-            if mode == "append":
-                device, created = models.Device.objects.get_or_create(code=code, defaults=defaults)
-                if created:
-                    created_devices += 1
-                else:
-                    skipped_devices += 1
-            else:
-                device, created = models.Device.objects.update_or_create(code=code, defaults=defaults)
-                if created:
-                    created_devices += 1
-                else:
-                    updated_devices += 1
-            device_cache[code] = device
+                    if mode == "append":
+                        device, created = models.Device.objects.get_or_create(code=code, defaults=defaults)
+                        if created:
+                            created_devices += 1
+                        else:
+                            skipped_devices += 1
+                    else:
+                        device, created = models.Device.objects.update_or_create(code=code, defaults=defaults)
+                        if created:
+                            created_devices += 1
+                        else:
+                            updated_devices += 1
+                    device_cache[code] = device
 
         # 2) Persist points + per-row template
-        for idx, row in df.iterrows():
-            row_data = _row_dict(row)
-            protocol = str(row_data.get("protocol_type", "")).strip().lower()
-            klass = ProtocolRegistry.get(protocol)
-            identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
-            code = _device_code(klass.META.name, identity)
-            device = device_cache[code]
+        for chunk in _chunked(rows, _IMPORT_CHUNK_ROWS):
+            with transaction.atomic():
+                for row_data in chunk:
+                    protocol = str(row_data.get("protocol_type", "")).strip().lower()
+                    klass = ProtocolRegistry.get(protocol)
+                    identity = tuple(row_data.get(f) for f in klass.IDENTITY_FIELDS)
+                    code = _device_code(klass.META.name, identity)
+                    device = device_cache[code]
 
-            point_data = klass.coerce_point(row_data)
-            point_code = str(point_data.get("code") or "").strip()
-            if not point_code:
-                continue
+                    point_data = klass.coerce_point(row_data)
+                    point_code = str(point_data.get("code") or "").strip()
+                    if not point_code:
+                        continue
 
-            data_type = str(point_data.get("data_type") or "float")
-            unit = str(point_data.get("unit") or "")
-            description = str(point_data.get("description") or point_code)
-            try:
-                coefficient = float(point_data.get("coefficient", 1.0))
-            except (TypeError, ValueError):
-                coefficient = 1.0
+                    data_type = str(point_data.get("data_type") or "float")
+                    unit = str(point_data.get("unit") or "")
+                    description = str(point_data.get("description") or point_code)
+                    try:
+                        coefficient = float(point_data.get("coefficient", 1.0))
+                    except (TypeError, ValueError):
+                        coefficient = 1.0
 
-            template, _ = models.PointTemplate.objects.get_or_create(
-                name=description or point_code,
-                english_name=point_code,
-                defaults={
-                    "unit": unit,
-                    "data_type": data_type,
-                    "coefficient": coefficient,
-                    "precision": 2,
-                },
-            )
+                    template, _ = models.PointTemplate.objects.get_or_create(
+                        name=description or point_code,
+                        english_name=point_code,
+                        defaults={
+                            "unit": unit,
+                            "data_type": data_type,
+                            "coefficient": coefficient,
+                            "precision": 2,
+                        },
+                    )
 
-            extra = {f.name: point_data.get(f.name) for f in klass.POINT_FIELDS
-                     if f.name in point_data and f.name != "code"}
-            extra["protocol"] = klass.META.name
+                    extra = {f.name: point_data.get(f.name) for f in klass.POINT_FIELDS
+                             if f.name in point_data and f.name != "code"}
+                    extra["protocol"] = klass.META.name
 
-            point_defaults = {
-                "channel": None,
-                "template": template,
-                "address": str(point_data.get("address") or "").strip(),
-                "description": description,
-                "sample_rate_hz": 1.0,
-                "extra": extra,
-            }
+                    point_defaults = {
+                        "channel": None,
+                        "template": template,
+                        "address": str(point_data.get("address") or "").strip(),
+                        "description": description,
+                        "sample_rate_hz": 1.0,
+                        "extra": extra,
+                    }
 
-            if mode == "append":
-                _, created = models.Point.objects.get_or_create(
-                    device=device, code=point_code, defaults=point_defaults,
-                )
-                if created:
-                    created_points += 1
-                else:
-                    skipped_points += 1
-            else:
-                _, created = models.Point.objects.update_or_create(
-                    device=device, code=point_code, defaults=point_defaults,
-                )
-                if created:
-                    created_points += 1
-                else:
-                    updated_points += 1
+                    if mode == "append":
+                        _, created = models.Point.objects.get_or_create(
+                            device=device, code=point_code, defaults=point_defaults,
+                        )
+                        if created:
+                            created_points += 1
+                        else:
+                            skipped_points += 1
+                    else:
+                        _, created = models.Point.objects.update_or_create(
+                            device=device, code=point_code, defaults=point_defaults,
+                        )
+                        if created:
+                            created_points += 1
+                        else:
+                            updated_points += 1
 
         # 3) Auto-create / update tasks (1 task per device).
         task_version_ids: List[int] = []
-        for device in device_cache.values():
-            task_code = f"task-{device.name.replace(' ', '_')}" if device.name else f"task-{device.code}"
+        for device_chunk in _chunked(list(device_cache.values()), _IMPORT_CHUNK_DEVICES):
+            with transaction.atomic():
+                for device in device_chunk:
+                    task_code = f"task-{device.name.replace(' ', '_')}" if device.name else f"task-{device.code}"
 
-            existing = list(models.AcqTask.objects.filter(points__device_id=device.id).distinct())
-            owned = [
-                t for t in existing
-                if not models.Point.objects.filter(tasks__id=t.id).exclude(device_id=device.id).exists()
-            ]
-            if owned:
-                owned.sort(key=lambda t: t.id)
-                task = owned[0]
-                task.code = task_code
-                task.name = device.name
-                task.description = f"自动导入任务 {device.name}"
-                task.save(update_fields=["code", "name", "description", "updated_at"])
-                for dup in owned[1:]:
-                    dup.delete()
-            else:
-                task, _ = models.AcqTask.objects.update_or_create(
-                    code=task_code,
-                    defaults={"name": device.name, "description": f"自动导入任务 {device.name}"},
-                )
+                    existing = list(models.AcqTask.objects.filter(points__device_id=device.id).distinct())
+                    owned = [
+                        t for t in existing
+                        if not models.Point.objects.filter(tasks__id=t.id).exclude(device_id=device.id).exists()
+                    ]
+                    if owned:
+                        owned.sort(key=lambda t: t.id)
+                        task = owned[0]
+                        task.code = task_code
+                        task.name = device.name
+                        task.description = f"自动导入任务 {device.name}"
+                        task.save(update_fields=["code", "name", "description", "updated_at"])
+                        for dup in owned[1:]:
+                            dup.delete()
+                    else:
+                        task, _ = models.AcqTask.objects.update_or_create(
+                            code=task_code,
+                            defaults={"name": device.name, "description": f"自动导入任务 {device.name}"},
+                        )
 
-            task.points.set(list(device.points.all()))
-            latest = task.versions.order_by("-version").first()
-            next_version = (latest.version if latest else 0) + 1
-            payload = {
-                "device": device.code,
-                "protocol": device.protocol,
-                "metadata": device.metadata,
-                "points": [{
-                    "code": p.code,
-                    "address": p.address,
-                    "description": p.description,
-                    "extra": p.extra,
-                } for p in device.points.all()],
-            }
-            version = models.ConfigVersion.objects.create(
-                task=task, version=next_version,
-                summary=f"导入作业 {self.job.id} 自动生成",
-                created_by=created_by, payload=payload,
-            )
-            task_version_ids.append(version.id)
+                    task.points.set(list(device.points.all()))
+                    latest = task.versions.order_by("-version").first()
+                    next_version = (latest.version if latest else 0) + 1
+                    payload = {
+                        "device": device.code,
+                        "protocol": device.protocol,
+                        "metadata": device.metadata,
+                        "points": [{
+                            "code": p.code,
+                            "address": p.address,
+                            "description": p.description,
+                            "extra": p.extra,
+                        } for p in device.points.all()],
+                    }
+                    version = models.ConfigVersion.objects.create(
+                        task=task, version=next_version,
+                        summary=f"导入作业 {self.job.id} 自动生成",
+                        created_by=created_by, payload=payload,
+                    )
+                    task_version_ids.append(version.id)
 
         result = {
             "mode": mode,
@@ -459,14 +530,16 @@ class ExcelImportService:
             "task_versions": task_version_ids,
         }
 
-        self.job.status = models.ImportJob.STATUS_APPLIED
-        self.job.related_version_id = task_version_ids[0] if task_version_ids else None
-        sm = self.job.summary or {}
-        sm["apply_result"] = result
-        sm["applied_at"] = timezone.now().isoformat()
-        sm["import_mode"] = mode
-        self.job.summary = sm
-        self.job.save(update_fields=["status", "related_version", "summary", "updated_at"])
+        # ---- phase 3: record the outcome on the job (own short transaction) ----
+        with transaction.atomic():
+            self.job.status = models.ImportJob.STATUS_APPLIED
+            self.job.related_version_id = task_version_ids[0] if task_version_ids else None
+            sm = self.job.summary or {}
+            sm["apply_result"] = result
+            sm["applied_at"] = timezone.now().isoformat()
+            sm["import_mode"] = mode
+            self.job.summary = sm
+            self.job.save(update_fields=["status", "related_version", "summary", "updated_at"])
 
         logger.info("Import applied (%s): %s", mode, result)
         return result
