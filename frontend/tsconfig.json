@@ -10,9 +10,8 @@
     "isolatedModules": true,
     "allowSyntheticDefaultImports": true,
     "jsx": "react-jsx",
-    "strict": false,
+    "strict": true,
     "noEmit": true,
-    "noImplicitAny": false,
     "noUnusedLocals": false,
     "noUnusedParameters": false
   },

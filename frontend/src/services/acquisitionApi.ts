@@ -1,7 +1,11 @@
 /**
  * Acquisition API Service
  * 采集任务控制 API 接口封装
+ *
+ * 所有请求均通过 `fetchWithAbort` 透传可选的 `AbortSignal`，
+ * 以便调用方在 `useEffect` cleanup 中取消未完成的请求（XIU-7 H12）。
  */
+import { fetchWithAbort } from './http';
 
 export interface AcquisitionSession {
   id: number;
@@ -90,8 +94,8 @@ const API_BASE = '/api';
 /**
  * 获取所有采集任务列表
  */
-export async function fetchTasks(): Promise<AcqTask[]> {
-  const response = await fetch(`${API_BASE}/config/tasks/`);
+export async function fetchTasks(signal?: AbortSignal): Promise<AcqTask[]> {
+  const response = await fetchWithAbort(`${API_BASE}/config/tasks/`, signal);
   if (!response.ok) {
     throw new Error(`获取任务列表失败: ${response.statusText}`);
   }
@@ -101,8 +105,13 @@ export async function fetchTasks(): Promise<AcqTask[]> {
 /**
  * 获取活跃的采集会话列表
  */
-export async function fetchActiveSessions(): Promise<AcquisitionSession[]> {
-  const response = await fetch(`${API_BASE}/acquisition/sessions/active/`);
+export async function fetchActiveSessions(
+  signal?: AbortSignal
+): Promise<AcquisitionSession[]> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/acquisition/sessions/active/`,
+    signal
+  );
   if (!response.ok) {
     throw new Error(`获取活跃会话失败: ${response.statusText}`);
   }
@@ -112,8 +121,14 @@ export async function fetchActiveSessions(): Promise<AcquisitionSession[]> {
 /**
  * 获取所有采集会话历史
  */
-export async function fetchSessions(limit = 20): Promise<AcquisitionSession[]> {
-  const response = await fetch(`${API_BASE}/acquisition/sessions/?limit=${limit}`);
+export async function fetchSessions(
+  limit = 20,
+  signal?: AbortSignal
+): Promise<AcquisitionSession[]> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/acquisition/sessions/?limit=${limit}`,
+    signal
+  );
   if (!response.ok) {
     throw new Error(`获取会话历史失败: ${response.statusText}`);
   }
@@ -124,8 +139,14 @@ export async function fetchSessions(limit = 20): Promise<AcquisitionSession[]> {
 /**
  * 获取指定会话的状态详情
  */
-export async function fetchSessionStatus(sessionId: number): Promise<SessionStatus> {
-  const response = await fetch(`${API_BASE}/acquisition/sessions/${sessionId}/status/`);
+export async function fetchSessionStatus(
+  sessionId: number,
+  signal?: AbortSignal
+): Promise<SessionStatus> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/acquisition/sessions/${sessionId}/status/`,
+    signal
+  );
   if (!response.ok) {
     throw new Error(`获取会话状态失败: ${response.statusText}`);
   }
@@ -135,14 +156,21 @@ export async function fetchSessionStatus(sessionId: number): Promise<SessionStat
 /**
  * 启动采集任务
  */
-export async function startTask(request: StartTaskRequest): Promise<StartTaskResponse> {
-  const response = await fetch(`${API_BASE}/acquisition/sessions/start-task/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(request),
-  });
+export async function startTask(
+  request: StartTaskRequest,
+  signal?: AbortSignal
+): Promise<StartTaskResponse> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/acquisition/sessions/start-task/`,
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+    }
+  );
 
   const data = await response.json();
 
@@ -158,15 +186,20 @@ export async function startTask(request: StartTaskRequest): Promise<StartTaskRes
  */
 export async function stopSession(
   sessionId: number,
-  reason?: string
+  reason?: string,
+  signal?: AbortSignal
 ): Promise<{ detail: string; session_id: number; current_status: string }> {
-  const response = await fetch(`${API_BASE}/acquisition/sessions/${sessionId}/stop/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ reason }),
-  });
+  const response = await fetchWithAbort(
+    `${API_BASE}/acquisition/sessions/${sessionId}/stop/`,
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason }),
+    }
+  );
 
   const data = await response.json();
 
@@ -180,35 +213,49 @@ export async function stopSession(
 /**
  * 通过配置API启动任务（兼容旧接口）
  */
-export async function startTaskViaConfig(taskId: number): Promise<unknown> {
-  const response = await fetch(`${API_BASE}/config/tasks/${taskId}/start/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({}),
-  });
+export async function startTaskViaConfig(
+  taskId: number,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/config/tasks/${taskId}/start/`,
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    }
+  );
 
   const data = await response.json();
 
   if (!response.ok) {
     throw new Error(data.detail || `启动任务失败: ${response.statusText}`);
   }
- 
+
   return data;
 }
 
 /**
  * 通过配置API停止任务（兼容旧接口）
  */
-export async function stopTaskViaConfig(taskId: number): Promise<unknown> {
-  const response = await fetch(`${API_BASE}/config/tasks/${taskId}/stop/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({}),
-  });
+export async function stopTaskViaConfig(
+  taskId: number,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/config/tasks/${taskId}/stop/`,
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    }
+  );
 
   const data = await response.json();
 
@@ -224,15 +271,20 @@ export async function stopTaskViaConfig(taskId: number): Promise<unknown> {
  */
 export async function updateTaskSampleRate(
   taskId: number,
-  rateHz: number
+  rateHz: number,
+  signal?: AbortSignal
 ): Promise<AcqTask> {
-  const response = await fetch(`${API_BASE}/config/tasks/${taskId}/`, {
-    method: 'PATCH',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ sample_rate_hz: rateHz }),
-  });
+  const response = await fetchWithAbort(
+    `${API_BASE}/config/tasks/${taskId}/`,
+    signal,
+    {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sample_rate_hz: rateHz }),
+    }
+  );
 
   const data = await response.json();
 
@@ -251,14 +303,21 @@ export async function updateTaskSampleRate(
 /**
  * 测试单次采集
  */
-export async function testAcquire(taskId: number): Promise<unknown> {
-  const response = await fetch(`${API_BASE}/acquisition/sessions/test-acquire/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ task_id: taskId }),
-  });
+export async function testAcquire(
+  taskId: number,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/acquisition/sessions/test-acquire/`,
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ task_id: taskId }),
+    }
+  );
 
   const data = await response.json();
 

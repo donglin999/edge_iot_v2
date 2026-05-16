@@ -1,6 +1,11 @@
 /**
- * API service for data visualization
+ * API service for data visualization.
+ *
+ * Every request accepts an optional `AbortSignal` (threaded through
+ * `fetchWithAbort`) so callers can cancel in-flight requests from a
+ * `useEffect` cleanup — see H12 in XIU-7.
  */
+import { fetchWithAbort } from './http';
 
 export interface PointLatestValue {
   point_code: string;
@@ -35,7 +40,8 @@ export interface PointsLatestValuesResponse {
  * Backed by `GET /api/config/points/latest-values/`.
  */
 export async function fetchPointsLatestValues(
-  filter: PointsLatestValuesFilter = {}
+  filter: PointsLatestValuesFilter = {},
+  signal?: AbortSignal
 ): Promise<PointsLatestValuesResponse> {
   const params = new URLSearchParams();
   if (filter.taskId !== undefined && filter.taskId !== null) {
@@ -49,7 +55,7 @@ export async function fetchPointsLatestValues(
   }
   const qs = params.toString();
   const url = `/api/config/points/latest-values/${qs ? `?${qs}` : ''}`;
-  const response = await fetch(url);
+  const response = await fetchWithAbort(url, signal);
   if (!response.ok) {
     throw new Error(`获取测点最新值失败: ${response.statusText}`);
   }
@@ -106,7 +112,8 @@ export async function fetchPointHistory(
   pointCode: string,
   startTime?: string,
   endTime?: string,
-  limit: number = 1000
+  limit: number = 1000,
+  signal?: AbortSignal
 ): Promise<PointHistoryResponse> {
   const params = new URLSearchParams({
     point_code: pointCode,
@@ -121,8 +128,9 @@ export async function fetchPointHistory(
     params.append('end_time', endTime);
   }
 
-  const response = await fetch(
-    `/api/acquisition/sessions/point-history/?${params.toString()}`
+  const response = await fetchWithAbort(
+    `/api/acquisition/sessions/point-history/?${params.toString()}`,
+    signal
   );
 
   if (!response.ok) {
@@ -135,8 +143,10 @@ export async function fetchPointHistory(
 /**
  * Fetch active acquisition sessions
  */
-export async function fetchActiveSessions(): Promise<AcquisitionSession[]> {
-  const response = await fetch('/api/acquisition/sessions/active/');
+export async function fetchActiveSessions(
+  signal?: AbortSignal
+): Promise<AcquisitionSession[]> {
+  const response = await fetchWithAbort('/api/acquisition/sessions/active/', signal);
 
   if (!response.ok) {
     throw new Error(`获取活跃会话失败: ${response.statusText}`);
@@ -148,8 +158,14 @@ export async function fetchActiveSessions(): Promise<AcquisitionSession[]> {
 /**
  * Fetch all acquisition sessions
  */
-export async function fetchSessions(limit: number = 50): Promise<AcquisitionSession[]> {
-  const response = await fetch(`/api/acquisition/sessions/?limit=${limit}`);
+export async function fetchSessions(
+  limit: number = 50,
+  signal?: AbortSignal
+): Promise<AcquisitionSession[]> {
+  const response = await fetchWithAbort(
+    `/api/acquisition/sessions/?limit=${limit}`,
+    signal
+  );
 
   if (!response.ok) {
     throw new Error(`获取会话列表失败: ${response.statusText}`);
@@ -162,8 +178,14 @@ export async function fetchSessions(limit: number = 50): Promise<AcquisitionSess
 /**
  * Fetch session details
  */
-export async function fetchSession(sessionId: number): Promise<AcquisitionSession> {
-  const response = await fetch(`/api/acquisition/sessions/${sessionId}/`);
+export async function fetchSession(
+  sessionId: number,
+  signal?: AbortSignal
+): Promise<AcquisitionSession> {
+  const response = await fetchWithAbort(
+    `/api/acquisition/sessions/${sessionId}/`,
+    signal
+  );
 
   if (!response.ok) {
     throw new Error(`获取会话详情失败: ${response.statusText}`);
@@ -178,10 +200,12 @@ export async function fetchSession(sessionId: number): Promise<AcquisitionSessio
 export async function fetchSessionDataPoints(
   sessionId: number,
   limit: number = 100,
-  offset: number = 0
+  offset: number = 0,
+  signal?: AbortSignal
 ): Promise<SessionDataPointsResponse> {
-  const response = await fetch(
-    `/api/acquisition/sessions/${sessionId}/data-points/?limit=${limit}&offset=${offset}`
+  const response = await fetchWithAbort(
+    `/api/acquisition/sessions/${sessionId}/data-points/?limit=${limit}&offset=${offset}`,
+    signal
   );
 
   if (!response.ok) {
@@ -194,14 +218,21 @@ export async function fetchSessionDataPoints(
 /**
  * Start an acquisition task
  */
-export async function startTask(taskId: number): Promise<AcquisitionSession> {
-  const response = await fetch('/api/acquisition/sessions/start-task/', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ task_id: taskId }),
-  });
+export async function startTask(
+  taskId: number,
+  signal?: AbortSignal
+): Promise<AcquisitionSession> {
+  const response = await fetchWithAbort(
+    '/api/acquisition/sessions/start-task/',
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ task_id: taskId }),
+    }
+  );
 
   if (!response.ok) {
     const errorData = await response.json();
@@ -214,14 +245,22 @@ export async function startTask(taskId: number): Promise<AcquisitionSession> {
 /**
  * Stop an acquisition session
  */
-export async function stopSession(sessionId: number, reason?: string): Promise<void> {
-  const response = await fetch(`/api/acquisition/sessions/${sessionId}/stop/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ reason: reason || '手动停止' }),
-  });
+export async function stopSession(
+  sessionId: number,
+  reason?: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetchWithAbort(
+    `/api/acquisition/sessions/${sessionId}/stop/`,
+    signal,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason: reason || '手动停止' }),
+    }
+  );
 
   if (!response.ok) {
     const errorData = await response.json();

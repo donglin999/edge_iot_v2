@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import type { AcqTask, AcquisitionSession } from '../services/acquisitionApi';
 import { fetchTasks, fetchActiveSessions } from '../services/acquisitionApi';
+import { isAbortError } from '../services/http';
 import TaskControlPanel from '../components/acquisition/TaskControlPanel';
 import { useWebSocket, WebSocketStatus, WebSocketMessage } from '../hooks/useWebSocket';
 import './AcquisitionControlPage.css';
@@ -12,28 +13,32 @@ const AcquisitionControlPage = () => {
   const [error, setError] = useState<string | null>(null);
   const [useWebSocketUpdates, setUseWebSocketUpdates] = useState(true);
 
-  const loadData = async () => {
+  const loadData = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError(null);
 
     try {
       const [tasksData, sessionsData] = await Promise.all([
-        fetchTasks(),
-        fetchActiveSessions(),
+        fetchTasks(signal),
+        fetchActiveSessions(signal),
       ]);
 
       setTasks(tasksData);
       setActiveSessions(sessionsData);
     } catch (err) {
+      // Ignore cancellations from a unmount/re-run cleanup.
+      if (isAbortError(err)) return;
       setError((err as Error).message);
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadData();
-  }, []);
+    const aborter = new AbortController();
+    loadData(aborter.signal);
+    return () => aborter.abort();
+  }, [loadData]);
 
   const handleWebSocketMessage = useCallback((message: WebSocketMessage) => {
     if (message.type === 'session_status') {
@@ -53,24 +58,41 @@ const AcquisitionControlPage = () => {
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${wsProtocol}//${window.location.host}/ws/acquisition/global/`;
 
+  // WebSocket is fully gated by the realtime toggle: when off, the socket is
+  // closed and the polling effect below becomes the single update source.
   const { status: wsStatus } = useWebSocket({
     url: wsUrl,
     onMessage: handleWebSocketMessage,
-    autoReconnect: useWebSocketUpdates,
+    enabled: useWebSocketUpdates,
   });
 
+  // Single update-source effect: poll only when the WebSocket is NOT the
+  // active realtime channel (toggle off, or socket not connected). This
+  // avoids the previous double WS + polling updates. Each tick uses an
+  // AbortController so a re-run/unmount cancels the in-flight request.
   useEffect(() => {
-    if (useWebSocketUpdates && wsStatus === WebSocketStatus.CONNECTED) {
+    const wsActive =
+      useWebSocketUpdates && wsStatus === WebSocketStatus.CONNECTED;
+    if (wsActive) {
       return;
     }
 
-    const interval = setInterval(() => {
-      fetchActiveSessions()
+    let aborter: AbortController | null = null;
+    const poll = () => {
+      aborter?.abort();
+      aborter = new AbortController();
+      fetchActiveSessions(aborter.signal)
         .then(setActiveSessions)
-        .catch(console.error);
-    }, 3000);
+        .catch((err) => {
+          if (!isAbortError(err)) console.error(err);
+        });
+    };
 
-    return () => clearInterval(interval);
+    const interval = setInterval(poll, 3000);
+    return () => {
+      clearInterval(interval);
+      aborter?.abort();
+    };
   }, [useWebSocketUpdates, wsStatus]);
 
   const getSessionForTask = (taskId: number) => {
@@ -123,7 +145,7 @@ const AcquisitionControlPage = () => {
             />
             <span className="ws-toggle__label">实时更新</span>
           </label>
-          <button onClick={loadData} disabled={loading} className="btn btn--secondary">
+          <button onClick={() => loadData()} disabled={loading} className="btn btn--secondary">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M23 4v6h-6M1 20v-6h6" />
               <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />

@@ -13,6 +13,11 @@ export interface UseWebSocketOptions {
   onError?: (error: Event) => void;
   autoReconnect?: boolean;
   reconnectInterval?: number;
+  /**
+   * When false the hook keeps the socket closed (and closes an open one).
+   * Lets a parent toggle realtime updates on/off without unmounting.
+   */
+  enabled?: boolean;
 }
 
 export enum WebSocketStatus {
@@ -31,12 +36,33 @@ export function useWebSocket(options: UseWebSocketOptions) {
     onError,
     autoReconnect = true,
     reconnectInterval = 3000,
+    enabled = true,
   } = options;
 
   const [status, setStatus] = useState<WebSocketStatus>(WebSocketStatus.DISCONNECTED);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldConnectRef = useRef(true);
+
+  // Keep the latest callbacks/config in refs. The WebSocket lifecycle must NOT
+  // restart just because a parent re-rendered with new callback identities —
+  // otherwise the socket churns (disconnect/reconnect) on every parent render.
+  // `connect` therefore only depends on `url`.
+  const onMessageRef = useRef(onMessage);
+  const onOpenRef = useRef(onOpen);
+  const onCloseRef = useRef(onClose);
+  const onErrorRef = useRef(onError);
+  const autoReconnectRef = useRef(autoReconnect);
+  const reconnectIntervalRef = useRef(reconnectInterval);
+
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+    onOpenRef.current = onOpen;
+    onCloseRef.current = onClose;
+    onErrorRef.current = onError;
+    autoReconnectRef.current = autoReconnect;
+    reconnectIntervalRef.current = reconnectInterval;
+  });
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -52,13 +78,13 @@ export function useWebSocket(options: UseWebSocketOptions) {
 
       ws.onopen = () => {
         setStatus(WebSocketStatus.CONNECTED);
-        onOpen?.();
+        onOpenRef.current?.();
       };
 
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as WebSocketMessage;
-          onMessage?.(message);
+          onMessageRef.current?.(message);
         } catch (err) {
           console.error('Failed to parse WebSocket message:', err);
         }
@@ -66,19 +92,19 @@ export function useWebSocket(options: UseWebSocketOptions) {
 
       ws.onclose = () => {
         setStatus(WebSocketStatus.DISCONNECTED);
-        onClose?.();
+        onCloseRef.current?.();
 
         // Auto-reconnect if enabled and component is still mounted
-        if (autoReconnect && shouldConnectRef.current) {
+        if (autoReconnectRef.current && shouldConnectRef.current) {
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
-          }, reconnectInterval);
+          }, reconnectIntervalRef.current);
         }
       };
 
       ws.onerror = (error) => {
         setStatus(WebSocketStatus.ERROR);
-        onError?.(error);
+        onErrorRef.current?.(error);
       };
 
       wsRef.current = ws;
@@ -86,7 +112,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
       console.error('Failed to create WebSocket:', err);
       setStatus(WebSocketStatus.ERROR);
     }
-  }, [url, onMessage, onOpen, onClose, onError, autoReconnect, reconnectInterval]);
+  }, [url]);
 
   const disconnect = useCallback(() => {
     shouldConnectRef.current = false;
@@ -112,16 +138,21 @@ export function useWebSocket(options: UseWebSocketOptions) {
     }
   }, []);
 
-  // Connect on mount
+  // Single lifecycle effect: connect when enabled, tear down otherwise / on
+  // unmount. Re-runs only when `enabled` or `url` (via `connect`) changes.
   useEffect(() => {
+    if (!enabled) {
+      disconnect();
+      return;
+    }
+
     shouldConnectRef.current = true;
     connect();
 
-    // Cleanup on unmount
     return () => {
       disconnect();
     };
-  }, [connect, disconnect]);
+  }, [enabled, connect, disconnect]);
 
   return {
     status,
