@@ -5,10 +5,9 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from django.conf import settings
 from rest_framework import serializers
 
-from . import models
+from . import import_paths, models
 
 
 class SiteSerializer(serializers.ModelSerializer):
@@ -245,15 +244,17 @@ class ImportJobCreateSerializer(ImportJobSerializer):
             validated_data["source_name"] = original_name
 
         job = models.ImportJob.objects.create(**validated_data)
-        storage_dir = Path(settings.BASE_DIR) / "uploads" / "import_jobs"
+        storage_dir = import_paths.import_storage_dir()
         storage_dir.mkdir(parents=True, exist_ok=True)
         saved_path = storage_dir / f"{job.id}_{original_name}"
         with saved_path.open("wb") as dest:
             for chunk in upload.chunks():
                 dest.write(chunk)
 
+        # M12: persist a BASE_DIR-relative path so the reference survives the
+        # project being moved / re-deployed under a different root.
         job.summary = {
-            "file_path": str(saved_path),
+            "file_path": import_paths.to_relative(saved_path),
             "original_name": original_name,
         }
         job.save(update_fields=["summary"])

@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import environ
+from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -75,6 +76,16 @@ DATABASES = {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": env.str("DJANGO_DB_NAME", default=str(BASE_DIR / "db.sqlite3")),
         "ATOMIC_REQUESTS": False,
+        # SQLite serialises writers with a database-level lock. The acquisition
+        # pipeline runs many worker/sink threads that all write, so the default
+        # 5 s busy-timeout surfaces as "database is locked" errors under load.
+        # `timeout` makes a blocked writer wait up to 30 s for the lock; the
+        # ORM hands connections across threads (workers, Channels) so
+        # `check_same_thread` must be disabled.
+        "OPTIONS": {
+            "timeout": 30,
+            "check_same_thread": False,
+        },
     }
 }
 
@@ -100,6 +111,12 @@ REST_FRAMEWORK = {
         "rest_framework.renderers.JSONRenderer",
         "rest_framework.renderers.BrowsableAPIRenderer",
     ],
+    # H10: global pagination so list endpoints never dump an unbounded result
+    # set. Responses become {count, next, previous, results}; clients page via
+    # ?page=N (&page_size=M up to the cap below). Custom @action endpoints that
+    # build their own Response are unaffected.
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": env.int("DRF_PAGE_SIZE", default=50),
 }
 
 SPECTACULAR_SETTINGS = {
@@ -116,6 +133,19 @@ CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
 CELERY_TASK_EAGER_PROPAGATES = env.bool("CELERY_TASK_EAGER_PROPAGATES", default=True)
 CELERY_TASK_TIME_LIMIT = env.int("CELERY_TASK_TIME_LIMIT", default=600)
 
+# M12: retention window for uploaded Excel import jobs/files, purged by the
+# scheduled ``cleanup_import_jobs`` task below.
+IMPORT_JOB_RETENTION_DAYS = env.int("IMPORT_JOB_RETENTION_DAYS", default=30)
+
+# Celery beat schedule — requires running `celery -A control_plane beat`.
+CELERY_BEAT_SCHEDULE = {
+    "cleanup-import-jobs-daily": {
+        "task": "configuration.tasks.cleanup_import_jobs",
+        # Daily at 03:30 — off-peak for an industrial acquisition gateway.
+        "schedule": crontab(hour=3, minute=30),
+    },
+}
+
 # InfluxDB Settings
 INFLUXDB_HOST = env.str("INFLUXDB_HOST", default="localhost")
 INFLUXDB_PORT = env.int("INFLUXDB_PORT", default=8086)
@@ -129,12 +159,24 @@ KAFKA_BOOTSTRAP_SERVERS = env.str("KAFKA_BOOTSTRAP_SERVERS", default="localhost:
 KAFKA_TOPIC = env.str("KAFKA_TOPIC", default="acquisition_data")
 
 # Logging Configuration
+#
+# M6: the ``acquisition`` logger defaults to INFO (was DEBUG — every read
+# cycle spammed the file). Override per-environment with ACQUISITION_LOG_LEVEL.
+# The file handler is now an AsyncRotatingFileHandler: records are queued and a
+# background thread does the disk write + rollover, so logging never blocks an
+# acquisition cycle.
+(BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+
+ACQUISITION_LOG_LEVEL = env.str("ACQUISITION_LOG_LEVEL", default="INFO").upper()
+
+_VERBOSE_LOG_FORMAT = "{levelname} {asctime} {module} {process:d} {thread:d} {message}"
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {
-            "format": "{levelname} {asctime} {module} {process:d} {thread:d} {message}",
+            "format": _VERBOSE_LOG_FORMAT,
             "style": "{",
         },
         "simple": {
@@ -150,11 +192,15 @@ LOGGING = {
         },
         "file": {
             "level": "INFO",
-            "class": "logging.handlers.RotatingFileHandler",
+            # Async queue handler — owns its own RotatingFileHandler + listener
+            # thread. The target handler carries the verbose format (fmt/style),
+            # so no "formatter" key is set on the queue handler itself.
+            "class": "control_plane.logging_utils.AsyncRotatingFileHandler",
             "filename": str(BASE_DIR / "logs" / "application.log"),
             "maxBytes": 10485760,
             "backupCount": 5,
-            "formatter": "verbose",
+            "fmt": _VERBOSE_LOG_FORMAT,
+            "style": "{",
         },
     },
     "loggers": {
@@ -164,7 +210,7 @@ LOGGING = {
         },
         "acquisition": {
             "handlers": ["console", "file"],
-            "level": "DEBUG",
+            "level": ACQUISITION_LOG_LEVEL,
             "propagate": False,
         },
         "storage": {
@@ -196,7 +242,16 @@ LOGGING = {
 # ========================================
 # Django Channels Configuration
 # ========================================
-
+#
+# WebSocket fan-out assumes a SINGLE acquisition process. The pipeline's
+# WebSocketSink broadcasts each session's readings to the channel-layer
+# groups; if the AcquisitionService runs in more than one process (e.g.
+# Celery concurrency > 1, or the pipeline started in both web + worker),
+# every copy broadcasts and connected clients receive duplicates.
+# Deploy the acquisition worker with concurrency 1 (or converge broadcasts
+# into a single dedicated task). The WebSocketSink additionally caps each
+# frame's payload size (see sinks.py:_WS_MAX_READINGS_PER_MSG) so a large
+# session cannot exceed the per-message limits of the layer below.
 CHANNEL_LAYERS = {
     "default": {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
