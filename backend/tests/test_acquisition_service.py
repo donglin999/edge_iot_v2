@@ -223,6 +223,7 @@ def _make_sink_skeleton(session, device_groups):
     sink._fail_count = 0
     sink._next_flush_at = 0.0
     sink._dropped_total = 0
+    sink._flush_in_progress = False
     sink._point_meta = {}
     for _device_id, group in device_groups.items():
         device = group["device"]
@@ -250,7 +251,7 @@ class TestInfluxDBSinkFormatting:
         create_point,
         create_point_template,
     ):
-        # cn_name shows up as a tag in the formatted point.
+        # M5 schema: point_code / cn_name / unit are fields, not tags.
         template = create_point_template(name="temperature", unit="°C")
         device = create_device(code="TEST_DEV", metadata={"device_a_tag": "SENSOR_001"})
         point = create_point(device=device, code="TEMP_01", template=template)
@@ -274,11 +275,16 @@ class TestInfluxDBSinkFormatting:
         assert len(sink._buffer) == 1
         formatted = sink._buffer[0]
         assert formatted["measurement"] == "SENSOR_001"
+        # M5: only low-cardinality dimensions are tags.
         assert formatted["tags"]["device"] == "TEST_DEV"
-        assert formatted["tags"]["point"] == "TEMP_01"
-        assert formatted["tags"]["cn_name"] == template.name
-        assert formatted["tags"]["unit"] == "°C"
+        assert set(formatted["tags"]) <= {"site", "device", "quality"}
+        assert "point" not in formatted["tags"]
+        assert "cn_name" not in formatted["tags"]
+        assert "unit" not in formatted["tags"]
+        # point_code is the field key; cn_name / unit are string fields.
         assert formatted["fields"]["TEMP_01"] == 25.5
+        assert formatted["fields"]["cn_name"] == template.name
+        assert formatted["fields"]["unit"] == "°C"
         assert formatted["time"] == 1234567890000000000
 
     def test_consume_drops_bad_quality_readings(

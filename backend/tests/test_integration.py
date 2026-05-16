@@ -66,6 +66,7 @@ def _make_sink_with_mock_storage(
     sink._fail_count = 0
     sink._next_flush_at = 0.0
     sink._dropped_total = 0
+    sink._flush_in_progress = False
     sink._point_meta = {}
     for _device_id, group in device_groups.items():
         device = group["device"]
@@ -363,7 +364,7 @@ class TestDataFormatting:
         create_task,
         create_session,
     ):
-        # Template carries unit + Chinese name → both end up as tags.
+        # M5 schema: unit + Chinese name are written as string fields, not tags.
         template = create_point_template(
             name="温度",
             unit="°C",
@@ -392,7 +393,10 @@ class TestDataFormatting:
         written = mock_storage.get_written_data()
         assert len(written) == 1
         data = written[0]
-        assert data["tags"]["cn_name"] == "温度"
-        assert data["tags"]["unit"] == "°C"
+        # M5: cn_name / unit moved out of the (low-cardinality) tag set.
+        assert "cn_name" not in data["tags"]
+        assert "unit" not in data["tags"]
+        assert data["fields"]["cn_name"] == "温度"
+        assert data["fields"]["unit"] == "°C"
         # Template coefficient (0.1) is applied: raw 250 → 25.0.
         assert data["fields"]["TEMP"] == 25.0

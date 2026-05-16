@@ -122,11 +122,27 @@ class OPCUAProtocol(BaseProtocol):
             finally:
                 self.client = None
 
-    async def _async_read(self, node_ids: List[str]) -> List[Any]:
+    async def _async_read(self, node_ids: List[str]) -> List[tuple]:
+        """Read each node independently and normalise failures.
+
+        ``client.read_values`` is a single batch call: one unresolvable
+        NodeId (or one node the server rejects) makes it raise and the
+        whole cycle's data is lost. Reading node-by-node instead isolates
+        the failure to the offending point. Returns a list aligned with
+        ``node_ids`` where each element is ``(value, None)`` on success or
+        ``(None, error_message)`` on failure.
+        """
         if self.client is None:
             raise ReadError("OPC-UA client not connected")
-        nodes = [self.client.get_node(nid) for nid in node_ids]
-        return await self.client.read_values(nodes)
+        out: List[tuple] = []
+        for nid in node_ids:
+            try:
+                node = self.client.get_node(nid)
+                value = await node.read_value()
+                out.append((value, None))
+            except Exception as exc:  # noqa: BLE001
+                out.append((None, str(exc)))
+        return out
 
     # ------------- sync facade ------------- #
     def connect(self) -> bool:
@@ -164,17 +180,35 @@ class OPCUAProtocol(BaseProtocol):
 
         node_ids = [str(p.get("address", "")) for p in points]
         try:
-            values = self._runner.run(self._async_read(node_ids))
+            outcomes = self._runner.run(self._async_read(node_ids))
         except Exception as exc:  # noqa: BLE001
+            # A failure here is transport-level (timeout / dropped session),
+            # not a single bad point — surface it so the caller reconnects.
             raise ReadError(f"OPC-UA read failed: {exc}") from exc
 
         results = []
-        for point, value in zip(points, values):
+        failures = 0
+        for point, (value, error) in zip(points, outcomes):
+            if error is None:
+                quality = "good"
+            else:
+                quality = "bad"
+                value = None
+                failures += 1
+                self.logger.warning(
+                    "OPC-UA read failed for %s @ %s: %s",
+                    point.get("code"), point.get("address"), error,
+                )
             results.append({
                 "code": point["code"],
                 "value": value,
                 "timestamp": time.time_ns(),
-                "quality": "good",
+                "quality": quality,
                 "address": point.get("address"),
             })
+        # Every point failing means the server/session is unhealthy — raise
+        # so the caller treats it as a transport failure and reconnects
+        # instead of streaming an all-bad batch.
+        if points and failures == len(points):
+            raise ReadError(f"OPC-UA read failed for all {len(points)} point(s)")
         return results

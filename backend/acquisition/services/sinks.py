@@ -102,10 +102,15 @@ class InfluxDBSink(Sink):
         self._total_written = 0
         # Failure-handling state: consecutive failures gate the next
         # allowed flush attempt; dropped_total counts points evicted
-        # because the buffer was full.
+        # because the buffer was full. All of these are mutated only while
+        # holding self._lock so concurrent flush() calls stay consistent.
         self._fail_count = 0
         self._next_flush_at = 0.0
         self._dropped_total = 0
+        # Guards against two worker threads running flush() concurrently —
+        # without it both could snapshot the same batch, double-write it,
+        # and then delete twice as many points from the buffer.
+        self._flush_in_progress = False
 
         # Build lookup maps keyed by point_code so consume() does not touch
         # the ORM. `device_by_point_code` is needed because point_code is
@@ -162,21 +167,27 @@ class InfluxDBSink(Sink):
 
         device_metadata = device.metadata or {}
         measurement = device_metadata.get("device_a_tag", device.code) or device.code
+        # M5 - cardinality control. Only low-cardinality dimensions belong in
+        # tags: the InfluxDB series index is the *product* of tag value counts.
+        # point_code is high-cardinality, so it is encoded as the field *key*
+        # instead of a tag. cn_name / unit are high-cardinality metadata that
+        # move to string fields - still queryable, but they no longer multiply
+        # the series index. quality is bounded (good/bad/uncertain).
         tags = {
             "site": device.site.code,
             "device": device.code,
-            "point": reading.point_code,
             "quality": reading.quality,
         }
+        fields: Dict[str, Any] = {reading.point_code: scaled}
         if meta.get("template_name"):
-            tags["cn_name"] = meta["template_name"]
+            fields["cn_name"] = meta["template_name"]
         if meta.get("template_unit"):
-            tags["unit"] = meta["template_unit"]
+            fields["unit"] = meta["template_unit"]
 
         point = {
             "measurement": measurement,
             "tags": tags,
-            "fields": {reading.point_code: scaled},
+            "fields": fields,
             "time": reading.timestamp_ns,
         }
 
@@ -209,36 +220,47 @@ class InfluxDBSink(Sink):
     def flush(self) -> None:
         now = time.time()
 
-        # Honour exponential backoff after a recent failure — bail early
-        # so we don't pound a sick storage backend on every consume() that
-        # crosses the batch threshold.
-        if now < self._next_flush_at:
-            return
-
+        # The backoff gate, the in-progress guard and the buffer snapshot must
+        # all be decided under a single lock acquisition. Reading
+        # self._next_flush_at outside the lock (as before) raced with the
+        # except-branch that sets it: two threads could both pass the gate, or
+        # one could see a half-updated value while another was writing it.
         with self._lock:
+            # Honour exponential backoff after a recent failure — bail early
+            # so we don't pound a sick storage backend on every consume()
+            # that crosses the batch threshold.
+            if now < self._next_flush_at:
+                return
+            # Only one flush at a time: a second concurrent caller would
+            # snapshot and re-write the same batch.
+            if self._flush_in_progress:
+                return
             if not self._buffer:
                 self._last_flush = now
+                return
+            if not self._storage:
                 return
             # Snapshot the current buffer but DO NOT clear it yet — we
             # only delete the prefix after the write succeeds, so a
             # failure leaves the data intact for the next retry.
             batch = list(self._buffer)
-
-        if not self._storage:
-            return
+            self._flush_in_progress = True
 
         try:
             self._storage.write(batch)
         except Exception as exc:  # noqa: BLE001
-            self._fail_count += 1
-            backoff = min(
-                _FLUSH_BACKOFF_MAX_S,
-                _FLUSH_RETRY_DELAY_S * (2 ** (self._fail_count - 1)),
-            )
-            self._next_flush_at = now + backoff
+            with self._lock:
+                self._fail_count += 1
+                fail_count = self._fail_count
+                backoff = min(
+                    _FLUSH_BACKOFF_MAX_S,
+                    _FLUSH_RETRY_DELAY_S * (2 ** (self._fail_count - 1)),
+                )
+                self._next_flush_at = now + backoff
+                self._flush_in_progress = False
             logger.warning(
                 "InfluxDBSink flush failed (#%d, retry in %.1fs, buffer=%d): %s",
-                self._fail_count,
+                fail_count,
                 backoff,
                 len(batch),
                 exc,
@@ -251,16 +273,18 @@ class InfluxDBSink(Sink):
         with self._lock:
             del self._buffer[: len(batch)]
             self._last_flush = now
-        if self._fail_count:
+            recovered_from = self._fail_count
+            self._fail_count = 0
+            self._next_flush_at = 0.0
+            # Only count points that actually made it to storage.
+            self._total_written += len(batch)
+            self._flush_in_progress = False
+        if recovered_from:
             logger.info(
                 "InfluxDBSink flush recovered after %d failure(s), wrote %d point(s)",
-                self._fail_count,
+                recovered_from,
                 len(batch),
             )
-        self._fail_count = 0
-        self._next_flush_at = 0.0
-        # Only count points that actually made it to storage.
-        self._total_written += len(batch)
 
     @property
     def total_written(self) -> int:
@@ -399,6 +423,11 @@ class AlarmSink(Sink):
         """Drain the queue serially. Order is preserved (FIFO Queue)."""
         while True:
             item = self._queue.get()
+            # task_done() MUST run for every get() — including the sentinel
+            # path and any exception raised by _evaluate_one. If it were
+            # skipped on an error, unfinished_tasks would never reach 0 and
+            # flush() (which polls unfinished_tasks) would block for its full
+            # 5 s timeout on every batch boundary. Hence the finally block.
             try:
                 if item is _ALARM_SENTINEL:
                     return
@@ -479,6 +508,14 @@ class AlarmSink(Sink):
 # ---------------------------------------------------------------------------
 # WebSocketSink
 # ---------------------------------------------------------------------------
+
+
+# Hard cap on the number of readings packed into a single WS frame. A
+# session with thousands of points would otherwise build one oversized
+# message that the channels-redis layer can silently drop (it enforces a
+# per-message size limit and a bounded channel ``capacity``). When a drain
+# exceeds this we split it across several frames instead.
+_WS_MAX_READINGS_PER_MSG = 200
 
 
 class WebSocketSink(Sink):
@@ -564,13 +601,22 @@ class WebSocketSink(Sink):
             return batch
 
     def _broadcast_loop(self) -> None:
+        # Compensated cadence: a naive ``wait(interval)`` then broadcast
+        # makes the real period ``interval + broadcast_cost``, so the push
+        # rate drifts slower than configured (and drifts further the more
+        # expensive ``group_send`` gets). Subtract the work time from the
+        # next wait so the broadcast lands on a fixed cadence.
+        next_wait = self.broadcast_interval
         while not self._stop.is_set():
-            if self._stop.wait(self.broadcast_interval):
+            if self._stop.wait(next_wait):
                 break
+            cycle_start = time.monotonic()
             try:
                 self._broadcast_once()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("WebSocketSink broadcast failed: %s", exc)
+            elapsed = time.monotonic() - cycle_start
+            next_wait = max(0.0, self.broadcast_interval - elapsed)
 
     def _broadcast_once(self) -> None:
         batch = self._drain()
@@ -591,22 +637,34 @@ class WebSocketSink(Sink):
                 "timestamp": ts,
             })
 
-        envelope = {
-            "type": "data_point_update",
-            "data": {
-                "session_id": self.session.id,
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                "readings": readings_payload,
-            },
-        }
-
         from asgiref.sync import async_to_sync
 
-        for group in (f"acquisition_session_{self.session.id}", "acquisition_global"):
-            try:
-                async_to_sync(self._channel_layer.group_send)(group, envelope)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("WebSocketSink group_send to %s failed: %s", group, exc)
+        # Split oversized drains across several frames so no single
+        # group_send payload exceeds what the channel layer will carry.
+        chunks = [
+            readings_payload[i : i + _WS_MAX_READINGS_PER_MSG]
+            for i in range(0, len(readings_payload), _WS_MAX_READINGS_PER_MSG)
+        ]
+        total_chunks = len(chunks)
+        for idx, chunk in enumerate(chunks):
+            envelope = {
+                "type": "data_point_update",
+                "data": {
+                    "session_id": self.session.id,
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    "readings": chunk,
+                    # Frame index hints let the client reassemble a drain
+                    # that had to be split; single-frame pushes still carry
+                    # them (0 / 1) so the shape is uniform.
+                    "chunk_index": idx,
+                    "chunk_count": total_chunks,
+                },
+            }
+            for group in (f"acquisition_session_{self.session.id}", "acquisition_global"):
+                try:
+                    async_to_sync(self._channel_layer.group_send)(group, envelope)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("WebSocketSink group_send to %s failed: %s", group, exc)
 
     def flush(self) -> None:
         # Drain anything left in the buffer.
