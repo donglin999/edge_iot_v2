@@ -112,10 +112,13 @@ REST_FRAMEWORK = {
         "rest_framework.renderers.BrowsableAPIRenderer",
     ],
     # H10: global pagination so list endpoints never dump an unbounded result
-    # set. Responses become {count, next, previous, results}; clients page via
-    # ?page=N (&page_size=M up to the cap below). Custom @action endpoints that
-    # build their own Response are unaffected.
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    # set. We use limit/offset pagination so the contract is consistent with
+    # the custom data-points action and the frontend API client: clients page
+    # via ?limit=N&offset=M and responses are {count, next, previous, results}.
+    # default_limit falls back to PAGE_SIZE; StandardLimitOffsetPagination caps
+    # max_limit. Custom @action endpoints that build their own Response are
+    # unaffected.
+    "DEFAULT_PAGINATION_CLASS": "control_plane.pagination.StandardLimitOffsetPagination",
     "PAGE_SIZE": env.int("DRF_PAGE_SIZE", default=50),
 }
 
