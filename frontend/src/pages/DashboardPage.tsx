@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { isAbortError } from '../services/http';
 import './DashboardPage.css';
 
 interface TaskRun {
@@ -41,26 +42,26 @@ const DashboardPage = () => {
   const [error, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'24h' | '7d' | '30d'>('24h');
 
-  const fetchOverview = useCallback(async () => {
-    const response = await fetch('/api/config/tasks/overview/?site_code=default');
+  const fetchOverview = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch('/api/config/tasks/overview/?site_code=default', { signal });
     if (!response.ok) throw new Error(await response.text());
     return (await response.json()) as OverviewPayload;
   }, []);
 
-  const fetchTasks = useCallback(async () => {
-    const response = await fetch('/api/config/tasks/?site_code=default');
+  const fetchTasks = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch('/api/config/tasks/?site_code=default', { signal });
     if (!response.ok) throw new Error(await response.text());
     return (await response.json()) as TaskItem[];
   }, []);
 
-  const fetchDevices = useCallback(async () => {
-    const response = await fetch('/api/config/devices/');
+  const fetchDevices = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch('/api/config/devices/', { signal });
     if (!response.ok) throw new Error(await response.text());
     return (await response.json()) as Array<{ id: number; protocol: string }>;
   }, []);
 
-  const fetchActiveSessions = useCallback(async () => {
-    const response = await fetch('/api/acquisition/sessions/active/');
+  const fetchActiveSessions = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch('/api/acquisition/sessions/active/', { signal });
     if (!response.ok) throw new Error(await response.text());
     return (await response.json()) as Array<{
       id: number;
@@ -71,18 +72,37 @@ const DashboardPage = () => {
   }, []);
 
   useEffect(() => {
+    const aborter = new AbortController();
+    const { signal } = aborter;
+
     const load = async () => {
       setLoading(true);
-      setError(null);
       try {
-        const [overviewData, tasksData, devices, activeSessions] = await Promise.all([
-          fetchOverview(),
-          fetchTasks(),
-          fetchDevices(),
-          fetchActiveSessions(),
-        ]);
-        setData(overviewData);
-        setTasks(tasksData);
+        // allSettled: a single failing endpoint must not blank the whole
+        // dashboard — render whatever succeeded and flag the rest.
+        const [overviewRes, tasksRes, devicesRes, sessionsRes] =
+          await Promise.allSettled([
+            fetchOverview(signal),
+            fetchTasks(signal),
+            fetchDevices(signal),
+            fetchActiveSessions(signal),
+          ]);
+        if (signal.aborted) return;
+
+        const failed: string[] = [];
+
+        if (overviewRes.status === 'fulfilled') setData(overviewRes.value);
+        else failed.push('任务概览');
+
+        if (tasksRes.status === 'fulfilled') setTasks(tasksRes.value);
+        else failed.push('任务列表');
+
+        const devices = devicesRes.status === 'fulfilled' ? devicesRes.value : [];
+        if (devicesRes.status === 'rejected') failed.push('设备');
+
+        const activeSessions =
+          sessionsRes.status === 'fulfilled' ? sessionsRes.value : [];
+        if (sessionsRes.status === 'rejected') failed.push('活跃会话');
 
         // Real device counts: a device is "online" if it appears in any
         // running session's device_health with status === "healthy".
@@ -104,16 +124,24 @@ const DashboardPage = () => {
           error: errored,
           offline: Math.max(0, total - online - errored),
         });
+
+        setError(
+          failed.length > 0 ? `部分数据加载失败：${failed.join('、')}` : null,
+        );
       } catch (err) {
-        setError((err as Error).message);
+        if (!isAbortError(err)) setError((err as Error).message);
       } finally {
-        setLoading(false);
+        if (!signal.aborted) setLoading(false);
       }
     };
+
     load();
     // 30s auto-refresh keeps the dashboard meaningful without WebSocket plumbing
     const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
+    return () => {
+      aborter.abort();
+      clearInterval(interval);
+    };
   }, [fetchOverview, fetchTasks, fetchDevices, fetchActiveSessions]);
 
   const getStatusBadgeClass = (status: string) => {
@@ -575,8 +603,13 @@ const DashboardPage = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {data?.recent_runs?.slice(0, 5).map((run, index) => (
-                    <tr key={`${run.task}-${run.started_at}-${index}`}>
+                  {data?.recent_runs?.slice(0, 5).map((run) => (
+                    <tr
+                      key={
+                        run.log_reference ||
+                        `${run.task}|${run.started_at || ''}|${run.finished_at || ''}`
+                      }
+                    >
                       <td>
                         <div className="run-task">
                           <span className="run-task__name font-medium">{run.task}</span>
