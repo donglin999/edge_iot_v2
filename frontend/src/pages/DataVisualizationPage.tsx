@@ -42,7 +42,9 @@ import {
   fetchPointHistory,
   fetchPointsLatestValues,
 } from '../services/dataApi';
+import { isAbortError } from '../services/http';
 import PointChart from '../components/PointChart';
+import VirtualPointGrid from '../components/VirtualPointGrid';
 import './DataVisualizationPage.css';
 
 dayjs.extend(relativeTime);
@@ -71,6 +73,10 @@ const HISTORY_OPTIONS: Array<{ label: string; value: HistoryRange }> = [
   { label: '近 6 小时', value: '6h' },
   { label: '近 24 小时', value: '24h' },
 ];
+
+// Above this many matching points the realtime panel switches to a
+// virtualized grid so the DOM stays bounded (M11 in XIU-7).
+const VIRTUALIZE_THRESHOLD = 120;
 
 const RANGE_TO_MS: Record<HistoryRange, number> = {
   '5m': 5 * 60 * 1000,
@@ -140,60 +146,87 @@ const DataVisualizationPage: React.FC = () => {
 
   // Tasks (top filter level).
   useEffect(() => {
-    let cancelled = false;
-    fetchTasks()
+    const aborter = new AbortController();
+    fetchTasks(aborter.signal)
       .then((list) => {
-        if (cancelled) return;
-        setTasks(list);
+        if (!aborter.signal.aborted) setTasks(list);
       })
       .catch((err) => {
         // Surface as latestError; user can still see the empty state.
-        if (!cancelled) setLatestError((err as Error).message);
+        if (!isAbortError(err)) setLatestError((err as Error).message);
       })
       .finally(() => {
-        if (!cancelled) setTasksLoading(false);
+        if (!aborter.signal.aborted) setTasksLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => aborter.abort();
   }, []);
 
-  // Latest-value polling.
-  const fetchLatest = useCallback(async (current: Filter) => {
-    const res = await fetchPointsLatestValues({
-      taskId: current.taskId,
-      deviceId: current.deviceId,
-      pointCode: current.pointCode,
-    });
-    return res.points || [];
+  // Latest-value fetch — shared by the filter effect, poll timer and manual
+  // refresh. Threads an AbortSignal so each caller can cancel its request.
+  const fetchLatest = useCallback(
+    async (current: Filter, signal?: AbortSignal) => {
+      const res = await fetchPointsLatestValues(
+        {
+          taskId: current.taskId,
+          deviceId: current.deviceId,
+          pointCode: current.pointCode,
+        },
+        signal,
+      );
+      return res.points || [];
+    },
+    [],
+  );
+
+  const applyLatest = useCallback((points: PointLatestValue[]) => {
+    setLatestValues(points);
+    setLatestUpdatedAt(Date.now());
+    setLatestError(null);
   }, []);
 
+  // Immediate refetch whenever the filter changes. Kept separate from the
+  // poll timer below so a filter change does NOT tear down / restart the
+  // interval — only `pollInterval` controls the timer's lifecycle.
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
+    const aborter = new AbortController();
+    setLatestLoading(true);
+    fetchLatest(filter, aborter.signal)
+      .then((points) => {
+        if (!aborter.signal.aborted) applyLatest(points);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) setLatestError((err as Error).message);
+      })
+      .finally(() => {
+        if (!aborter.signal.aborted) setLatestLoading(false);
+      });
+    return () => aborter.abort();
+  }, [filter, fetchLatest, applyLatest]);
 
-    const tick = async () => {
-      try {
-        if (!cancelled) setLatestLoading(true);
-        const points = await fetchLatest(filterRef.current);
-        if (cancelled) return;
-        setLatestValues(points);
-        setLatestUpdatedAt(Date.now());
-        setLatestError(null);
-      } catch (err) {
-        if (!cancelled) setLatestError((err as Error).message);
-      } finally {
-        if (!cancelled) setLatestLoading(false);
-      }
+  // Poll timer. Reads the live filter from `filterRef`, so the interval is
+  // (re)created only when `pollInterval` changes — never on filter change.
+  useEffect(() => {
+    let aborter: AbortController | null = null;
+
+    const tick = () => {
+      aborter?.abort();
+      aborter = new AbortController();
+      const { signal } = aborter;
+      fetchLatest(filterRef.current, signal)
+        .then((points) => {
+          if (!signal.aborted) applyLatest(points);
+        })
+        .catch((err) => {
+          if (!isAbortError(err)) setLatestError((err as Error).message);
+        });
     };
 
-    tick();
-    timer = window.setInterval(tick, pollInterval);
+    const timer = window.setInterval(tick, pollInterval);
     return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearInterval(timer);
+      window.clearInterval(timer);
+      aborter?.abort();
     };
-  }, [filter, pollInterval, fetchLatest]);
+  }, [pollInterval, fetchLatest, applyLatest]);
 
   // Refresh "5 秒前更新" labels every second.
   useEffect(() => {
@@ -203,13 +236,11 @@ const DataVisualizationPage: React.FC = () => {
 
   const handleManualRefresh = useCallback(() => {
     fetchLatest(filterRef.current)
-      .then((points) => {
-        setLatestValues(points);
-        setLatestUpdatedAt(Date.now());
-        setLatestError(null);
-      })
-      .catch((err) => setLatestError((err as Error).message));
-  }, [fetchLatest]);
+      .then(applyLatest)
+      .catch((err) => {
+        if (!isAbortError(err)) setLatestError((err as Error).message);
+      });
+  }, [fetchLatest, applyLatest]);
 
   // Cascading-reset helpers.
   const onTaskChange = (value: number | null) => {
@@ -428,6 +459,18 @@ const DataVisualizationPage: React.FC = () => {
           />
         ) : matchingCount === 0 ? (
           <Empty description="当前筛选条件下没有测点" />
+        ) : matchingCount > VIRTUALIZE_THRESHOLD ? (
+          <VirtualPointGrid
+            points={latestValues}
+            renderCard={(p) => (
+              <PointValueCard
+                point={p}
+                active={p.point_code === filter.pointCode}
+                now={now}
+                onClick={() => onPointChange(p.point_code)}
+              />
+            )}
+          />
         ) : (
           <Row gutter={[12, 12]}>
             {latestValues.map((p) => (

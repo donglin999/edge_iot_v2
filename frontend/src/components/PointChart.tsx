@@ -15,6 +15,24 @@ import {
 import dayjs from 'dayjs';
 import { Empty, Spin } from 'antd';
 import { fetchPointHistory } from '../services/dataApi';
+import { isAbortError } from '../services/http';
+
+/**
+ * Recharts renders every datum as SVG; thousands of points janks the chart.
+ * Cap the series at this many points and downsample beyond it.
+ */
+const MAX_CHART_POINTS = 500;
+
+/** Evenly downsample to at most `max` items, always keeping first & last. */
+function downsample<T>(rows: T[], max: number): T[] {
+  if (rows.length <= max) return rows;
+  const step = (rows.length - 1) / (max - 1);
+  const out: T[] = [];
+  for (let i = 0; i < max; i += 1) {
+    out.push(rows[Math.round(i * step)]);
+  }
+  return out;
+}
 
 interface PointChartProps {
   pointCode: string;
@@ -46,12 +64,18 @@ const PointChart: React.FC<PointChartProps> = ({
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    const aborter = new AbortController();
     const load = async () => {
       setLoading(true);
       setError(null);
       try {
-        const res = await fetchPointHistory(pointCode, startTime, endTime, 1000);
+        const res = await fetchPointHistory(
+          pointCode,
+          startTime,
+          endTime,
+          1000,
+          aborter.signal,
+        );
         const rows: ChartPoint[] = (res.data || [])
           .map((dp) => {
             const numericValue =
@@ -72,20 +96,21 @@ const PointChart: React.FC<PointChartProps> = ({
           .filter((row) => Number.isFinite(row.value))
           .sort((a, b) => a.ts - b.ts);
 
-        if (!cancelled) {
-          setData(rows);
+        if (!aborter.signal.aborted) {
+          // Downsample so the SVG line chart stays responsive on large ranges.
+          setData(downsample(rows, MAX_CHART_POINTS));
         }
       } catch (err) {
-        if (!cancelled) {
+        if (!aborter.signal.aborted && !isAbortError(err)) {
           setError((err as Error).message);
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!aborter.signal.aborted) setLoading(false);
       }
     };
     load();
     return () => {
-      cancelled = true;
+      aborter.abort();
     };
   }, [pointCode, startTime, endTime, refreshKey]);
 
