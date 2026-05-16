@@ -136,7 +136,13 @@ class MitsubishiPLCProtocol(BaseProtocol):
 
         for group in groups:
             start_addr = group[0]["address"]
-            total_length = group[-1]["addr_num"] - group[0]["addr_num"] + group[-1].get("num", 1)
+            # Word count spanning the group: from the first register's address
+            # up to (and including) every word of the last register. Computed
+            # as (last_addr + last_num) - first_addr so a single-register group
+            # yields exactly 1 — never one short.
+            total_length = (
+                group[-1]["addr_num"] + group[-1].get("num", 1)
+            ) - group[0]["addr_num"]
 
             try:
                 result = self.plc.Read(start_addr, total_length)
