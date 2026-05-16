@@ -17,10 +17,24 @@ from storage import StorageRegistry
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
+@shared_task(
+    bind=True,
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3},
+)
 def start_acquisition_task(self, task_id: int, config_version_id: int = None) -> Dict[str, Any]:
     """
     Start continuous data acquisition for a task.
+
+    H8: this is a long-running task, so it is declared ``acks_late=True`` — the
+    broker message is only acked once the pipeline exits. If the worker dies
+    mid-run the message is redelivered (after ``broker_transport_options
+    visibility_timeout``) instead of being silently lost. To make redelivery
+    safe we run an *idempotency guard*: if a RUNNING session already exists for
+    the task the duplicate invocation exits immediately rather than spawning a
+    second pipeline against the same devices.
 
     Args:
         task_id: ID of the AcqTask to execute
@@ -41,6 +55,29 @@ def start_acquisition_task(self, task_id: int, config_version_id: int = None) ->
         if not task.is_active:
             logger.warning(f"Task {task_id} is not active, skipping")
             return {"status": "skipped", "reason": "Task is not active"}
+
+        # Idempotency guard (H8): a redelivered message (or a racing double
+        # dispatch from the API) must not start a second pipeline for a task
+        # that is already being acquired.
+        existing = (
+            acq_models.AcquisitionSession.objects.filter(
+                task_id=task_id,
+                status=acq_models.AcquisitionSession.STATUS_RUNNING,
+            )
+            .order_by("-started_at")
+            .first()
+        )
+        if existing is not None:
+            logger.warning(
+                "start_acquisition_task: task %s already has a RUNNING session "
+                "%s; skipping duplicate invocation %s",
+                task_id, existing.id, self.request.id,
+            )
+            return {
+                "status": "skipped",
+                "reason": "already running",
+                "session_id": existing.id,
+            }
 
         # Create acquisition session
         session = acq_models.AcquisitionSession.objects.create(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from pathlib import Path
 
 from django.db import transaction
 from django.db.models import Max
@@ -18,7 +17,7 @@ from rest_framework.views import APIView
 
 from configuration.services.exporter import ExcelExportService
 from configuration.services.importer import ExcelImportService
-from . import models, serializers, tasks
+from . import import_paths, models, serializers, tasks
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +118,19 @@ class DeviceViewSet(viewsets.ModelViewSet):
     @extend_schema(summary="测试设备连接")
     @action(detail=True, methods=["post"], url_path="test-connection")
     def test_connection(self, request, pk=None):
-        """测试设备连接（同步本地调用，不走 Celery）。
+        """测试设备连接（H9：转 Celery ``short`` 队列，5s 超时即返回）。
 
-        连接测试是短交互：开 TCP、发心跳、关 TCP。直接在请求线程里跑可避免
-        Celery solo pool 被长跑采集任务独占时无法获取结果的问题。
+        连接测试要做真实协议 I/O（开 TCP、发心跳、关 TCP）。过去它在 WSGI
+        请求线程里同步执行——设备无响应时会一直占住一个 web worker 线程。
+        现在改为派发到 Celery ``short`` 队列（与长跑采集任务的 ``acquisition``
+        队列隔离），WSGI 线程最多只阻塞 5s 等结果：超时则立即返回 504，真正的
+        阻塞 I/O 留在 Celery worker 上，不再拖垮 web 进程。
         """
-        device = self.get_object()
+        from celery.exceptions import TimeoutError as CeleryTimeoutError
 
-        from acquisition.protocols import ProtocolRegistry
+        from acquisition import tasks as acq_tasks
+
+        device = self.get_object()
 
         metadata = device.metadata or {}
         device_config = {
@@ -137,24 +141,29 @@ class DeviceViewSet(viewsets.ModelViewSet):
             "timeout": min(float(metadata.get("timeout", 5.0)), 5.0),
         }
 
+        async_result = acq_tasks.check_protocol_connection.apply_async(
+            args=[device.protocol, device_config],
+            queue="short",
+        )
         try:
-            protocol = ProtocolRegistry.create(device.protocol, device_config)
-            with protocol:
-                healthy = protocol.health_check()
-                connected = protocol.is_connected
-
-            details = {
-                "status": "success" if healthy else "unhealthy",
-                "protocol": device.protocol,
-                "connected": connected,
-                "healthy": healthy,
-            }
-            return Response({
-                "success": healthy,
-                "message": "连接测试成功" if healthy else "连接异常",
-                "details": details,
-            })
-        except Exception as e:
+            # WSGI 线程在此最多阻塞 5s。
+            result = async_result.get(timeout=5.0, propagate=True)
+        except CeleryTimeoutError:
+            logger.warning("Test connection timed out for device %s (task %s)",
+                            device.id, async_result.id)
+            return Response(
+                {
+                    "success": False,
+                    "message": "连接测试超时(>5s)，设备无响应或网络不可达",
+                    "details": {
+                        "status": "timeout",
+                        "protocol": device.protocol,
+                        "task_id": async_result.id,
+                    },
+                },
+                status=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+        except Exception as e:  # noqa: BLE001 - task raised inside the worker
             logger.warning("Test connection failed for device %s: %s", device.id, e)
             return Response({
                 "success": False,
@@ -165,6 +174,24 @@ class DeviceViewSet(viewsets.ModelViewSet):
                     "error": str(e),
                 },
             })
+
+        healthy = bool(result.get("healthy")) or result.get("status") == "success"
+        if result.get("status") == "error":
+            return Response({
+                "success": False,
+                "message": f"连接测试失败: {result.get('error', '未知错误')}",
+                "details": result,
+            })
+        return Response({
+            "success": healthy,
+            "message": "连接测试成功" if healthy else "连接异常",
+            "details": {
+                "status": result.get("status", "unknown"),
+                "protocol": device.protocol,
+                "connected": bool(result.get("connected")),
+                "healthy": healthy,
+            },
+        })
 
     @extend_schema(summary="获取设备所有测点的最新值")
     @action(detail=True, methods=["get"], url_path="latest-values")
@@ -738,7 +765,7 @@ class ImportJobViewSet(
         if not file_path:
             return Response({"detail": "导入作业缺少文件路径信息"}, status=status.HTTP_400_BAD_REQUEST)
 
-        path = Path(file_path)
+        path = import_paths.resolve(file_path)
         if not path.exists():
             return Response({"detail": f"文件不存在: {path}"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -765,7 +792,7 @@ class ImportJobViewSet(
         file_path = summary.get("file_path")
         if not file_path:
             return Response({"detail": "导入作业缺少文件路径信息"}, status=status.HTTP_400_BAD_REQUEST)
-        path = Path(file_path)
+        path = import_paths.resolve(file_path)
         if not path.exists():
             return Response({"detail": f"文件不存在: {path}"}, status=status.HTTP_400_BAD_REQUEST)
         site_code = request.query_params.get("site_code") or summary.get("site_code") or "default"

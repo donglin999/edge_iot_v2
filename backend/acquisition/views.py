@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Dict, Any
 
+from django.db import connection, transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, extend_schema_view
@@ -21,6 +22,39 @@ from acquisition.services.templates import build_template
 from configuration import models as config_models
 
 logger = logging.getLogger(__name__)
+
+
+def _update_session_locked(session, *, metadata_mutator=None, field_updates=None):
+    """M1: re-read an AcquisitionSession under a row lock, mutate, save.
+
+    The acquisition loop writes ``session.metadata`` (live counters such as
+    ``last_read_time``) every cycle. A naive read-modify-write in the request
+    handler races with that loop and silently clobbers its updates. Here we
+    re-fetch the row inside a transaction with ``select_for_update`` so the
+    loop's metadata writes and the view's writes are serialized.
+
+    ``select_for_update`` is a real row lock on Postgres and a no-op on SQLite
+    (``has_select_for_update`` is False there) — the surrounding
+    ``transaction.atomic`` still keeps the read-modify-write consistent.
+
+    Returns the freshly-locked instance with the changes applied.
+    """
+    update_fields = {"updated_at"}
+    qs = acq_models.AcquisitionSession.objects.all()
+    if connection.features.has_select_for_update:
+        qs = qs.select_for_update()
+    with transaction.atomic():
+        locked = qs.get(pk=session.pk)
+        if metadata_mutator is not None:
+            meta = locked.metadata or {}
+            metadata_mutator(meta)
+            locked.metadata = meta
+            update_fields.add("metadata")
+        for field, value in (field_updates or {}).items():
+            setattr(locked, field, value)
+            update_fields.add(field)
+        locked.save(update_fields=sorted(update_fields))
+    return locked
 
 
 class ProtocolViewSet(viewsets.ViewSet):
@@ -264,10 +298,10 @@ class AcquisitionSessionViewSet(
             celery_task_id=celery_result.id
         ).first()
 
-        # 将验证结果写入会话元数据
+        # 将验证结果写入会话元数据（M1：行锁下 read-modify-write，避免覆盖
+        # 采集循环并发写入的实时计数器）。
         if session:
-            session.metadata = session.metadata or {}
-            session.metadata["startup_validation"] = {
+            startup_validation = {
                 "timestamp": timezone.now().isoformat(),
                 "all_healthy": all_healthy,
                 "total_points": total_points,
@@ -276,8 +310,14 @@ class AcquisitionSessionViewSet(
                 "elapsed_seconds": time.time() - start_time,
             }
             if failed_points:
-                session.metadata["startup_validation"]["failed_points"] = failed_points[:20]
-            session.save(update_fields=['metadata'])
+                startup_validation["failed_points"] = failed_points[:20]
+
+            def _set_startup_validation(meta):
+                meta["startup_validation"] = startup_validation
+
+            session = _update_session_locked(
+                session, metadata_mutator=_set_startup_validation
+            )
 
         logger.info(
             f"Started acquisition task {task_id} ({task.code}), "
@@ -345,15 +385,24 @@ class AcquisitionSessionViewSet(
         # We don't dispatch stop_acquisition_task because under --pool=solo the
         # running start_acquisition_task occupies the only worker slot, so the
         # stop task would never get consumed.
-        metadata = session.metadata or {}
-        if reason:
-            metadata['stop_reason'] = reason
-        metadata['stopped_by'] = request.user.username if request.user.is_authenticated else 'anonymous'
-        metadata['stopped_at_client'] = timezone.now().isoformat()
-        session.metadata = metadata
-        session.status = acq_models.AcquisitionSession.STATUS_STOPPED
-        session.stopped_at = timezone.now()
-        session.save(update_fields=['status', 'stopped_at', 'metadata', 'updated_at'])
+        # M1: lock the row so the metadata merge doesn't clobber the loop's
+        # concurrent writes (last_read_time 等实时计数器).
+        stopped_by = request.user.username if request.user.is_authenticated else 'anonymous'
+
+        def _apply_stop(meta):
+            if reason:
+                meta['stop_reason'] = reason
+            meta['stopped_by'] = stopped_by
+            meta['stopped_at_client'] = timezone.now().isoformat()
+
+        session = _update_session_locked(
+            session,
+            metadata_mutator=_apply_stop,
+            field_updates={
+                "status": acq_models.AcquisitionSession.STATUS_STOPPED,
+                "stopped_at": timezone.now(),
+            },
+        )
 
         # Best-effort revoke in case the worker is configured with a multi-slot
         # pool; safe no-op when the task isn't running.
@@ -388,13 +437,21 @@ class AcquisitionSessionViewSet(
         # next loop tick; the worker disconnects cleanly and the celery task
         # exits. We don't issue revoke() — we want the loop's finally block to
         # flush the final batch and update metadata.
-        session.status = acq_models.AcquisitionSession.STATUS_PAUSED
-        session.stopped_at = timezone.now()
-        meta = session.metadata or {}
-        meta["paused_at"] = timezone.now().isoformat()
-        meta["paused_by"] = request.user.username if request.user.is_authenticated else "anonymous"
-        session.metadata = meta
-        session.save(update_fields=["status", "stopped_at", "metadata", "updated_at"])
+        # M1: lock the row so the metadata merge doesn't clobber loop writes.
+        paused_by = request.user.username if request.user.is_authenticated else "anonymous"
+
+        def _apply_pause(meta):
+            meta["paused_at"] = timezone.now().isoformat()
+            meta["paused_by"] = paused_by
+
+        session = _update_session_locked(
+            session,
+            metadata_mutator=_apply_pause,
+            field_updates={
+                "status": acq_models.AcquisitionSession.STATUS_PAUSED,
+                "stopped_at": timezone.now(),
+            },
+        )
 
         logger.info("Pause requested for session %s", session.id)
         return Response({
@@ -433,10 +490,12 @@ class AcquisitionSessionViewSet(
             )
 
         # Mark old session metadata for traceability (status stays PAUSED).
-        meta = session.metadata or {}
-        meta["resumed_at"] = timezone.now().isoformat()
-        session.metadata = meta
-        session.save(update_fields=["metadata", "updated_at"])
+        # M1: lock the row to avoid clobbering concurrent loop writes.
+        resumed_at = timezone.now().isoformat()
+        session = _update_session_locked(
+            session,
+            metadata_mutator=lambda meta: meta.__setitem__("resumed_at", resumed_at),
+        )
 
         # Dispatch a brand-new session via the same start_acquisition_task path.
         # The celery task itself creates the session row.
@@ -446,10 +505,13 @@ class AcquisitionSessionViewSet(
             celery_task_id=celery_result.id,
         ).first()
         if new_session is not None:
-            md = new_session.metadata or {}
-            md["resumed_from_session"] = session.id
-            new_session.metadata = md
-            new_session.save(update_fields=["metadata", "updated_at"])
+            previous_session_id = session.id
+            new_session = _update_session_locked(
+                new_session,
+                metadata_mutator=lambda meta: meta.__setitem__(
+                    "resumed_from_session", previous_session_id
+                ),
+            )
 
         logger.info("Resumed paused session %s as new session %s",
                     session.id, new_session.id if new_session else "?")
@@ -635,10 +697,13 @@ class AcquisitionSessionViewSet(
         # Escape user input to prevent Flux injection in the filter.
         safe_point = point_code.replace("\\", "\\\\").replace('"', '\\"')
         bucket = influx_config["bucket"]
+        # M5: point_code is no longer a tag - it is the field *key*. Filter on
+        # _field so only the numeric series is returned (cn_name / unit fields
+        # are excluded).
         flux_query = (
             f'from(bucket:"{bucket}") '
             f'|> range(start: {_flux_range_arg(start_time)}, stop: {_flux_range_arg(end_time)}) '
-            f'|> filter(fn: (r) => r["point"] == "{safe_point}") '
+            f'|> filter(fn: (r) => r["_field"] == "{safe_point}") '
             f'|> sort(columns: ["_time"]) '
             f'|> limit(n: {limit})'
         )

@@ -23,6 +23,15 @@ app.conf.task_routes = {
 # stray task lands on the responsive worker rather than the acquisition one.
 app.conf.task_default_queue = "short"
 
+# Broker visibility timeout (H8): with a Redis broker an unacked message is
+# re-delivered to another worker after ``visibility_timeout`` seconds. The
+# default is 1 hour; we shorten it to 30 min so a crashed worker's task is
+# re-picked promptly. Long-running ``start_acquisition_task`` uses
+# ``acks_late=True`` plus an idempotency guard, so a redelivery is safe — the
+# second runner sees the still-RUNNING session and exits without
+# double-acquiring.
+app.conf.broker_transport_options = {"visibility_timeout": 1800}
+
 
 @app.task(bind=True)
 def debug_task(self):  # pragma: no cover - helper task
