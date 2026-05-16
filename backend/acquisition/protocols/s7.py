@@ -70,6 +70,12 @@ def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
     byte = int(parts["byte"])
     bit = int(parts["bit"] or 0)
 
+    # A byte holds 8 bits; a ``.bit`` offset outside 0..7 is a malformed
+    # address (e.g. "DBX10.8"). Reject it here rather than silently masking
+    # the wrong bit — ``1 << bit`` for bit>7 just yields 0 in _decode().
+    if bit > 7:
+        raise ValueError(f"S7 位偏移 {bit} 超出范围 0-7: {address!r}")
+
     # Map area → snap7.Area + size
     if code in ("DBX",):
         return Area.DB, db, byte, bit, 1
@@ -205,6 +211,7 @@ class SiemensS7Protocol(BaseProtocol):
                 raise ReadError("Not connected to S7 PLC")
 
         results: List[Dict[str, Any]] = []
+        errors: List[str] = []
         for point in points:
             try:
                 area, db, byte, bit, length = _parse_s7_address(str(point.get("address", "")))
@@ -218,7 +225,22 @@ class SiemensS7Protocol(BaseProtocol):
                     "address": point.get("address"),
                 })
             except Exception as exc:  # noqa: BLE001
-                raise ReadError(
-                    f"S7 read failed for {point.get('code')} @ {point.get('address')}: {exc}"
-                ) from exc
+                # A single bad address / decode must not discard the whole
+                # batch: flag just this point as bad-quality and carry on so
+                # its healthy peers still produce readings.
+                msg = f"{point.get('code')} @ {point.get('address')}: {exc}"
+                errors.append(msg)
+                self.logger.warning("S7 read failed for %s", msg)
+                results.append({
+                    "code": point["code"],
+                    "value": None,
+                    "timestamp": time.time_ns(),
+                    "quality": "bad",
+                    "address": point.get("address"),
+                })
+        # If *every* point failed the device itself is unreachable — raise so
+        # the caller treats it as a transport failure and triggers reconnect,
+        # rather than silently streaming an all-bad batch forever.
+        if points and len(errors) == len(points):
+            raise ReadError(f"S7 read failed for all {len(points)} point(s): {errors[0]}")
         return results

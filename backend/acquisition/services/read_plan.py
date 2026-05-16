@@ -266,7 +266,14 @@ def _build_modbus_plan(
         cur_end: Optional[int] = None  # exclusive: address of next free reg
 
         def flush() -> None:
-            if not current:
+            # Never emit a degenerate group: no points, or a non-positive
+            # register span. The old ``else 0`` fallback for a ``None``
+            # cur_start would append a 0-register group that read_batch then
+            # turns into a bogus ``execute(quantity_of_x=0)`` call.
+            if not current or cur_start is None or cur_end is None:
+                return
+            register_count = cur_end - cur_start
+            if register_count <= 0:
                 return
             groups.append(
                 ReadGroup(
@@ -274,7 +281,7 @@ def _build_modbus_plan(
                     points=list(current),
                     function_code=fc,
                     start_address=cur_start,
-                    register_count=(cur_end - cur_start) if cur_start is not None else 0,
+                    register_count=register_count,
                     extra={"slave_id": slave_id},
                 )
             )
@@ -292,14 +299,26 @@ def _build_modbus_plan(
             if meta.address == current[-1].address and meta.num_registers == current[-1].num_registers:
                 continue
 
-            gap = meta.address - cur_end  # may be negative if overlapping
+            # Overlap: this point starts *inside* the register range the
+            # current group already covers. Because ``metas`` is sorted
+            # ascending we also know ``meta.address >= cur_start``, so the
+            # point is fully addressable from within the current group.
+            # Always fold it in here — feeding a negative ``gap`` into the
+            # merge arithmetic below could otherwise flush and open a second
+            # group that overlaps the first (redundant reads, and the shared
+            # point read twice).
+            if meta.address < cur_end:
+                current.append(meta)
+                cur_end = max(cur_end, point_end)
+                continue
+
+            gap = meta.address - cur_end  # non-negative: overlaps handled above
             new_end = max(cur_end, point_end)
             new_span = new_end - cur_start
 
             mergeable = (
                 gap <= gap_threshold
                 and new_span <= max_registers
-                and meta.address >= cur_start  # never go backwards
             )
             if mergeable:
                 current.append(meta)

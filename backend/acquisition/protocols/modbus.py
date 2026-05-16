@@ -11,6 +11,7 @@ importer / API can validate per-row before any device connection is opened.
 from __future__ import annotations
 
 import re
+import socket
 import struct
 import time
 from typing import Any, Dict, List
@@ -18,7 +19,12 @@ from typing import Any, Dict, List
 import modbus_tk.defines as cst
 from modbus_tk import modbus_rtu, modbus_tcp
 
-from acquisition.services.read_plan import PointMeta, ReadGroup, Reading
+from acquisition.services.read_plan import (
+    PointMeta,
+    ReadGroup,
+    ReadPlanBuilder,
+    Reading,
+)
 
 from .base import (
     BaseProtocol,
@@ -52,30 +58,48 @@ _BYTE_ORDERS = ("big", "little", "big-swap", "little-swap")
 # ---------------------------------------------------------------------------
 
 
-def _apply_byte_order(word_bytes: bytes, byte_order: str) -> bytes:
-    """Re-order bytes to match the device's word/byte layout.
+# A multi-register scalar (2 or 4 uint16 words) is decoded by composing two
+# independent transforms that together cover all four ``byte_order`` modes:
+#   * within-word byte swap — needed only for the *-swap orders (BADC / CDAB)
+#   * struct endianness char — ">" for big/big-swap, "<" for little/little-swap
+# Swapping the bytes inside each word (when required) and then unpacking with
+# the matching endianness char reproduces the device's value for every order;
+# this is why _combine_registers must NOT hard-code ">f".
+_BYTE_SWAP_ORDERS = frozenset({"big-swap", "little-swap"})
+_LITTLE_ENDIAN_ORDERS = frozenset({"little", "little-swap"})
 
-    ``big`` (default) — ABCD: each word big-endian, words in network order.
-    ``little`` — DCBA: each word little-endian, words reversed.
-    ``big-swap`` — BADC: each word's bytes swapped, words in network order.
-    ``little-swap`` — CDAB: each word big-endian, but word order reversed.
+
+def _apply_byte_order(word_bytes: bytes, byte_order: str) -> bytes:
+    """Swap the two bytes inside each 16-bit word when ``byte_order`` requires it.
+
+    ``big`` (ABCD) / ``little`` (DCBA) keep each word's bytes as received — the
+    word-level ordering is then expressed through the struct endianness char
+    (see :func:`_struct_prefix`). ``big-swap`` (BADC) / ``little-swap`` (CDAB)
+    additionally need the two bytes inside every word swapped.
+
+    Always returns a freshly joined ``bytes`` object (never an iterator).
     """
     bo = (byte_order or "big").strip().lower()
-    if bo == "big":
-        return word_bytes
-    # Split into 2-byte words
+    if bo not in _BYTE_SWAP_ORDERS:
+        return bytes(word_bytes)
     words = [word_bytes[i : i + 2] for i in range(0, len(word_bytes), 2)]
-    if bo == "little":
-        return b"".join(w[::-1] for w in reversed(words))
-    if bo == "big-swap":
-        return b"".join(w[::-1] for w in words)
-    if bo == "little-swap":
-        return b"".join(reversed(words))
-    return word_bytes  # unknown — pass through
+    return b"".join(bytes(reversed(w)) for w in words)
+
+
+def _struct_prefix(byte_order: str) -> str:
+    """Return the ``struct`` endianness char (``>`` or ``<``) for ``byte_order``."""
+    bo = (byte_order or "big").strip().lower()
+    return "<" if bo in _LITTLE_ENDIAN_ORDERS else ">"
 
 
 def _combine_registers(registers, data_type: str, num: int, byte_order: str = "big"):
-    """Combine N consecutive uint16 registers into the right scalar."""
+    """Combine N consecutive uint16 registers into the right scalar.
+
+    ``byte_order`` is honoured for every multi-register type: bytes are
+    rearranged by :func:`_apply_byte_order` and the ``struct`` format string is
+    selected via :func:`_struct_prefix` so big- and little-endian devices both
+    decode correctly.
+    """
     if num <= 1:
         if not registers:
             return 0
@@ -86,21 +110,55 @@ def _combine_registers(registers, data_type: str, num: int, byte_order: str = "b
         int(r).to_bytes(2, byteorder="big", signed=False) for r in registers[:num]
     )
     word_bytes = _apply_byte_order(word_bytes, byte_order)
+    pfx = _struct_prefix(byte_order)
 
     if num == 2 and dt in ("float", "float32", "real"):
-        return struct.unpack(">f", word_bytes)[0]
+        return struct.unpack(pfx + "f", word_bytes)[0]
     if num == 4 and dt in ("float64", "double"):
-        return struct.unpack(">d", word_bytes)[0]
+        return struct.unpack(pfx + "d", word_bytes)[0]
     if num == 2 and dt in ("int32", "long", "dint"):
-        return struct.unpack(">i", word_bytes)[0]
+        return struct.unpack(pfx + "i", word_bytes)[0]
     if num == 2 and dt in ("uint32", "udint", "dword"):
-        return struct.unpack(">I", word_bytes)[0]
+        return struct.unpack(pfx + "I", word_bytes)[0]
     if num == 4 and dt in ("int64", "lint"):
-        return struct.unpack(">q", word_bytes)[0]
+        return struct.unpack(pfx + "q", word_bytes)[0]
     if num == 4 and dt in ("uint64", "ulint", "qword"):
-        return struct.unpack(">Q", word_bytes)[0]
+        return struct.unpack(pfx + "Q", word_bytes)[0]
 
     return list(registers[:num])
+
+
+# ---------------------------------------------------------------------------
+# Legacy read_points() adapters
+#
+# The dict-based read_points() path predates ReadPlanBuilder. These tiny
+# duck-typed stand-ins let it reuse the exact same plan builder the pipeline
+# uses, without importing the Django-bound pipeline module.
+# ---------------------------------------------------------------------------
+
+
+class _LegacyPoint:
+    """Wrap a legacy point dict so :class:`ReadPlanBuilder` sees the
+    attributes (``code``, ``address``, ``extra``, ``template``) it expects."""
+
+    __slots__ = ("code", "address", "extra", "template")
+
+    def __init__(self, raw: Dict[str, Any]) -> None:
+        self.code = raw["code"]
+        self.address = raw.get("address", "0")
+        # ReadPlanBuilder pulls function_code / data_type / type / num here.
+        self.extra = {k: v for k, v in raw.items() if k not in ("code", "address")}
+        self.template = None
+
+
+class _LegacyDevice:
+    """Minimal device stand-in carrying just what ``ReadPlanBuilder`` reads."""
+
+    __slots__ = ("protocol", "metadata")
+
+    def __init__(self, protocol: str, slave_id: int) -> None:
+        self.protocol = protocol
+        self.metadata = {"slave_id": slave_id}
 
 
 # ---------------------------------------------------------------------------
@@ -160,46 +218,35 @@ class _ModbusBase(BaseProtocol):
             return False
 
     def read_points(self, points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Legacy dict-in / dict-out read interface.
+
+        This now delegates to the same gap-tolerant :class:`ReadPlanBuilder`
+        coalescing and :meth:`read_batch` decoding the pipeline uses, so the
+        old call path benefits from batch merging (fewer round-trips) and
+        per-point error isolation instead of the previous strict-contiguous
+        grouping. The dict result shape is preserved for existing callers.
+        """
         if not self.is_connected or not self.master:
             if not self.connect():
                 raise ReadError("Not connected to Modbus device")
 
-        groups = self._group_continuous_registers(points)
+        groups = ReadPlanBuilder.build(
+            _LegacyDevice(self.META.name, self.slave_addr),
+            [_LegacyPoint(p) for p in points],
+        )
+        addr_by_code = {pm.code: pm.address for g in groups for pm in g.points}
+
         results: List[Dict[str, Any]] = []
-
-        for func_code, register_groups in groups.items():
-            for group in register_groups:
-                start_addr = group[0]["address"]
-                total_length = (group[-1]["address"] + group[-1].get("num", 1)) - start_addr
-                try:
-                    data = self.master.execute(
-                        slave=self.slave_addr,
-                        function_code=func_code,
-                        starting_address=start_addr,
-                        quantity_of_x=total_length,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    raise ReadError(
-                        f"Failed to read registers @ {start_addr} len={total_length} fc={func_code}: {exc}"
-                    ) from exc
-
-                offset = 0
-                for point in group:
-                    num_registers = point.get("num", 1)
-                    point_data = data[offset : offset + num_registers]
-                    offset += num_registers
-                    value = _combine_registers(
-                        point_data, point.get("data_type", ""),
-                        num_registers, self.byte_order,
-                    )
-                    results.append({
-                        "code": point["code"],
-                        "value": value,
-                        "timestamp": time.time_ns(),
-                        "quality": "good",
-                        "address": point["address"],
-                        "raw_data": point_data,
-                    })
+        for group in groups:
+            for reading in self.read_batch(group):
+                results.append({
+                    "code": reading.point_code,
+                    "value": reading.value,
+                    "timestamp": reading.timestamp_ns,
+                    "quality": reading.quality,
+                    "address": addr_by_code.get(reading.point_code),
+                    "raw_data": reading.raw,
+                })
         return results
 
     # ------- Batched read (new pipeline path) ------- #
@@ -389,12 +436,42 @@ class ModbusTCPProtocol(_ModbusBase):
     def connect(self) -> bool:
         try:
             self.master = modbus_tcp.TcpMaster(host=self.ip, port=self.port, timeout_in_sec=self.timeout)
+            # Open the socket eagerly so we can tune it; modbus-tk would
+            # otherwise lazy-open on the first execute().
+            self.master.open()
+            self._enable_keepalive()
             self.is_connected = True
             self.logger.info("Connected to Modbus TCP %s:%s slave=%s", self.ip, self.port, self.slave_addr)
             return True
         except Exception as exc:  # noqa: BLE001
             self.is_connected = False
             raise ConnectionError(f"Modbus TCP connection failed: {exc}") from exc
+
+    def _enable_keepalive(self) -> None:
+        """Enable TCP keep-alive on the Modbus socket.
+
+        Without ``SO_KEEPALIVE`` a silently dropped link (cable pull, switch
+        reboot, NAT idle-timeout) is only noticed when the next read times
+        out — which at long poll intervals can be minutes. Keep-alive probes
+        surface the dead peer proactively. Probe-interval knobs are set
+        best-effort: they are not portable (e.g. macOS lacks
+        ``TCP_KEEPIDLE``), so each is guarded by ``getattr``.
+        """
+        sock = getattr(self.master, "_sock", None)
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt_name, value in (
+                ("TCP_KEEPIDLE", 30),   # idle seconds before first probe
+                ("TCP_KEEPINTVL", 10),  # seconds between probes
+                ("TCP_KEEPCNT", 3),     # failed probes before drop
+            ):
+                opt = getattr(socket, opt_name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError as exc:
+            self.logger.warning("Failed to enable SO_KEEPALIVE on Modbus TCP socket: %s", exc)
 
 
 # ---------------------------------------------------------------------------

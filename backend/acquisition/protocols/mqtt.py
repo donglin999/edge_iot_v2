@@ -47,6 +47,8 @@ class MQTTProtocol(BaseProtocol):
         FieldSpec("mqtt_use_tls", "启用 TLS", kind="bool", default=False),
         FieldSpec("mqtt_client_id", "ClientID", default="",
                   help_text="留空自动生成"),
+        FieldSpec("mqtt_read_timeout", "读取超时(秒)", kind="float", default=5.0,
+                  help_text="采集循环从消息队列拉数据时的最长等待时间;队列空闲超过该值即结束本轮读取"),
     )
     IDENTITY_FIELDS = ("source_ip", "source_port", "mqtt_client_id")
 
@@ -80,6 +82,14 @@ class MQTTProtocol(BaseProtocol):
             # accept comma- or semicolon-separated topic lists
             topics = [t.strip() for t in topics.replace(";", ",").split(",") if t.strip()]
         self.topics = topics
+
+        # How long read_points() waits on an empty queue before returning.
+        try:
+            self.read_timeout = float(device_config.get("mqtt_read_timeout", 5.0))
+        except (TypeError, ValueError):
+            self.read_timeout = 5.0
+        if self.read_timeout <= 0:
+            self.read_timeout = 5.0
 
         self.client: Optional[mqtt.Client] = None
         self.data_queue = queue.Queue(maxsize=1000)
@@ -150,7 +160,7 @@ class MQTTProtocol(BaseProtocol):
                 raise ReadError("Not connected to MQTT broker")
 
         results = []
-        timeout = 5  # seconds
+        timeout = self.read_timeout  # seconds, configurable via mqtt_read_timeout
 
         try:
             # Try to get messages from queue with timeout

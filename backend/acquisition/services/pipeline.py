@@ -73,6 +73,15 @@ class ReadWorker(threading.Thread):
         self.connection_timeout = float(connection_timeout)
         self.reconnect_backoff = float(reconnect_backoff)
         self.protocol = None
+        # ----- health record (cross-thread) ----------------------------
+        # ``health_dict`` is shared with the pipeline's supervising loop,
+        # which reads this worker's record from a different thread. We
+        # never mutate the live record key-by-key (the reader could then
+        # observe a half-updated dict); instead ``_update_health`` swaps a
+        # freshly built dict in atomically. Keep a reference to the shared
+        # dict + our key so the swap can target it.
+        self._health_dict = health_dict
+        self._device_id = device.id
         self.health = health_dict.setdefault(
             device.id,
             {
@@ -114,13 +123,51 @@ class ReadWorker(threading.Thread):
         # so a stuck I/O fails fast and the next cycle gets a fresh shot.
         metadata = self.device.metadata or {}
         configured_timeout = float(metadata.get("timeout", 5.0))
-        self._auto_timeout = max(0.1, min(configured_timeout, self.cycle_interval * 2))
+        # Floor at 500 ms: anything tighter would abort slow-but-healthy
+        # devices (serial RTU, multi-register reads) mid-transaction.
+        self._auto_timeout = max(0.5, min(configured_timeout, self.cycle_interval * 2))
         logger.info(
             "ReadWorker[%s] cycle=%.0fms timeout=%.0fms",
             self.device.code,
             self.cycle_interval * 1000,
             self._auto_timeout * 1000,
         )
+
+    # --------------------------------------------------------------- helpers
+    def _update_health(self, **changes: Any) -> None:
+        """Atomically publish a health update.
+
+        The pipeline's supervising loop reads ``health_dict[device_id]``
+        from another thread. Mutating the live record key-by-key would let
+        that reader observe a half-updated dict (e.g. a new ``status`` with
+        a stale ``consecutive_failures``). Instead we build a fresh dict and
+        swap it in with a single assignment — atomic under the GIL — so the
+        reader always sees a self-consistent snapshot. Only this worker
+        thread ever writes its own record, so no lock is required.
+        """
+        new = dict(self.health)
+        new.update(changes)
+        self.health = new
+        self._health_dict[self._device_id] = new
+
+    def _interruptible_sleep(self, duration: float) -> bool:
+        """Sleep up to ``duration`` seconds, staying responsive to shutdown.
+
+        Returns ``True`` if shutdown was requested during the wait (caller
+        should stop), ``False`` if the full duration elapsed. The wait is
+        sliced into <=100 ms chunks so a long reconnect backoff never delays
+        a stop by more than a tick, even on platforms where ``Event.wait``
+        wake-ups are coarse.
+        """
+        deadline = time.monotonic() + max(0.0, duration)
+        while True:
+            if self.shutdown_event.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.shutdown_event.wait(min(0.1, remaining)):
+                return True
 
     # --------------------------------------------------------------- lifecycle
     def _emit(self, event_type: str, **payload: Any) -> None:
@@ -186,9 +233,11 @@ class ReadWorker(threading.Thread):
             }
             self.protocol = ProtocolRegistry.create(self.device.protocol, cfg)
             self.protocol.connect()
-            self.health["status"] = "healthy"
-            self.health["consecutive_failures"] = 0
-            self.health["last_success"] = time.time()
+            self._update_health(
+                status="healthy",
+                consecutive_failures=0,
+                last_success=time.time(),
+            )
             logger.info("ReadWorker[%s] connected", self.device.code)
 
             connect_duration_ms = int((time.time() - connect_start) * 1000)
@@ -212,8 +261,10 @@ class ReadWorker(threading.Thread):
             self._gave_up_emitted = False
             return True
         except Exception as exc:  # noqa: BLE001
-            self.health["consecutive_failures"] += 1
-            self.health["status"] = "disconnected"
+            self._update_health(
+                consecutive_failures=self.health["consecutive_failures"] + 1,
+                status="disconnected",
+            )
             self.protocol = None
             logger.warning("ReadWorker[%s] connect failed: %s", self.device.code, exc)
             return False
@@ -222,6 +273,27 @@ class ReadWorker(threading.Thread):
         # Initial connect; failure is fine — the loop will retry with backoff.
         self._connect()
 
+        # try/finally guarantees the protocol connection is closed even if
+        # the loop exits via an unexpected exception rather than a clean
+        # shutdown — without it a crashed worker would leak its socket
+        # until interpreter exit (and a daemon thread skips its cleanup
+        # entirely when killed at exit).
+        try:
+            self._run_loop()
+        finally:
+            # Final flush so partial aggregates still surface in the UI log.
+            self._flush_failed_events(force=True)
+            # Graceful disconnect.
+            if self.protocol is not None:
+                try:
+                    self.protocol.disconnect()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "ReadWorker[%s] disconnect error: %s", self.device.code, exc,
+                    )
+            logger.info("ReadWorker[%s] stopped", self.device.code)
+
+    def _run_loop(self) -> None:
         while not self.shutdown_event.is_set():
             cycle_start = time.time()
 
@@ -238,10 +310,10 @@ class ReadWorker(threading.Thread):
                             will_retry_in_seconds=int(self.reconnect_backoff),
                         )
                         self._gave_up_emitted = True
-                    if self.shutdown_event.wait(self.reconnect_backoff):
+                    if self._interruptible_sleep(self.reconnect_backoff):
                         break
                     # Reset so we re-attempt; otherwise we'd never recover.
-                    self.health["consecutive_failures"] = 0
+                    self._update_health(consecutive_failures=0)
                     self._reconnect_attempt = 0
                     self._gave_up_emitted = False
                     # Allow a fresh ``connecting`` event for the next
@@ -270,19 +342,8 @@ class ReadWorker(threading.Thread):
             elapsed = time.time() - cycle_start
             sleep = max(0.0, self.cycle_interval - elapsed)
             if sleep > 0:
-                if self.shutdown_event.wait(sleep):
+                if self._interruptible_sleep(sleep):
                     break
-
-        # Final flush so partial aggregates still surface in the UI log.
-        self._flush_failed_events(force=True)
-
-        # Graceful disconnect
-        if self.protocol is not None:
-            try:
-                self.protocol.disconnect()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("ReadWorker[%s] disconnect error: %s", self.device.code, exc)
-        logger.info("ReadWorker[%s] stopped", self.device.code)
 
     # --------------------------------------------------------------- per-cycle
     def _read_cycle(self) -> None:
@@ -295,9 +356,11 @@ class ReadWorker(threading.Thread):
                 self._record_failure(exc)
                 continue
 
-            self.health["last_success"] = time.time()
-            self.health["consecutive_failures"] = 0
-            self.health["status"] = "healthy"
+            self._update_health(
+                last_success=time.time(),
+                consecutive_failures=0,
+                status="healthy",
+            )
 
             for reading in readings:
                 for sink in self.sinks:
@@ -311,9 +374,9 @@ class ReadWorker(threading.Thread):
                         )
 
     def _record_failure(self, exc: Exception) -> None:
-        self.health["consecutive_failures"] += 1
         last = self.health.get("last_success")
         now = time.time()
+        next_failures = self.health["consecutive_failures"] + 1
 
         # Aggregate read_failed for the operator log.
         if self._failed_window_start is None:
@@ -323,7 +386,7 @@ class ReadWorker(threading.Thread):
         self._flush_failed_events()
 
         if last and (now - last) > self.connection_timeout:
-            self.health["status"] = "timeout"
+            self._update_health(consecutive_failures=next_failures, status="timeout")
             try:
                 if self.protocol:
                     self.protocol.disconnect()
@@ -345,7 +408,7 @@ class ReadWorker(threading.Thread):
                 # tally rather than the next aggregate window.
                 self._flush_failed_events(force=True)
         else:
-            self.health["status"] = "error"
+            self._update_health(consecutive_failures=next_failures, status="error")
         logger.warning("ReadWorker[%s] read failed: %s", self.device.code, exc)
 
 
@@ -401,6 +464,16 @@ class AcquisitionPipeline:
         self.shutdown_event.set()
         for w in self.workers:
             w.join(timeout=timeout)
+        # A worker still alive after join() is stuck in a blocking protocol
+        # call. It is a daemon thread so it will not block process exit, but
+        # surfacing it lets the operator see a leaked connection / hung
+        # device instead of it failing silently.
+        stuck = [w for w in self.workers if w.is_alive()]
+        if stuck:
+            logger.warning(
+                "Pipeline stop: %d worker(s) did not terminate within %.1fs: %s",
+                len(stuck), timeout, ", ".join(w.name for w in stuck),
+            )
         for sink in self.sinks:
             try:
                 sink.flush()
