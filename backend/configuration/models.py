@@ -109,6 +109,14 @@ class Point(TimeStampedModel):
     class Meta:
         unique_together = ("device", "code")
         ordering = ["device", "code"]
+        # M3: the (device, code) lookup is already backed by the
+        # ``unique_together`` constraint's implicit index. A separate index on
+        # ``code`` alone is still needed because the latest-values endpoint
+        # filters ``Point.objects.filter(code=point_code)`` across all devices
+        # — a (device, code) composite can't serve that (wrong leading column).
+        indexes = [
+            models.Index(fields=["code"], name="point_code_idx"),
+        ]
 
     def __str__(self) -> str:
         return f"{self.device}:{self.code}"

@@ -133,4 +133,7 @@ class Alarm(TimeStampedModel):
         indexes = [
             models.Index(fields=["status", "-fired_at"]),
             models.Index(fields=["point_code", "-fired_at"]),
+            # M3: composite index for "active alarms of a point" lookups
+            # (filter by point_code + status together).
+            models.Index(fields=["point_code", "status"], name="alarm_point_status_idx"),
         ]

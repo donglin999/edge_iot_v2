@@ -107,23 +107,26 @@ def delete_owned_tasks(sender, instance: models.Device, **kwargs) -> None:
     "ghost" task in the UI. We only delete tasks that are exclusively bound
     to this device — tasks that span multiple devices are kept intact.
     """
-    candidate_task_ids = (
+    # M2: resolve orphans with two set queries instead of an N+1 ``.exists()``
+    # loop. ``candidate`` = tasks referencing this device; ``multi_device`` =
+    # the subset that also has at least one point on a *different* device.
+    # Orphans = candidate − multi_device.
+    candidate_task_ids = set(
         models.AcqTask.objects
         .filter(points__device_id=instance.pk)
         .values_list("id", flat=True)
         .distinct()
     )
 
-    orphan_ids = []
-    for task_id in candidate_task_ids:
-        has_other_device_point = (
-            models.Point.objects
-            .filter(tasks__id=task_id)
-            .exclude(device_id=instance.pk)
-            .exists()
-        )
-        if not has_other_device_point:
-            orphan_ids.append(task_id)
+    multi_device_task_ids = set(
+        models.TaskPoint.objects
+        .filter(task_id__in=candidate_task_ids)
+        .exclude(point__device_id=instance.pk)
+        .values_list("task_id", flat=True)
+        .distinct()
+    )
+
+    orphan_ids = sorted(candidate_task_ids - multi_device_task_ids)
 
     if orphan_ids:
         deleted, _ = models.AcqTask.objects.filter(id__in=orphan_ids).delete()
