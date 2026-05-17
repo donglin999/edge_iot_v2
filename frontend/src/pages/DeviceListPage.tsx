@@ -36,6 +36,7 @@ import {
 
 import DeviceFormModal from '../components/DeviceFormModal';
 import { apiClient } from '../services/apiClient';
+import { fetchAllPages } from '../services/pagination';
 import { downloadTemplate, listProtocols, type ProtocolDescriptor } from '../services/protocolApi';
 
 interface Device {
@@ -66,8 +67,14 @@ const DeviceListPage = () => {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiClient.get<Device[]>('/config/devices/');
-      setDevices(res.data);
+      // 标准 list 端点:DRF 全局分页后返回 `{ results }`;逐页合并取全量(XIU-9 / H10)。
+      const devices = await fetchAllPages<Device>(async (limit, offset) => {
+        const res = await apiClient.get('/config/devices/', {
+          params: { limit, offset },
+        });
+        return res.data;
+      });
+      setDevices(devices);
     } finally {
       setLoading(false);
     }

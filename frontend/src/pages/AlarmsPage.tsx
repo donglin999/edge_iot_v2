@@ -30,6 +30,7 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { apiClient } from '../services/apiClient';
+import { fetchAllPages } from '../services/pagination';
 
 const { Title, Text } = Typography;
 
@@ -84,14 +85,27 @@ const AlarmsPage = () => {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [alarmsRes, rulesRes] = await Promise.all([
-        apiClient.get<Alarm[]>('/acquisition/alarms/', {
-          params: statusFilter === 'all' ? undefined : { status: statusFilter },
+      // 标准 list 端点:DRF 全局分页后返回 `{ results }`;逐页合并取全量(XIU-9 / H10)。
+      const [alarms, rules] = await Promise.all([
+        fetchAllPages<Alarm>(async (limit, offset) => {
+          const res = await apiClient.get('/acquisition/alarms/', {
+            params: {
+              limit,
+              offset,
+              ...(statusFilter === 'all' ? {} : { status: statusFilter }),
+            },
+          });
+          return res.data;
         }),
-        apiClient.get<AlarmRule[]>('/acquisition/alarm-rules/'),
+        fetchAllPages<AlarmRule>(async (limit, offset) => {
+          const res = await apiClient.get('/acquisition/alarm-rules/', {
+            params: { limit, offset },
+          });
+          return res.data;
+        }),
       ]);
-      setAlarms(alarmsRes.data);
-      setRules(rulesRes.data);
+      setAlarms(alarms);
+      setRules(rules);
     } finally {
       setLoading(false);
     }

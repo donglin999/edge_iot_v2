@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { isAbortError } from '../services/http';
+import { fetchAllPages, withLimitOffset } from '../services/pagination';
 import './DashboardPage.css';
 
 interface TaskRun {
@@ -48,16 +49,27 @@ const DashboardPage = () => {
     return (await response.json()) as OverviewPayload;
   }, []);
 
+  // 标准 list 端点:DRF 全局分页后返回 `{ results }`;逐页合并仍取全量(XIU-9 / H10)。
   const fetchTasks = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch('/api/config/tasks/?site_code=default', { signal });
-    if (!response.ok) throw new Error(await response.text());
-    return (await response.json()) as TaskItem[];
+    return fetchAllPages<TaskItem>(async (limit, offset) => {
+      const response = await fetch(
+        withLimitOffset('/api/config/tasks/?site_code=default', limit, offset),
+        { signal }
+      );
+      if (!response.ok) throw new Error(await response.text());
+      return response.json();
+    });
   }, []);
 
   const fetchDevices = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch('/api/config/devices/', { signal });
-    if (!response.ok) throw new Error(await response.text());
-    return (await response.json()) as Array<{ id: number; protocol: string }>;
+    return fetchAllPages<{ id: number; protocol: string }>(async (limit, offset) => {
+      const response = await fetch(
+        withLimitOffset('/api/config/devices/', limit, offset),
+        { signal }
+      );
+      if (!response.ok) throw new Error(await response.text());
+      return response.json();
+    });
   }, []);
 
   const fetchActiveSessions = useCallback(async (signal?: AbortSignal) => {
