@@ -6,6 +6,7 @@
  * 以便调用方在 `useEffect` cleanup 中取消未完成的请求（XIU-7 H12）。
  */
 import { fetchWithAbort } from './http';
+import { fetchAllPages, unwrapList, withLimitOffset } from './pagination';
 
 export interface AcquisitionSession {
   id: number;
@@ -95,11 +96,17 @@ const API_BASE = '/api';
  * 获取所有采集任务列表
  */
 export async function fetchTasks(signal?: AbortSignal): Promise<AcqTask[]> {
-  const response = await fetchWithAbort(`${API_BASE}/config/tasks/`, signal);
-  if (!response.ok) {
-    throw new Error(`获取任务列表失败: ${response.statusText}`);
-  }
-  return response.json();
+  // 标准 list 端点:DRF 全局分页(limit/offset)后逐页合并(XIU-9 / H10)。
+  return fetchAllPages<AcqTask>(async (limit, offset) => {
+    const response = await fetchWithAbort(
+      withLimitOffset(`${API_BASE}/config/tasks/`, limit, offset),
+      signal
+    );
+    if (!response.ok) {
+      throw new Error(`获取任务列表失败: ${response.statusText}`);
+    }
+    return response.json();
+  });
 }
 
 /**
@@ -125,15 +132,16 @@ export async function fetchSessions(
   limit = 20,
   signal?: AbortSignal
 ): Promise<AcquisitionSession[]> {
+  // 标准 list 端点:DRF 全局分页后返回 `{ results }`。直接用 `?limit=N`
+  // 取最近 N 条即可满足"最近会话历史"场景(XIU-9 / H10)。
   const response = await fetchWithAbort(
-    `${API_BASE}/acquisition/sessions/?limit=${limit}`,
+    withLimitOffset(`${API_BASE}/acquisition/sessions/`, limit, 0),
     signal
   );
   if (!response.ok) {
     throw new Error(`获取会话历史失败: ${response.statusText}`);
   }
-  const data = await response.json();
-  return data.results || data;
+  return unwrapList<AcquisitionSession>(await response.json());
 }
 
 /**

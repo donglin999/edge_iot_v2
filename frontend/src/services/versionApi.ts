@@ -4,6 +4,7 @@
  * Adds export / delete / bulk-delete on top of the existing list+rollback
  * helpers consumed by VersionHistoryPage.
  */
+import { fetchAllPages, withLimitOffset } from './pagination';
 
 const API_BASE = '/api/config';
 
@@ -53,15 +54,18 @@ export interface BulkDeleteResponse {
  * across tasks (newest first).
  */
 export async function fetchTaskVersions(taskId?: number | null): Promise<ConfigVersion[]> {
-  const url =
+  // 标准 list 端点:DRF 全局分页后逐页合并(XIU-9 / H10)。
+  const base =
     taskId === undefined || taskId === null
       ? `${API_BASE}/versions/`
       : `${API_BASE}/versions/?task_id=${taskId}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`获取版本列表失败: ${response.statusText}`);
-  }
-  return response.json();
+  return fetchAllPages<ConfigVersion>(async (limit, offset) => {
+    const response = await fetch(withLimitOffset(base, limit, offset));
+    if (!response.ok) {
+      throw new Error(`获取版本列表失败: ${response.statusText}`);
+    }
+    return response.json();
+  });
 }
 
 /**
@@ -95,22 +99,28 @@ export async function rollbackToVersion(versionId: number): Promise<RollbackResp
  * Fetch all tasks for version history selection
  */
 export async function fetchAllTasks(): Promise<Array<{ id: number; code: string; name: string }>> {
-  const response = await fetch(`${API_BASE}/tasks/`);
-  if (!response.ok) {
-    throw new Error(`获取任务列表失败: ${response.statusText}`);
-  }
-  return response.json();
+  // 标准 list 端点:DRF 全局分页后逐页合并(XIU-9 / H10)。
+  return fetchAllPages<{ id: number; code: string; name: string }>(async (limit, offset) => {
+    const response = await fetch(withLimitOffset(`${API_BASE}/tasks/`, limit, offset));
+    if (!response.ok) {
+      throw new Error(`获取任务列表失败: ${response.statusText}`);
+    }
+    return response.json();
+  });
 }
 
 /**
  * Fetch all sites (used by "导出当前配置" picker).
  */
 export async function fetchSites(): Promise<Site[]> {
-  const response = await fetch(`${API_BASE}/sites/`);
-  if (!response.ok) {
-    throw new Error(`获取站点列表失败: ${response.statusText}`);
-  }
-  return response.json();
+  // 标准 list 端点:DRF 全局分页后逐页合并(XIU-9 / H10)。
+  return fetchAllPages<Site>(async (limit, offset) => {
+    const response = await fetch(withLimitOffset(`${API_BASE}/sites/`, limit, offset));
+    if (!response.ok) {
+      throw new Error(`获取站点列表失败: ${response.statusText}`);
+    }
+    return response.json();
+  });
 }
 
 /** Pull a filename out of a Content-Disposition header, falling back to a default. */

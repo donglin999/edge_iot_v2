@@ -6,6 +6,7 @@
  * `useEffect` cleanup — see H12 in XIU-7.
  */
 import { fetchWithAbort } from './http';
+import { unwrapList, withLimitOffset } from './pagination';
 
 export interface PointLatestValue {
   point_code: string;
@@ -162,8 +163,10 @@ export async function fetchSessions(
   limit: number = 50,
   signal?: AbortSignal
 ): Promise<AcquisitionSession[]> {
+  // 标准 list 端点:DRF 全局分页后返回 `{ results }`;用 `?limit=N` 取最近
+  // N 条(XIU-9 / H10)。
   const response = await fetchWithAbort(
-    `/api/acquisition/sessions/?limit=${limit}`,
+    withLimitOffset('/api/acquisition/sessions/', limit, 0),
     signal
   );
 
@@ -171,8 +174,7 @@ export async function fetchSessions(
     throw new Error(`获取会话列表失败: ${response.statusText}`);
   }
 
-  const data = await response.json();
-  return data.results || data;
+  return unwrapList<AcquisitionSession>(await response.json());
 }
 
 /**

@@ -1,6 +1,7 @@
 /**
  * API service for device detail page
  */
+import { fetchAllPages, withLimitOffset } from './pagination';
 
 const API_BASE = '/api/config';
 
@@ -71,14 +72,19 @@ export interface DeviceLatestValues {
 }
 
 /**
- * 获取所有设备列表
+ * 获取所有设备列表。
+ *
+ * `/devices/` 是标准 list 端点,DRF 全局分页后返回 `{ results }`;
+ * 这里逐页抓取并合并,调用方仍拿到完整数组(XIU-9 / H10)。
  */
 export async function fetchDevices(): Promise<Device[]> {
-  const response = await fetch(`${API_BASE}/devices/`);
-  if (!response.ok) {
-    throw new Error(`获取设备列表失败: ${response.statusText}`);
-  }
-  return response.json();
+  return fetchAllPages<Device>(async (limit, offset) => {
+    const response = await fetch(withLimitOffset(`${API_BASE}/devices/`, limit, offset));
+    if (!response.ok) {
+      throw new Error(`获取设备列表失败: ${response.statusText}`);
+    }
+    return response.json();
+  });
 }
 
 /**
