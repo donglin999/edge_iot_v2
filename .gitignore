@@ -86,6 +86,8 @@ venv.bak/
 # Database
 db.sqlite3
 db.sqlite3-journal
+influx_spill.sqlite3
+influx_spill.sqlite3-*
 
 # Django local settings
 local_settings.py
