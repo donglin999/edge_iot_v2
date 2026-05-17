@@ -29,6 +29,7 @@ import pytest
 from acquisition.protocols import opcua as opcua_mod
 from acquisition.protocols import s7 as s7_mod
 from acquisition.protocols.base import ReadError
+from acquisition.services import sinks as sinks_mod
 from acquisition.services.pipeline import AcquisitionPipeline, ReadWorker
 from acquisition.services.read_plan import ReadPlanBuilder, Reading
 from acquisition.services.sinks import WebSocketSink, _WS_MAX_READINGS_PER_MSG
@@ -176,34 +177,77 @@ class TestH2HealthRace:
 # ---------------------------------------------------------------------------
 
 
+class _VirtualClock:
+    """Deterministic stand-in for ``time`` + a ``threading.Event``.
+
+    Drives ``_broadcast_loop`` with virtual time so the cadence assertion no
+    longer depends on wall-clock scheduling (which is preempted under a
+    fully-loaded concurrent test run). ``wait`` advances virtual time and
+    signals the loop to stop once the simulated horizon is reached.
+    """
+
+    def __init__(self, horizon: float) -> None:
+        self.now = 0.0
+        self._horizon = horizon
+        self._stopped = False
+
+    # --- ``time`` surface --------------------------------------------------
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, dt: float) -> None:
+        self.now += dt
+
+    # --- ``threading.Event`` surface used by ``_broadcast_loop`` -----------
+    def is_set(self) -> bool:
+        return self._stopped
+
+    def set(self) -> None:
+        self._stopped = True
+
+    def wait(self, timeout: float) -> bool:
+        self.now += timeout
+        if self.now >= self._horizon:
+            self._stopped = True
+        return self._stopped
+
+
 class TestH3BroadcastDrift:
-    def test_broadcast_cadence_compensates_for_work_time(self):
-        """With a broadcast cost ~= interval, a naive loop would run at half
-        rate. The compensated loop subtracts the work time and keeps pace."""
+    def test_broadcast_cadence_compensates_for_work_time(self, monkeypatch):
+        """With a broadcast cost == interval, a naive loop would run at half
+        rate. The compensated loop subtracts the work time and keeps pace.
+
+        Driven by a virtual clock so the result is deterministic: no real
+        threads, no real sleeps, no dependency on OS scheduling.
+        """
         sink = WebSocketSink(MagicMock(id=1), broadcast_interval=0.05)
         # Stop the real loop thread so we can drive a controlled one.
         sink._stop.set()
         sink._thread.join(timeout=1.0)
 
+        # Simulate 0.80 s of virtual time, work cost == interval (0.05 s).
+        clock = _VirtualClock(horizon=0.8)
+        monkeypatch.setattr(sinks_mod.time, "monotonic", clock.monotonic)
+        sink._stop = clock
+
         calls = []
 
         def _slow_broadcast():
-            calls.append(time.monotonic())
-            time.sleep(0.05)  # work cost == interval
+            calls.append(clock.now)
+            clock.advance(0.05)  # work cost == interval
 
         sink._broadcast_once = _slow_broadcast
-        sink._stop = threading.Event()
 
-        loop = threading.Thread(target=sink._broadcast_loop, daemon=True)
-        loop.start()
-        time.sleep(0.8)
-        sink._stop.set()
-        loop.join(timeout=1.0)
+        # Runs synchronously; the virtual clock guarantees termination.
+        sink._broadcast_loop()
 
-        # Uncompensated period would be ~0.10 s -> ~8 calls in 0.8 s.
-        # Compensated period is ~0.05 s -> ~16 calls. Assert clearly above
-        # the uncompensated ceiling.
-        assert len(calls) >= 12
+        # Uncompensated period is interval + work = 0.10 s -> 8 calls in
+        # 0.80 s. Compensated period is the interval (0.05 s) -> 15 calls.
+        # With a virtual clock the count is exact, not a flaky range.
+        assert len(calls) == 15
+        # And the cadence is the interval, not double it.
+        gaps = [b - a for a, b in zip(calls, calls[1:])]
+        assert all(abs(g - 0.05) < 1e-9 for g in gaps)
 
 
 # ---------------------------------------------------------------------------
