@@ -16,8 +16,13 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from .models import EdgeNode
-from .serializers import EdgeAssignmentSerializer, EdgeNodeCreateSerializer, EdgeNodeSerializer
+from .models import EdgeNode, EdgeTaskStatus
+from .serializers import (
+    EdgeAssignmentSerializer,
+    EdgeNodeCreateSerializer,
+    EdgeNodeSerializer,
+    EdgeTaskStatusSerializer,
+)
 from .services import sweep_stale_edges, sync_assignments
 
 
@@ -81,3 +86,29 @@ class EdgeNodeViewSet(
         qs = edge.assignments.select_related("task").order_by("task__code")
         ser = EdgeAssignmentSerializer(qs, many=True)
         return Response(ser.data)
+
+
+@extend_schema(summary="列出 edge 上报的任务运行状态")
+class EdgeTaskStatusViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Read-only projection of the latest per-(edge, task) lifecycle state.
+
+    The center frontend's ``/acquisition`` page joins this against the
+    task list to render "task X is running on edge Y". The rows are kept
+    fresh by the inbound ``task_state`` WS frames. Filter with
+    ``?task=<id>`` / ``?edge=<id>`` for the per-task lookup.
+    """
+
+    serializer_class = EdgeTaskStatusSerializer
+    queryset = EdgeTaskStatus.objects.select_related("edge", "task").order_by(
+        "edge", "task"
+    )
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        task_id = self.request.query_params.get("task")
+        edge_id = self.request.query_params.get("edge")
+        if task_id:
+            qs = qs.filter(task_id=task_id)
+        if edge_id:
+            qs = qs.filter(edge_id=edge_id)
+        return qs
