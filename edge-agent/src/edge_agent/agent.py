@@ -254,22 +254,32 @@ class EdgeAgent:
     def _bootstrap_runtime(self) -> None:
         """Construct the Django-backed state store and task runner lazily.
 
-        Skipped when injected via ``__init__`` (tests do this).
+        Skipped when injected via ``__init__`` (tests do this). A failure
+        here is logged but NOT fatal: the agent still maintains the
+        control-plane connection (register + heartbeat) so the center sees
+        the edge online and an operator can investigate. ``apply_config``
+        frames are then rejected gracefully (see ``_handle_apply_config``).
         """
         if self._state_store is not None and self._runner is not None:
             return
 
         # Django setup is heavy — only pay for it when we actually need
         # to run tasks. ensure_setup is idempotent so re-entries are fine.
-        from .django_setup import ensure_setup
-        from .runner import TaskRunner
-        from .state import EdgeStateStore
+        try:
+            from .django_setup import ensure_setup
+            from .runner import TaskRunner
+            from .state import EdgeStateStore
 
-        db_path = ensure_setup()
-        if self._state_store is None:
-            self._state_store = EdgeStateStore(db_path)
-        if self._runner is None:
-            self._runner = TaskRunner(on_state=self._emit_task_state)
+            db_path = ensure_setup()
+            if self._state_store is None:
+                self._state_store = EdgeStateStore(db_path)
+            if self._runner is None:
+                self._runner = TaskRunner(on_state=self._emit_task_state)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "edge-agent runtime bootstrap failed — control-plane will "
+                "stay up but config dispatch is disabled this session"
+            )
 
     def _replay_cached_config(self) -> None:
         """Re-import the last persisted apply_config snapshot on cold start."""

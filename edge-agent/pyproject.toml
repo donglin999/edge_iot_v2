@@ -36,3 +36,8 @@ edge_agent = ["py.typed"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The edge-agent boots Django itself (see tests/conftest.py::django_edge);
+# pytest-django, if installed in the dev env, would otherwise inject its
+# own DB/mail fixtures and clash. ``-p no:django`` is a safe no-op when the
+# plugin is absent.
+addopts = "-p no:django"
