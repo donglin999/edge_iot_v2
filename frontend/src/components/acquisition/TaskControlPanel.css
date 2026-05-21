@@ -102,6 +102,12 @@
   color: var(--text-muted);
 }
 
+/* M2: edge run-location badge on the /acquisition task panel. */
+.badge--edge {
+  background: rgba(59, 130, 246, 0.1);
+  color: var(--info);
+}
+
 .badge--success {
   background: rgba(34, 197, 94, 0.1);
   color: var(--success);
@@ -198,6 +204,10 @@
   font-weight: 500;
   color: var(--text-secondary);
   min-width: 72px;
+}
+
+.sample-rate__row--edge {
+  margin-top: 12px;
 }
 
 .sample-rate__hint {

@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import type { AcqTask, AcquisitionSession } from '../services/acquisitionApi';
 import { fetchTasks, fetchActiveSessions } from '../services/acquisitionApi';
+import type { EdgeNode, EdgeTaskStatus } from '../services/fleet';
+import { listEdges, listTaskStatuses } from '../services/fleet';
 import { isAbortError } from '../services/http';
 import TaskControlPanel from '../components/acquisition/TaskControlPanel';
 import { useWebSocket, WebSocketStatus, WebSocketMessage } from '../hooks/useWebSocket';
@@ -9,6 +11,8 @@ import './AcquisitionControlPage.css';
 const AcquisitionControlPage = () => {
   const [tasks, setTasks] = useState<AcqTask[]>([]);
   const [activeSessions, setActiveSessions] = useState<AcquisitionSession[]>([]);
+  const [taskStatuses, setTaskStatuses] = useState<EdgeTaskStatus[]>([]);
+  const [edges, setEdges] = useState<EdgeNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [useWebSocketUpdates, setUseWebSocketUpdates] = useState(true);
@@ -18,13 +22,18 @@ const AcquisitionControlPage = () => {
     setError(null);
 
     try {
-      const [tasksData, sessionsData] = await Promise.all([
-        fetchTasks(signal),
-        fetchActiveSessions(signal),
-      ]);
+      const [tasksData, sessionsData, statusesData, edgesData] =
+        await Promise.all([
+          fetchTasks(signal),
+          fetchActiveSessions(signal),
+          listTaskStatuses(undefined, signal),
+          listEdges(signal),
+        ]);
 
       setTasks(tasksData);
       setActiveSessions(sessionsData);
+      setTaskStatuses(statusesData);
+      setEdges(edgesData);
     } catch (err) {
       // Ignore cancellations from a unmount/re-run cleanup.
       if (isAbortError(err)) return;
@@ -97,6 +106,10 @@ const AcquisitionControlPage = () => {
 
   const getSessionForTask = (taskId: number) => {
     return activeSessions.find((s) => s.task === taskId);
+  };
+
+  const getEdgeStatusForTask = (taskId: number) => {
+    return taskStatuses.find((s) => s.task === taskId);
   };
 
   const activeTasks = tasks.filter((t) => t.is_active);
@@ -239,6 +252,8 @@ const AcquisitionControlPage = () => {
                 key={task.id}
                 task={task}
                 activeSession={getSessionForTask(task.id)}
+                edges={edges}
+                edgeStatus={getEdgeStatusForTask(task.id)}
                 onStatusChange={loadData}
               />
             ))}
@@ -261,6 +276,8 @@ const AcquisitionControlPage = () => {
                 key={task.id}
                 task={task}
                 activeSession={getSessionForTask(task.id)}
+                edges={edges}
+                edgeStatus={getEdgeStatusForTask(task.id)}
                 onStatusChange={loadData}
               />
             ))}

@@ -51,6 +51,8 @@ export interface AcqTask {
   schedule: string;
   is_active: boolean;
   sample_rate_hz: number;
+  /** M2: EdgeNode.id the task runs on; `null` = center celery. */
+  edge_id: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -300,6 +302,41 @@ export async function updateTaskSampleRate(
     const detail =
       (data && (data.detail || data.sample_rate_hz)) ||
       `更新采样频率失败: ${response.statusText}`;
+    throw new Error(
+      Array.isArray(detail) ? detail.join('; ') : String(detail)
+    );
+  }
+
+  return data as AcqTask;
+}
+
+/**
+ * 更新任务的运行位置（M2）。`edgeId` 为某个 EdgeNode.id 表示在该 edge 上跑，
+ * `null` 表示在中心 celery 上跑。
+ */
+export async function updateTaskEdge(
+  taskId: number,
+  edgeId: number | null,
+  signal?: AbortSignal
+): Promise<AcqTask> {
+  const response = await fetchWithAbort(
+    `${API_BASE}/config/tasks/${taskId}/`,
+    signal,
+    {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ edge_id: edgeId }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const detail =
+      (data && (data.detail || data.edge_id)) ||
+      `更新运行位置失败: ${response.statusText}`;
     throw new Error(
       Array.isArray(detail) ? detail.join('; ') : String(detail)
     );

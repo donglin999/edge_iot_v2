@@ -1,18 +1,27 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, InputNumber, message } from 'antd';
+import { Button, InputNumber, Select, message } from 'antd';
 import type { AcqTask, AcquisitionSession } from '../../services/acquisitionApi';
 import {
   startTask,
   stopSession,
   updateTaskSampleRate,
+  updateTaskEdge,
 } from '../../services/acquisitionApi';
+import type { EdgeNode, EdgeTaskStatus } from '../../services/fleet';
 import { useWebSocket, WebSocketMessage } from '../../hooks/useWebSocket';
 import { buildWebSocketUrl } from '../../services/apiClient';
 import './TaskControlPanel.css';
 
+/** Center (celery) sentinel for the 运行位置 dropdown — backend `edge_id: null`. */
+const CENTER_EDGE = 0;
+
 interface TaskControlPanelProps {
   task: AcqTask;
   activeSession?: AcquisitionSession;
+  /** Edge nodes available as task run targets (for the 运行位置 dropdown). */
+  edges?: EdgeNode[];
+  /** Latest edge-side lifecycle state for this task, if it runs on an edge. */
+  edgeStatus?: EdgeTaskStatus;
   onStatusChange: () => void;
 }
 
@@ -107,6 +116,8 @@ const SessionEventSubscriber: React.FC<SessionEventSubscriberProps> = ({
 const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   task,
   activeSession,
+  edges,
+  edgeStatus,
   onStatusChange,
 }) => {
   const [loading, setLoading] = useState(false);
@@ -114,6 +125,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   const [success, setSuccess] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showLogs, setShowLogs] = useState(false);
+  const [edgeSaving, setEdgeSaving] = useState(false);
 
   // Sample rate (Hz) editor state
   const initialSampleRate =
@@ -377,6 +389,30 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
     }
   };
 
+  const handleEdgeChange = async (value: number) => {
+    const nextEdgeId = value === CENTER_EDGE ? null : value;
+    if (nextEdgeId === (task.edge_id ?? null)) return;
+
+    setEdgeSaving(true);
+    try {
+      await updateTaskEdge(task.id, nextEdgeId);
+      addLog(
+        'success',
+        nextEdgeId === null
+          ? '运行位置已改为中心'
+          : `运行位置已改为 edge #${nextEdgeId}`
+      );
+      message.success('运行位置已更新');
+      onStatusChange();
+    } catch (err) {
+      const errorMessage = (err as Error).message;
+      addLog('error', `更新运行位置失败: ${errorMessage}`);
+      message.error(errorMessage);
+    } finally {
+      setEdgeSaving(false);
+    }
+  };
+
   const formatDuration = (seconds: number | null) => {
     if (!seconds) return '-';
     const hours = Math.floor(seconds / 3600);
@@ -394,6 +430,23 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   };
 
   const deviceHealth = getDeviceHealth();
+
+  // M2: which edge this task is bound to, and its reported lifecycle state.
+  const boundEdge = edges?.find((e) => e.id === task.edge_id);
+  const edgeName =
+    boundEdge?.name ?? edgeStatus?.edge_name ?? `edge #${task.edge_id}`;
+  // Show the bound edge in the dropdown even if it's missing from the edges
+  // list (e.g. deleted) so the Select value still resolves to a label.
+  const edgeOptions = [
+    { value: CENTER_EDGE, label: '中心 (Celery)' },
+    ...(edges ?? []).map((e) => ({
+      value: e.id,
+      label: e.status === 'online' ? e.name : `${e.name} (${e.status})`,
+    })),
+  ];
+  if (task.edge_id != null && !boundEdge) {
+    edgeOptions.push({ value: task.edge_id, label: edgeName });
+  }
 
   const getStatusClass = (status: string) => {
     switch (status.toLowerCase()) {
@@ -486,6 +539,35 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
               <span className={task.is_active ? 'badge badge--active' : 'badge badge--muted'}>
                 {task.is_active ? '启用' : '停用'}
               </span>
+              {task.edge_id != null && (
+                <span className="badge badge--edge" title="任务运行位置">
+                  {edgeName}
+                </span>
+              )}
+              {task.edge_id != null &&
+                (edgeStatus ? (
+                  <span
+                    className={getStatusClass(edgeStatus.state)}
+                    title={
+                      edgeStatus.error
+                        ? `${edgeStatus.state}：${edgeStatus.error}`
+                        : `最后上报：${
+                            edgeStatus.last_reported_at
+                              ? new Date(
+                                  edgeStatus.last_reported_at
+                                ).toLocaleString('zh-CN')
+                              : '-'
+                          }`
+                    }
+                  >
+                    <span className="status-badge__dot" />
+                    {edgeStatus.state}
+                  </span>
+                ) : (
+                  <span className="badge badge--muted" title="edge 尚未上报该任务状态">
+                    未上报
+                  </span>
+                ))}
               {deviceHealth && (
                 <span className={getHealthBadgeClass(deviceHealth.status)}>
                   设备: {deviceHealth.status === 'healthy' ? '正常' :
@@ -559,6 +641,21 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
             {isRunning
               ? '※ 修改后将重启采集会话'
               : '※ 修改后将影响新启动的会话'}
+          </span>
+        </div>
+        <div className="sample-rate__row sample-rate__row--edge">
+          <span className="sample-rate__label">运行位置</span>
+          <Select
+            value={task.edge_id ?? CENTER_EDGE}
+            onChange={handleEdgeChange}
+            loading={edgeSaving}
+            disabled={edgeSaving}
+            options={edgeOptions}
+            style={{ width: 200 }}
+            size="small"
+          />
+          <span className="sample-rate__hint">
+            ※ 选择 edge 后任务将分派到该节点，选「中心」表示在中心 celery 上运行
           </span>
         </div>
       </div>
