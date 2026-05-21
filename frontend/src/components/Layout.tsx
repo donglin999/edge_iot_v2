@@ -55,6 +55,15 @@ const AlarmIcon = () => (
   </svg>
 );
 
+const FleetIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <rect x="3" y="4" width="18" height="6" rx="1" />
+    <rect x="3" y="14" width="18" height="6" rx="1" />
+    <circle cx="7" cy="7" r="0.8" fill="currentColor" />
+    <circle cx="7" cy="17" r="0.8" fill="currentColor" />
+  </svg>
+);
+
 const CollapseIcon = ({ collapsed }: { collapsed: boolean }) => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
     {collapsed ? (
@@ -76,6 +85,7 @@ const navItems: NavItem[] = [
   { path: '/', label: '任务总览', icon: <DashboardIcon />, end: true },
   { path: '/acquisition', label: '采集控制', icon: <AcquisitionIcon /> },
   { path: '/devices', label: '连接与测点', icon: <DeviceIcon /> },
+  { path: '/fleet', label: '边缘节点', icon: <FleetIcon /> },
   { path: '/data', label: '数据可视化', icon: <DataIcon /> },
   { path: '/import', label: '导入作业', icon: <ImportIcon /> },
   { path: '/alarms', label: '告警中心', icon: <AlarmIcon /> },
@@ -86,6 +96,7 @@ const routeTitles: Record<string, string> = {
   '/': '任务总览',
   '/acquisition': '采集控制',
   '/devices': '连接与测点',
+  '/fleet': '边缘节点',
   '/data': '数据可视化',
   '/import': '导入作业',
   '/alarms': '告警中心',

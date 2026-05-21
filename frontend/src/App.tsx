@@ -11,6 +11,7 @@ import AcquisitionControlPage from './pages/AcquisitionControlPage';
 import VersionHistoryPage from './pages/VersionHistoryPage';
 import DataVisualizationPage from './pages/DataVisualizationPage';
 import AlarmsPage from './pages/AlarmsPage';
+import FleetPage from './pages/FleetPage';
 
 const App = () => (
   <ConfigProvider
@@ -35,6 +36,7 @@ const App = () => (
           <Route path="import" element={<ImportJobPage />} />
           <Route path="versions" element={<VersionHistoryPage />} />
           <Route path="alarms" element={<AlarmsPage />} />
+          <Route path="fleet" element={<FleetPage />} />
         </Route>
       </Routes>
     </AntdApp>
