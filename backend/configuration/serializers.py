@@ -8,6 +8,9 @@ from pathlib import Path
 from rest_framework import serializers
 
 from . import import_paths, models
+# fleet's models depend on configuration via soft string FKs, so importing
+# fleet.models from here is safe (the dependency only flows one way).
+from fleet.models import EdgeNode
 
 
 class SiteSerializer(serializers.ModelSerializer):
@@ -112,6 +115,16 @@ class AcqTaskSerializer(serializers.ModelSerializer):
     """采集任务序列化：定义任务编码、调度及测点集合。"""
 
     points = serializers.PrimaryKeyRelatedField(queryset=models.Point.objects.all(), many=True, required=False)
+    # M2: which edge owns this task. ``edge`` is the FK column name on the
+    # model — we expose it under the ``edge_id`` alias on the wire so the
+    # frontend's IDs read naturally. ``null`` means "center-only".
+    edge_id = serializers.PrimaryKeyRelatedField(
+        source="edge",
+        queryset=EdgeNode.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text="EdgeNode.id — 任务运行所在的 edge；为空表示在中心 celery 上运行。",
+    )
     sample_rate_hz = serializers.DecimalField(
         max_digits=8,
         decimal_places=2,
@@ -130,11 +143,13 @@ class AcqTaskSerializer(serializers.ModelSerializer):
             "description",
             "sample_rate_hz",
             "is_active",
+            "edge_id",
             "points",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ("id", "created_at", "updated_at")
+
 
     def validate(self, attrs):
         attrs = super().validate(attrs)

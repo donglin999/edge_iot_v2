@@ -1,20 +1,24 @@
 """DRF views for the fleet registry.
 
 Exposes:
-- GET  /api/fleet/edges/                — list edges (auto-sweeps stale → offline)
-- POST /api/fleet/edges/                — factory-register a new edge, returns
-                                          the one-shot activation token
-- GET  /api/fleet/edges/<id>/           — single edge detail
+- GET  /api/fleet/edges/                                — list edges (auto-sweeps stale → offline)
+- POST /api/fleet/edges/                                — factory-register a new edge, returns
+                                                          the one-shot activation token
+- GET  /api/fleet/edges/<id>/                           — single edge detail
+- POST /api/fleet/edges/<id>/assignments/sync           — reconcile EdgeAssignment rows for
+                                                          the edge and push an ``apply_config``
+                                                          frame (M2)
 """
 from __future__ import annotations
 
-from drf_spectacular.utils import extend_schema, OpenApiResponse
+from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import mixins, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from .models import EdgeNode
-from .serializers import EdgeNodeCreateSerializer, EdgeNodeSerializer
-from .services import sweep_stale_edges
+from .serializers import EdgeAssignmentSerializer, EdgeNodeCreateSerializer, EdgeNodeSerializer
+from .services import sweep_stale_edges, sync_assignments
 
 
 class EdgeNodeViewSet(
@@ -46,3 +50,34 @@ class EdgeNodeViewSet(
         body = EdgeNodeSerializer(node).data
         body["activation_token"] = token
         return Response(body, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        summary="同步任务分派到指定 edge",
+        description=(
+            "Reconcile EdgeAssignment rows against AcqTask.edge_id and push a "
+            "full apply_config snapshot to the edge over its open WS. Returns "
+            "the new per-edge config_version and the assembled task/device/"
+            "point counts. If the edge is offline the snapshot is still "
+            "computed but not delivered — the edge will pick it up on next "
+            "register."
+        ),
+        responses={200: OpenApiResponse(description="同步结果摘要")},
+    )
+    @action(detail=True, methods=["post"], url_path="assignments/sync")
+    def assignments_sync(self, request, pk=None):
+        edge = self.get_object()
+        result = sync_assignments(edge)
+        # Frame can be large; keep it under a top-level key so callers can
+        # opt in to inspecting it without paying for it in routine summaries.
+        return Response(result, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="列出 edge 已分派的任务",
+        responses={200: EdgeAssignmentSerializer(many=True)},
+    )
+    @action(detail=True, methods=["get"], url_path="assignments")
+    def assignments(self, request, pk=None):
+        edge = self.get_object()
+        qs = edge.assignments.select_related("task").order_by("task__code")
+        ser = EdgeAssignmentSerializer(qs, many=True)
+        return Response(ser.data)

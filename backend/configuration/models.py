@@ -136,6 +136,19 @@ class AcqTask(TimeStampedModel):
     )
     is_active = models.BooleanField(default=True)
 
+    # M2: which edge owns this task. NULL means "center-only" (legacy
+    # single-host deployment) — the task runs on the central celery
+    # worker just like before. When set, the task is dispatched to that
+    # edge via ``apply_config`` and runs on the edge-agent.
+    # Soft string FK so configuration does not import fleet at module load.
+    edge = models.ForeignKey(
+        "fleet.EdgeNode",
+        on_delete=models.SET_NULL,
+        related_name="tasks",
+        null=True,
+        blank=True,
+    )
+
     points = models.ManyToManyField(Point, through="TaskPoint", related_name="tasks")
 
     class Meta:
