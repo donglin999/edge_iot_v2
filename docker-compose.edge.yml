@@ -1,16 +1,16 @@
 # ============================================================================
-# Edge compose — one工控机 stack: edge-agent + local InfluxDB.
+# Edge compose — one工控机 stack: edge-agent + local InfluxDB + mock Modbus.
 #
-# M1 only runs the edge-agent (control-plane). InfluxDB is included so M2
-# can land acquisition tasks without a follow-up compose change. The edge
-# does NOT run django/redis/celery — those live on the center.
+# The edge-agent runs the acquisition pipeline in-process (imports
+# backend.acquisition) and writes samples to the local InfluxDB. It does
+# NOT run django/redis/celery — those live on the center.
 #
 # Required env (export before `up`):
 #   EDGE_ID       e.g. edge-shanghai-line-1
 #   EDGE_TOKEN    one-shot token returned by POST /api/fleet/edges/
 #   CENTER_URL    e.g. ws://192.168.1.10:8000/ws/fleet/
 #
-# Use:
+# Use (build context is the repo root so the image can pull backend deps):
 #   docker compose -f docker-compose.edge.yml up -d --build
 # ============================================================================
 
@@ -40,25 +40,55 @@ services:
       timeout: 3s
       retries: 5
 
+  # Mock Modbus TCP device — same generator the central docker-compose.yml
+  # uses, so an edge can be smoke-tested without real PLC hardware. A
+  # Device pointed at host ``mock-modbus-edge`` port 5020 returns 9
+  # holding registers of plausible data.
+  mock-modbus:
+    image: python:3.10-slim
+    container_name: mock-modbus-edge
+    networks:
+      - edge-network
+    volumes:
+      - ./mock/entrypoint.sh:/entrypoint.sh:ro
+      - ./mock:/mock:ro
+    working_dir: /mock
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    restart: unless-stopped
+
   edge-agent:
     build:
-      context: ./edge-agent
-      dockerfile: Dockerfile
+      # Repo root so the image can COPY backend/requirements.txt.
+      context: .
+      dockerfile: edge-agent/Dockerfile
     container_name: edge-agent
     networks:
       - edge-network
-    # Mount the host's backend so M2 can `import backend.acquisition`
-    # without rebuilding the image. M1 does not actually exercise this.
+    # Mount the host's backend so the agent can `import backend.acquisition`
+    # without rebuilding the image. The edge-side SQLite (edge_state.db)
+    # lives in a named volume so it survives container restarts — that is
+    # what powers auto-resume of acquisition tasks.
     volumes:
       - ./edge-agent:/app
       - ./backend:/opt/backend:ro
+      - edge-agent-state:/var/lib/edge-agent
     environment:
       - EDGE_ID=${EDGE_ID:?EDGE_ID is required}
       - EDGE_TOKEN=${EDGE_TOKEN:?EDGE_TOKEN is required}
       - CENTER_URL=${CENTER_URL:?CENTER_URL is required}
       - EDGE_LABELS=${EDGE_LABELS:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - PYTHONPATH=/opt
+      # --- Django bootstrap for the in-process acquisition pipeline ----
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - BACKEND_DIR=/opt/backend
+      - EDGE_STATE_DB=/var/lib/edge-agent/edge_state.db
+      - PYTHONPATH=/opt/backend:/app/src
+      # --- local InfluxDB the pipeline writes samples into -------------
+      - INFLUXDB_HOST=edge-influxdb
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
       - TZ=Asia/Shanghai
     depends_on:
       influxdb:
@@ -72,3 +102,4 @@ networks:
 volumes:
   edge-influxdb-data:
   edge-influxdb-config:
+  edge-agent-state:
