@@ -1,0 +1,74 @@
+# ============================================================================
+# Edge compose — one工控机 stack: edge-agent + local InfluxDB.
+#
+# M1 only runs the edge-agent (control-plane). InfluxDB is included so M2
+# can land acquisition tasks without a follow-up compose change. The edge
+# does NOT run django/redis/celery — those live on the center.
+#
+# Required env (export before `up`):
+#   EDGE_ID       e.g. edge-shanghai-line-1
+#   EDGE_TOKEN    one-shot token returned by POST /api/fleet/edges/
+#   CENTER_URL    e.g. ws://192.168.1.10:8000/ws/fleet/
+#
+# Use:
+#   docker compose -f docker-compose.edge.yml up -d --build
+# ============================================================================
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: edge-influxdb
+    ports:
+      - "8086:8086"
+    networks:
+      - edge-network
+    volumes:
+      - edge-influxdb-data:/var/lib/influxdb2
+      - edge-influxdb-config:/etc/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
+      - DOCKER_INFLUXDB_INIT_ORG=edge-iot
+      - DOCKER_INFLUXDB_INIT_BUCKET=iot-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  edge-agent:
+    build:
+      context: ./edge-agent
+      dockerfile: Dockerfile
+    container_name: edge-agent
+    networks:
+      - edge-network
+    # Mount the host's backend so M2 can `import backend.acquisition`
+    # without rebuilding the image. M1 does not actually exercise this.
+    volumes:
+      - ./edge-agent:/app
+      - ./backend:/opt/backend:ro
+    environment:
+      - EDGE_ID=${EDGE_ID:?EDGE_ID is required}
+      - EDGE_TOKEN=${EDGE_TOKEN:?EDGE_TOKEN is required}
+      - CENTER_URL=${CENTER_URL:?CENTER_URL is required}
+      - EDGE_LABELS=${EDGE_LABELS:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PYTHONPATH=/opt
+      - TZ=Asia/Shanghai
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  edge-network:
+    driver: bridge
+
+volumes:
+  edge-influxdb-data:
+  edge-influxdb-config:

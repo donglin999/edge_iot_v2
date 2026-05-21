@@ -11,4 +11,5 @@ urlpatterns = [
     path("api/auth/", include("rest_framework.urls")),
     path("api/config/", include("configuration.urls")),
     path("api/acquisition/", include("acquisition.urls")),
+    path("api/fleet/", include("fleet.urls")),
 ]

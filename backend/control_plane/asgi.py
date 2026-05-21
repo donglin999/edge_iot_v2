@@ -20,7 +20,10 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "control_plane.settings")
 django_asgi_app = get_asgi_application()
 
 # Import routing after Django is initialized
-from acquisition.routing import websocket_urlpatterns
+from acquisition.routing import websocket_urlpatterns as acquisition_ws_urls
+from fleet.routing import websocket_urlpatterns as fleet_ws_urls
+
+websocket_urlpatterns = acquisition_ws_urls + fleet_ws_urls
 
 application = ProtocolTypeRouter({
     # Django's ASGI application to handle traditional HTTP requests

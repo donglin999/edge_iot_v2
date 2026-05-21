@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "drf_spectacular",
     "configuration.apps.ConfigurationConfig",
     "acquisition.apps.AcquisitionConfig",
+    "fleet.apps.FleetConfig",
 ]
 
 MIDDLEWARE = [

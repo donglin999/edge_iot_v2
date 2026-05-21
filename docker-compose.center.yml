@@ -1,0 +1,80 @@
+# ============================================================================
+# Center compose — control-plane only (django + redis + frontend).
+#
+# Mirrors the control-plane services from `docker-compose.yml` but does NOT
+# bring up acquisition workers / InfluxDB / mosquitto on the center. In the
+# distributed deployment those run per-edge instead (see
+# docker-compose.edge.yml).
+#
+# Use:
+#   docker compose -f docker-compose.center.yml up -d --build
+# ============================================================================
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: center-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - center-network
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  django:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: center-django
+    ports:
+      - "8000:8000"
+    networks:
+      - center-network
+    volumes:
+      - ./backend:/app
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=center-redis
+      - REDIS_PORT=6379
+      # InfluxDB connection vars kept so legacy acquisition modules that
+      # import settings don't crash on missing env. The center itself
+      # does not write samples in the distributed topology.
+      - INFLUXDB_HOST=center-redis
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=unused-on-center
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+      - TZ=Asia/Shanghai
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: sh -c "python manage.py migrate && daphne -b 0.0.0.0 -p 8000 control_plane.asgi:application"
+
+  frontend:
+    image: node:18-alpine
+    container_name: center-frontend
+    ports:
+      - "5173:5173"
+    networks:
+      - center-network
+    volumes:
+      - ./frontend:/app
+      - ./frontend/node_modules:/app/node_modules:rw
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - TZ=Asia/Shanghai
+    depends_on:
+      - django
+    restart: unless-stopped
+
+networks:
+  center-network:
+    driver: bridge
