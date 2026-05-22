@@ -258,6 +258,13 @@ frame to an `EdgeLifecycleEvent` log table for an audit timeline.
 reliably send a final frame. The center synthesises a `session.offline`
 row in `EdgeLifecycleEvent` itself when the WS disconnects.
 
+`EdgeLifecycleEvent` is append-only, so a flapping edge would grow it
+without bound. A daily Celery beat task (`fleet.tasks.cleanup_edge_lifecycle_events`)
+prunes rows older than `EDGE_LIFECYCLE_EVENT_RETENTION_DAYS` (default 7,
+matching the `edge_sample` InfluxDB mirror). Set it to `0` to disable
+pruning. The prune deletes in chunks off the ingest path, so it never
+stalls live uplink handling.
+
 ## `sample_batch` — edge → center  (v0.3)
 
 Carries one aggregation window of sampled point values. The edge-agent

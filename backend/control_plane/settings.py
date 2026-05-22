@@ -148,6 +148,11 @@ CELERY_BEAT_SCHEDULE = {
         # Daily at 03:30 — off-peak for an industrial acquisition gateway.
         "schedule": crontab(hour=3, minute=30),
     },
+    "cleanup-edge-lifecycle-events-daily": {
+        "task": "fleet.tasks.cleanup_edge_lifecycle_events",
+        # Daily at 03:40 — staggered just after the import-job cleanup.
+        "schedule": crontab(hour=3, minute=40),
+    },
 }
 
 # InfluxDB Settings
@@ -189,6 +194,15 @@ EDGE_HISTORY_PROXY_DEFAULT_TOKEN = env.str(
 EDGE_HISTORY_PROXY_TOKENS = env.json("EDGE_HISTORY_PROXY_TOKENS", default={})
 EDGE_HISTORY_PROXY_URLS = env.json("EDGE_HISTORY_PROXY_URLS", default={})
 EDGE_HISTORY_PROXY_TIMEOUT_S = env.float("EDGE_HISTORY_PROXY_TIMEOUT_S", default=10.0)
+
+# M3 follow-up (XIU-66): ``EdgeLifecycleEvent`` is an append-only audit table —
+# every connect/disconnect writes a row, so a flapping edge would grow it
+# unbounded (unlike ``EdgeSample``, which is bounded by unique_together, and
+# the InfluxDB mirror, which has its own bucket retention). The scheduled
+# ``cleanup_edge_lifecycle_events`` task purges rows whose ``received_at`` is
+# older than this many days. Mirrors the InfluxDB mirror's 7-day default.
+# Set to 0 (or any non-positive value) to disable lifecycle pruning entirely.
+EDGE_LIFECYCLE_EVENT_RETENTION_DAYS = env.int("EDGE_LIFECYCLE_EVENT_RETENTION_DAYS", default=7)
 
 # Kafka Settings (Optional)
 KAFKA_ENABLED = env.bool("KAFKA_ENABLED", default=False)
