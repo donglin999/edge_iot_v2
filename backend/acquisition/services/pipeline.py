@@ -437,10 +437,16 @@ class AcquisitionPipeline:
         # of the list.
         influx = InfluxDBSink(self.session, device_groups)
         self.influx_sink = influx
+        # The WebSocketSink cadence doubles as the M3 sample_batch
+        # aggregation window; the edge-agent sets WS_BROADCAST_INTERVAL_S
+        # from EDGE_UPLINK_SAMPLE_WINDOW. Defaults to 1 Hz for the monolith.
+        from django.conf import settings as _settings
+
+        ws_interval = float(getattr(_settings, "WS_BROADCAST_INTERVAL_S", 1.0))
         self.sinks = [
             influx,
             AlarmSink(self.session, device_groups=device_groups),
-            WebSocketSink(self.session, broadcast_interval=1.0),
+            WebSocketSink(self.session, broadcast_interval=ws_interval),
         ]
 
         for _device_id, group in device_groups.items():

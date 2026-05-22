@@ -12,6 +12,8 @@ deterministically simulate an outage and a recovery.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from storage.influxdb import InfluxDBStorage
@@ -199,3 +201,54 @@ class TestOutageRecovery:
         # Replay failed -> nothing deleted, data still safe on disk.
         assert s._spill.count() == 1
         assert s._consecutive_failures == 1
+
+
+# ---------------------------------------------------------------------------
+# M3 — spill path is configurable / degrades gracefully (XIU-63 carry-over fix)
+# ---------------------------------------------------------------------------
+
+
+class TestSpillPathConfig:
+    def test_spill_path_from_env(self, tmp_path, monkeypatch):
+        """INFLUXDB_SPILL_DB_PATH redirects the spill DB to a writable volume.
+
+        This is how the edge-agent points the queue off the read-only
+        /opt/backend mount (M2 defect B carry-over).
+        """
+        env_path = str(tmp_path / "writable_vol" / "influx_spill.sqlite3")
+        monkeypatch.setenv("INFLUXDB_SPILL_DB_PATH", env_path)
+        s = InfluxDBStorage({
+            "url": "http://localhost:8086", "token": "t", "org": "o", "bucket": "b",
+        })
+        assert s.spill_db_path == os.path.abspath(env_path)
+        assert s._spill is not None
+
+    def test_explicit_config_overrides_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INFLUXDB_SPILL_DB_PATH", str(tmp_path / "env.sqlite3"))
+        explicit = str(tmp_path / "explicit.sqlite3")
+        s = InfluxDBStorage({
+            "url": "http://localhost:8086", "token": "t", "org": "o", "bucket": "b",
+            "spill_db_path": explicit,
+        })
+        assert s.spill_db_path == os.path.abspath(explicit)
+
+    def test_unwritable_spill_path_degrades_gracefully(self, tmp_path):
+        """An unwritable path disables spill without raising — no ERROR abort.
+
+        Mirrors a read-only edge mount with no writable override: live
+        writes still work, only cross-restart durability is lost.
+        """
+        # A regular file stands in for a non-directory ancestor so the
+        # spill DB's parent ``mkdir`` fails on every platform.
+        blocker = tmp_path / "not_a_dir"
+        blocker.write_text("x")
+        bad_path = str(blocker / "sub" / "influx_spill.sqlite3")
+
+        s = InfluxDBStorage({
+            "url": "http://localhost:8086", "token": "t", "org": "o", "bucket": "b",
+            "spill_db_path": bad_path,
+        })
+        # Constructor must not raise; spill is simply disabled.
+        assert s._spill is None
+        # And a failed batch is tolerated rather than crashing the callback.
+        s._spill_points([{"measurement": "m", "tags": {}, "fields": {"v": 1}}])

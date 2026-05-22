@@ -156,6 +156,24 @@ INFLUXDB_PORT = env.int("INFLUXDB_PORT", default=8086)
 INFLUXDB_TOKEN = env.str("INFLUXDB_TOKEN", default="")
 INFLUXDB_ORG = env.str("INFLUXDB_ORG", default="default")
 INFLUXDB_BUCKET = env.str("INFLUXDB_BUCKET", default="default")
+# InfluxDB durable spill queue path. Empty = storage layer's own default
+# (next to the backend package). On a read-only edge mount the edge-agent
+# overrides this via the INFLUXDB_SPILL_DB_PATH env so the queue lands on a
+# writable volume; an unwritable path degrades gracefully (spill disabled).
+INFLUXDB_SPILL_DB_PATH = env.str("INFLUXDB_SPILL_DB_PATH", default="")
+
+# WebSocketSink broadcast cadence (seconds). Doubles as the M3 distributed
+# ``sample_batch`` aggregation window — the edge-agent sets this from
+# EDGE_UPLINK_SAMPLE_WINDOW. 1 Hz for a monolith deployment.
+WS_BROADCAST_INTERVAL_S = env.float("WS_BROADCAST_INTERVAL_S", default=1.0)
+
+# M3 distributed uplink — center side. When enabled the fleet WS bridge
+# also mirrors inbound edge ``sample_batch`` frames into InfluxDB under the
+# ``edge_sample`` measurement (intended for a short-retention bucket;
+# default 7 days, applied as the bucket's retention policy). The aggregation
+# cache table (``EdgeSample``) is always written regardless of this flag.
+CENTER_EDGE_SAMPLE_TO_INFLUX = env.bool("CENTER_EDGE_SAMPLE_TO_INFLUX", default=True)
+CENTER_EDGE_SAMPLE_RETENTION_DAYS = env.int("CENTER_EDGE_SAMPLE_RETENTION_DAYS", default=7)
 
 # Kafka Settings (Optional)
 KAFKA_ENABLED = env.bool("KAFKA_ENABLED", default=False)

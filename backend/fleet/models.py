@@ -42,6 +42,10 @@ class EdgeNode(models.Model):
         default=EdgeStatus.PENDING,
     )
     labels = models.JSONField(default=dict, blank=True)
+    # M3: highest uplink ``monotonic_seq`` (lifecycle / sample_batch) the
+    # center has accepted from this edge. Drives duplicate / gap / restart
+    # detection — see ``docs/distributed/protocol.md`` § Uplink sequencing.
+    last_uplink_seq = models.PositiveBigIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -217,3 +221,123 @@ def next_config_version(edge: "EdgeNode") -> int:
         .first()
     )
     return int(current_max or 0) + 1
+
+
+# ---------------------------------------------------------------------------
+# M3 — uplink: lifecycle events + aggregated sample cache
+# ---------------------------------------------------------------------------
+
+
+class EdgeLifecycleEvent(models.Model):
+    """Append-only timeline of lifecycle events reported by an edge.
+
+    One row per inbound ``lifecycle`` frame, plus center-synthesised
+    ``session.offline`` rows written when the WS disconnects. The *latest*
+    per-(edge, task) state still lives in :class:`EdgeTaskStatus` for cheap
+    "current state" lookups; this table is the audit history behind it.
+    """
+
+    edge = models.ForeignKey(
+        EdgeNode,
+        on_delete=models.CASCADE,
+        related_name="lifecycle_events",
+    )
+    # Null for session-scoped events (session.online / session.offline).
+    task = models.ForeignKey(
+        "configuration.AcqTask",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="edge_lifecycle_events",
+    )
+    event = models.CharField(max_length=32)
+    # Uplink seq of the originating frame; 0 for center-synthesised rows.
+    monotonic_seq = models.PositiveBigIntegerField(default=0)
+    error = models.TextField(blank=True, default="")
+    # Edge wall-clock from the frame's ``ts`` (may drift); null if absent.
+    edge_ts = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-received_at", "-id")
+        indexes = [
+            models.Index(fields=["edge", "-received_at"], name="edge_lifecycle_idx"),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"{self.edge.name}:{self.event}@{self.monotonic_seq}"
+
+
+class EdgeSample(models.Model):
+    """Center-side aggregation cache: latest sample per (edge, task, point).
+
+    Updated in place from inbound ``sample_batch`` frames — this is the
+    汇聚缓存 the operator UI reads for a live value without round-tripping to
+    InfluxDB. The optional InfluxDB mirror (short-retention bucket) is
+    written separately by the consumer; this table is always kept.
+    """
+
+    edge = models.ForeignKey(
+        EdgeNode,
+        on_delete=models.CASCADE,
+        related_name="samples",
+    )
+    task = models.ForeignKey(
+        "configuration.AcqTask",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="edge_samples",
+    )
+    point_code = models.CharField(max_length=128)
+    # Reading value — number, bool or string; JSONField carries any of them.
+    value = models.JSONField(null=True, blank=True)
+    quality = models.CharField(max_length=16, default="good")
+    # Timestamp of the underlying reading (from the sample's ``timestamp``).
+    sample_ts = models.DateTimeField(null=True, blank=True)
+    # Uplink seq of the sample_batch frame this value arrived in.
+    monotonic_seq = models.PositiveBigIntegerField(default=0)
+    window_end = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("edge", "task", "point_code")
+        ordering = ("edge", "task", "point_code")
+        indexes = [
+            models.Index(fields=["edge", "task"], name="edge_sample_idx"),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"{self.edge.name}:{self.point_code}={self.value}"
+
+
+# Outcome of comparing an inbound uplink seq against the stored high-water
+# mark. See ``docs/distributed/protocol.md`` § Uplink sequencing.
+UPLINK_SEQ_ADVANCED = "advanced"   # seq == prev + 1 — the normal case
+UPLINK_SEQ_GAP = "gap"             # seq > prev + 1 — frames lost (M5 backfill)
+UPLINK_SEQ_DUPLICATE = "duplicate" # 0 < seq <= prev — replay; apply idempotently
+UPLINK_SEQ_RESTART = "restart"     # seq far below prev — agent process restarted
+
+# A drop this large below the high-water mark is read as an agent restart
+# (its per-process counter reset to 1) rather than a stale duplicate.
+_UPLINK_RESTART_GAP = 100
+
+
+def classify_uplink_seq(prev: int, incoming: int) -> str:
+    """Classify an inbound uplink ``monotonic_seq`` against the prior value.
+
+    Pure function (no DB) so it is trivially unit-testable. The caller
+    persists ``EdgeNode.last_uplink_seq`` for every outcome except
+    ``duplicate`` (which must not move the high-water mark backward).
+    """
+    prev = int(prev or 0)
+    incoming = int(incoming or 0)
+    if incoming <= prev:
+        if prev - incoming >= _UPLINK_RESTART_GAP:
+            return UPLINK_SEQ_RESTART
+        return UPLINK_SEQ_DUPLICATE
+    if incoming == prev + 1:
+        return UPLINK_SEQ_ADVANCED
+    return UPLINK_SEQ_GAP

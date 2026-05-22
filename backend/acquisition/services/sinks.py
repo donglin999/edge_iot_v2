@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from django.conf import settings
 
+from . import uplink
 from .read_plan import Reading
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,12 @@ class InfluxDBSink(Sink):
             "bucket": getattr(settings, "INFLUXDB_BUCKET", "default"),
             "docker_mode": False,
         }
+        # Let the operator point the durable spill queue at a writable
+        # volume — on the edge, backend/ is a read-only mount (M2 defect B).
+        # Empty string means "use the storage layer's own default".
+        spill_db_path = getattr(settings, "INFLUXDB_SPILL_DB_PATH", "")
+        if spill_db_path:
+            cfg["spill_db_path"] = spill_db_path
         try:
             storage = StorageRegistry.create("influxdb", cfg)
             storage.connect()
@@ -619,8 +626,9 @@ class WebSocketSink(Sink):
             next_wait = max(0.0, self.broadcast_interval - elapsed)
 
     def _broadcast_once(self) -> None:
+        window_end = datetime.now(tz=timezone.utc)
         batch = self._drain()
-        if not batch or not self._channel_layer:
+        if not batch:
             return
         # Latest value wins per point — keeps the WS payload bounded
         latest: Dict[str, Reading] = {}
@@ -636,6 +644,16 @@ class WebSocketSink(Sink):
                 "quality": r.quality,
                 "timestamp": ts,
             })
+
+        # M3: forward the aggregated window to the (optional) uplink hook so
+        # an edge-agent can relay it to the center. No-op in a monolith
+        # deployment, and independent of whether the local Channels layer
+        # is available below.
+        self._emit_uplink_window(readings_payload, window_end)
+
+        # The rest is the local Channels broadcast — skipped headlessly.
+        if not self._channel_layer:
+            return
 
         from asgiref.sync import async_to_sync
 
@@ -665,6 +683,29 @@ class WebSocketSink(Sink):
                     async_to_sync(self._channel_layer.group_send)(group, envelope)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("WebSocketSink group_send to %s failed: %s", group, exc)
+
+    def _emit_uplink_window(self, readings_payload, window_end) -> None:
+        """Hand one aggregated window to the distributed uplink hook.
+
+        ``window_start`` is derived by subtracting the broadcast interval
+        from ``window_end`` — close enough for the center's short-retention
+        view; the per-reading ``timestamp`` carries the exact sample time.
+        """
+        if not uplink.has_sample_hook():
+            return
+        from datetime import timedelta
+
+        window_start = window_end - timedelta(seconds=self.broadcast_interval)
+        try:
+            uplink.emit_sample_window(uplink.SampleWindow(
+                session_id=self.session.id,
+                task_id=getattr(self.session, "task_id", None),
+                window_start=window_start.isoformat(),
+                window_end=window_end.isoformat(),
+                samples=readings_payload,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WebSocketSink uplink emit failed: %s", exc)
 
     def flush(self) -> None:
         # Drain anything left in the buffer.

@@ -1,6 +1,8 @@
 """Helper services for the fleet app."""
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any, Dict, List, Tuple
 
 from asgiref.sync import async_to_sync
@@ -8,6 +10,9 @@ from channels.layers import get_channel_layer
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
+logger = logging.getLogger(__name__)
 
 from configuration.models import AcqTask, Device, Point
 
@@ -217,3 +222,99 @@ def sync_assignments(edge: EdgeNode) -> Dict[str, Any]:
         "delivered": delivered,
         "frame": frame,
     }
+
+
+# ---------------------------------------------------------------------------
+# M3 — edge sample InfluxDB mirror (short-retention)
+# ---------------------------------------------------------------------------
+
+# Lazily-created, process-wide InfluxDB handle for the center-side
+# ``edge_sample`` mirror. Reused across sample batches so we do not pay a
+# connect() per frame.
+_sample_storage_lock = threading.Lock()
+_sample_storage = None
+
+
+def _iso_to_ns(raw) -> int | None:
+    """Convert an ISO-8601 timestamp to integer nanoseconds, or ``None``."""
+    if not raw:
+        return None
+    dt = parse_datetime(str(raw))
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1e9)
+
+
+def _get_sample_storage():
+    """Return a connected InfluxDB storage handle (cached), or ``None``."""
+    global _sample_storage
+    with _sample_storage_lock:
+        if _sample_storage is not None:
+            return _sample_storage
+        from django.conf import settings
+
+        from storage import StorageRegistry
+
+        cfg = {
+            "url": getattr(settings, "INFLUXDB_URL", None),
+            "host": getattr(settings, "INFLUXDB_HOST", "localhost"),
+            "port": getattr(settings, "INFLUXDB_PORT", 8086),
+            "token": getattr(settings, "INFLUXDB_TOKEN", ""),
+            "org": getattr(settings, "INFLUXDB_ORG", "default"),
+            "bucket": getattr(settings, "INFLUXDB_BUCKET", "default"),
+            "docker_mode": False,
+        }
+        storage = StorageRegistry.create("influxdb", cfg)
+        storage.connect()
+        _sample_storage = storage
+        return _sample_storage
+
+
+def reset_sample_storage() -> None:
+    """Drop the cached InfluxDB handle (used by tests / on reconfigure)."""
+    global _sample_storage
+    with _sample_storage_lock:
+        _sample_storage = None
+
+
+def mirror_edge_samples(edge_pk, task_code: str, samples: list, window_end) -> int:
+    """Mirror one edge ``sample_batch`` into InfluxDB measurement ``edge_sample``.
+
+    Intended for a short-retention bucket (default 7 days, applied as the
+    bucket's retention policy — see ``CENTER_EDGE_SAMPLE_RETENTION_DAYS``).
+    Returns the number of points written. Best-effort: the caller wraps
+    this and swallows any exception — the ``EdgeSample`` cache table is the
+    source of truth, this copy is a convenience for historical queries.
+    """
+    storage = _get_sample_storage()
+    if storage is None:
+        return 0
+
+    fallback_ns = _iso_to_ns(window_end)
+    points = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        code = sample.get("point_code")
+        value = sample.get("value")
+        if not code or value is None:
+            continue
+        point = {
+            "measurement": "edge_sample",
+            "tags": {
+                "edge": str(edge_pk),
+                "task": str(task_code or ""),
+                "quality": str(sample.get("quality") or "good"),
+            },
+            # point_code is high-cardinality → field key, not a tag (the
+            # same cardinality-control rule the acquisition InfluxDBSink uses).
+            "fields": {str(code): value},
+        }
+        ts_ns = _iso_to_ns(sample.get("timestamp")) or fallback_ns
+        if ts_ns is not None:
+            point["time"] = ts_ns
+        points.append(point)
+
+    if points:
+        storage.write(points)
+    return len(points)

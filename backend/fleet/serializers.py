@@ -1,6 +1,12 @@
 from rest_framework import serializers
 
-from .models import EdgeAssignment, EdgeNode, EdgeTaskStatus
+from .models import (
+    EdgeAssignment,
+    EdgeLifecycleEvent,
+    EdgeNode,
+    EdgeSample,
+    EdgeTaskStatus,
+)
 
 
 class EdgeNodeSerializer(serializers.ModelSerializer):
@@ -67,6 +73,54 @@ class EdgeTaskStatusSerializer(serializers.ModelSerializer):
             "state",
             "error",
             "last_reported_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+
+class EdgeLifecycleEventSerializer(serializers.ModelSerializer):
+    """One row of an edge's lifecycle audit timeline (M3)."""
+
+    edge_name = serializers.CharField(source="edge.name", read_only=True)
+    task_code = serializers.CharField(source="task.code", read_only=True, default=None)
+
+    class Meta:
+        model = EdgeLifecycleEvent
+        fields = (
+            "id",
+            "edge",
+            "edge_name",
+            "task",
+            "task_code",
+            "event",
+            "monotonic_seq",
+            "error",
+            "edge_ts",
+            "received_at",
+        )
+        read_only_fields = fields
+
+
+class EdgeSampleSerializer(serializers.ModelSerializer):
+    """Latest cached sample for an (edge, task, point) — the 汇聚缓存 (M3)."""
+
+    edge_name = serializers.CharField(source="edge.name", read_only=True)
+    task_code = serializers.CharField(source="task.code", read_only=True, default=None)
+
+    class Meta:
+        model = EdgeSample
+        fields = (
+            "id",
+            "edge",
+            "edge_name",
+            "task",
+            "task_code",
+            "point_code",
+            "value",
+            "quality",
+            "sample_ts",
+            "monotonic_seq",
+            "window_end",
             "updated_at",
         )
         read_only_fields = fields

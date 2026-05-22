@@ -57,10 +57,17 @@ class InfluxDBStorage(BaseStorage):
         self.jitter_interval = int(config.get("jitter_interval", 200))  # ms
 
         # --- M4: spill queue + replay tuning --------------------------------
-        # The spill DB lives next to the Django db by default so it shares the
-        # instance's data directory and survives restarts.
-        spill_path = config.get("spill_db_path") or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), os.pardir, "influx_spill.sqlite3"
+        # Resolution order for the durable spill DB path:
+        #   1. explicit config["spill_db_path"]
+        #   2. INFLUXDB_SPILL_DB_PATH env (set by the edge-agent to point at a
+        #      writable volume — backend/ is a read-only mount on the edge)
+        #   3. next to the backend package (monolith default)
+        spill_path = (
+            config.get("spill_db_path")
+            or os.environ.get("INFLUXDB_SPILL_DB_PATH")
+            or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), os.pardir, "influx_spill.sqlite3"
+            )
         )
         self.spill_db_path = os.path.abspath(spill_path)
         self.replay_interval = float(config.get("replay_interval", 5.0))  # seconds
@@ -79,11 +86,21 @@ class InfluxDBStorage(BaseStorage):
         self._last_failure_time = 0.0
 
         # Durable spill queue is created eagerly so failed batches can be
-        # persisted even if a later connect() attempt fails.
+        # persisted even if a later connect() attempt fails. When the path is
+        # unwritable (e.g. a read-only mount with no INFLUXDB_SPILL_DB_PATH
+        # override) we degrade gracefully: spill is disabled and live writes
+        # still work — they just are not durably retried across a restart.
+        # This is a WARNING, not an ERROR: it is an expected, configured
+        # trade-off on a constrained edge box, not a fault.
         try:
             self._spill: Optional[SpillQueue] = SpillQueue(self.spill_db_path)
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("Failed to open spill queue at %s: %s", self.spill_db_path, exc)
+            self.logger.warning(
+                "Spill queue unavailable at %s (%s) — durable spill disabled, "
+                "continuing without it. Set INFLUXDB_SPILL_DB_PATH to a "
+                "writable path to enable cross-restart retry.",
+                self.spill_db_path, exc,
+            )
             self._spill = None
 
         self._replay_thread: Optional[threading.Thread] = None

@@ -16,11 +16,13 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from .models import EdgeNode, EdgeTaskStatus
+from .models import EdgeLifecycleEvent, EdgeNode, EdgeSample, EdgeTaskStatus
 from .serializers import (
     EdgeAssignmentSerializer,
+    EdgeLifecycleEventSerializer,
     EdgeNodeCreateSerializer,
     EdgeNodeSerializer,
+    EdgeSampleSerializer,
     EdgeTaskStatusSerializer,
 )
 from .services import sweep_stale_edges, sync_assignments
@@ -111,4 +113,50 @@ class EdgeTaskStatusViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
             qs = qs.filter(task_id=task_id)
         if edge_id:
             qs = qs.filter(edge_id=edge_id)
+        return qs
+
+
+@extend_schema(summary="列出 edge 上报的生命周期事件时间线 (M3)")
+class EdgeLifecycleEventViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Read-only audit timeline of inbound ``lifecycle`` frames.
+
+    Filter with ``?edge=<id>`` / ``?task=<id>``; newest first. The latest
+    per-(edge, task) state still lives in ``/api/fleet/task-statuses/``.
+    """
+
+    serializer_class = EdgeLifecycleEventSerializer
+    queryset = EdgeLifecycleEvent.objects.select_related("edge", "task")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        edge_id = self.request.query_params.get("edge")
+        task_id = self.request.query_params.get("task")
+        if edge_id:
+            qs = qs.filter(edge_id=edge_id)
+        if task_id:
+            qs = qs.filter(task_id=task_id)
+        return qs
+
+
+@extend_schema(summary="列出 center 汇聚缓存中的 edge 聚合样本 (M3)")
+class EdgeSampleViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Read-only projection of the center-side sample aggregation cache.
+
+    One row per (edge, task, point) carrying the latest 1 Hz value the edge
+    uplinked. Filter with ``?edge=<id>`` / ``?task=<id>``.
+    """
+
+    serializer_class = EdgeSampleSerializer
+    queryset = EdgeSample.objects.select_related("edge", "task").order_by(
+        "edge", "task", "point_code"
+    )
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        edge_id = self.request.query_params.get("edge")
+        task_id = self.request.query_params.get("task")
+        if edge_id:
+            qs = qs.filter(edge_id=edge_id)
+        if task_id:
+            qs = qs.filter(task_id=task_id)
         return qs
