@@ -25,7 +25,12 @@ import {
   message,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { CopyOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  CopyOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  WarningOutlined,
+} from '@ant-design/icons';
 import axios from 'axios';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
@@ -54,6 +59,13 @@ const STATUS_META: Record<EdgeStatus, { label: string; color: string }> = {
 
 function formatLastSeen(value: string | null): string {
   if (!value) return '从未上报';
+  const dt = dayjs(value);
+  if (!dt.isValid()) return value;
+  return dt.fromNow();
+}
+
+function formatRelative(value: string | null, emptyLabel: string): string {
+  if (!value) return emptyLabel;
   const dt = dayjs(value);
   if (!dt.isValid()) return value;
   return dt.fromNow();
@@ -105,8 +117,15 @@ const FleetPage = () => {
   }, [refresh]);
 
   const counts = useMemo(() => {
-    const c = { online: 0, offline: 0, pending: 0 };
-    for (const e of edges) c[e.status] += 1;
+    const c = { online: 0, offline: 0, pending: 0, backloggedEdges: 0, backlogFrames: 0 };
+    for (const e of edges) {
+      c[e.status] += 1;
+      const backlog = e.buffer_backlog ?? 0;
+      if (backlog > 0) {
+        c.backloggedEdges += 1;
+        c.backlogFrames += backlog;
+      }
+    }
     return c;
   }, [edges]);
 
@@ -154,6 +173,42 @@ const FleetPage = () => {
       sorter: (a, b) => {
         const av = a.last_seen ? dayjs(a.last_seen).valueOf() : 0;
         const bv = b.last_seen ? dayjs(b.last_seen).valueOf() : 0;
+        return av - bv;
+      },
+    },
+    {
+      title: '缓冲积压',
+      dataIndex: 'buffer_backlog',
+      width: 130,
+      render: (backlog: number | null | undefined) => {
+        const n = backlog ?? 0;
+        if (n > 0) {
+          return (
+            <Tooltip title="edge 持久 outbox 有未上送帧 — 正在离线缓冲或补发中">
+              <Tag color="warning" icon={<WarningOutlined />}>
+                {n.toLocaleString()} 帧
+              </Tag>
+            </Tooltip>
+          );
+        }
+        return <Text type="secondary">0</Text>;
+      },
+      sorter: (a, b) => (a.buffer_backlog ?? 0) - (b.buffer_backlog ?? 0),
+    },
+    {
+      title: '最后补发',
+      dataIndex: 'last_backfill_at',
+      width: 170,
+      render: (value: string | null) => (
+        <Tooltip title={value ?? '从未发生断线回补'}>
+          <Text type={value ? undefined : 'secondary'}>
+            {formatRelative(value, '—')}
+          </Text>
+        </Tooltip>
+      ),
+      sorter: (a, b) => {
+        const av = a.last_backfill_at ? dayjs(a.last_backfill_at).valueOf() : 0;
+        const bv = b.last_backfill_at ? dayjs(b.last_backfill_at).valueOf() : 0;
         return av - bv;
       },
     },
@@ -245,6 +300,13 @@ const FleetPage = () => {
             <Text type="secondary">
               在线 {counts.online} · 离线 {counts.offline} · 待激活 {counts.pending} · 共 {edges.length}
             </Text>
+            {counts.backloggedEdges > 0 ? (
+              <div style={{ marginTop: 4 }}>
+                <Tag color="warning" icon={<WarningOutlined />}>
+                  {counts.backloggedEdges} 个 edge 有缓冲积压 · 共 {counts.backlogFrames.toLocaleString()} 帧待上送
+                </Tag>
+              </div>
+            ) : null}
           </div>
           <Space wrap>
             <Button icon={<ReloadOutlined />} onClick={refresh}>

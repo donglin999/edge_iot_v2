@@ -21,6 +21,12 @@ export interface EdgeNode {
   version: string;
   labels: Record<string, string>;
   last_seen: string | null;
+  /** M5 offline observability — highest uplink seq the center has received. */
+  last_uplink_seq: number;
+  /** M5 — frames sitting in the edge's persistent outbox; >0 means un-shipped data. */
+  buffer_backlog: number;
+  /** M5 — when the edge last drained a post-reconnect backfill (null if never). */
+  last_backfill_at: string | null;
   created_at: string;
   updated_at: string;
 }
