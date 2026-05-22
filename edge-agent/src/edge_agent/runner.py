@@ -147,6 +147,16 @@ class TaskRunner:
         with self._lock:
             return list(self._workers.keys())
 
+    def task_code_for(self, task_id: int) -> Optional[str]:
+        """Return the ``task_code`` of a running task, or ``None``.
+
+        Used by the sample uplink to label ``sample_batch`` frames without
+        an ORM round-trip — the runner already holds the code per worker.
+        """
+        with self._lock:
+            worker = self._workers.get(int(task_id))
+            return worker.task_code if worker is not None else None
+
     # ---- internals --------------------------------------------------------
 
     def _create_session(self, task_id: int):

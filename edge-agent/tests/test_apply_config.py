@@ -137,13 +137,16 @@ async def test_handle_apply_config_replies_error_on_failure(monkeypatch):
 
 
 def test_emit_task_state_enqueues_frame():
+    """v0.3: task state transitions are emitted as ``lifecycle`` frames."""
     agent = EdgeAgent(_cfg())
     agent._emit_task_state(12, "task-12", TASK_STATE_RUNNING, None)
 
     frame = agent._outbox.get_nowait()
-    assert frame["type"] == FRAME_TASK_STATE
+    assert frame["type"] == "lifecycle"
+    assert frame["event"] == "task.running"
     assert frame["task_id"] == 12
-    assert frame["state"] == TASK_STATE_RUNNING
+    assert frame["task_code"] == "task-12"
+    assert frame["monotonic_seq"] == 1
     assert frame["edge_id"] == "edge-test"
 
 

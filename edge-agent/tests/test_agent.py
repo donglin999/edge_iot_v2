@@ -98,8 +98,12 @@ async def test_register_then_heartbeat_sends_expected_frames():
     assert types.count("heartbeat") >= 2
     assert fake.sent[0]["edge_id"] == "edge-1"
     assert fake.sent[0]["token"] == "tk"
-    for hb in fake.sent[1:]:
-        assert hb["type"] == "heartbeat"
+    # v0.3: a session.online lifecycle frame is emitted right after register,
+    # carrying the first uplink monotonic_seq.
+    online = next(f for f in fake.sent if f["type"] == "lifecycle")
+    assert online["event"] == "session.online"
+    assert online["monotonic_seq"] == 1
+    for hb in (f for f in fake.sent[1:] if f["type"] == "heartbeat"):
         assert hb["edge_id"] == "edge-1"
         assert hb["uptime"] >= 0
 

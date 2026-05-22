@@ -15,6 +15,17 @@ class ConfigError(RuntimeError):
     pass
 
 
+# Minimum aggregation window — below this the WS broadcast cadence and the
+# uplink emit cost stop being worth it. Mirrors WebSocketSink's own floor.
+_MIN_SAMPLE_WINDOW_S = 0.05
+
+
+def _parse_bool(raw: str, default: bool) -> bool:
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class EdgeConfig:
     edge_id: str
@@ -22,6 +33,9 @@ class EdgeConfig:
     center_url: str
     labels: Dict[str, Any]
     log_level: str = "INFO"
+    # M3 uplink: 1 Hz aggregated sample_batch frames.
+    uplink_samples: bool = True
+    uplink_sample_window: float = 1.0
 
     @classmethod
     def from_env(cls, env: Dict[str, str] | None = None) -> "EdgeConfig":
@@ -41,10 +55,23 @@ class EdgeConfig:
         else:
             labels = {}
 
+        window_raw = env.get("EDGE_UPLINK_SAMPLE_WINDOW", "")
+        if window_raw:
+            try:
+                window = max(_MIN_SAMPLE_WINDOW_S, float(window_raw))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_UPLINK_SAMPLE_WINDOW must be a number: {exc}"
+                ) from exc
+        else:
+            window = 1.0
+
         return cls(
             edge_id=env["EDGE_ID"],
             edge_token=env["EDGE_TOKEN"],
             center_url=env["CENTER_URL"],
             labels=labels,
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
+            uplink_samples=_parse_bool(env.get("EDGE_UPLINK_SAMPLES", ""), True),
+            uplink_sample_window=window,
         )

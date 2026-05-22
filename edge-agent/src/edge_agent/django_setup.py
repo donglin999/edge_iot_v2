@@ -44,6 +44,24 @@ def _ensure_backend_on_path() -> None:
         sys.path.insert(0, backend_dir)
 
 
+def _ensure_writable_spill_path(state_db: str) -> None:
+    """Point the InfluxDB spill queue at a writable directory.
+
+    The center's ``InfluxDBStorage`` defaults its durable spill queue to
+    ``backend/influx_spill.sqlite3``. On the edge ``backend`` is the
+    read-only ``/opt/backend`` mount, so opening that SQLite file fails
+    with ``unable to open database file`` (M2 defect B, same root cause as
+    the log-dir redirect). We redirect the spill DB next to the edge-side
+    state DB — the same writable volume — unless the operator already set
+    ``INFLUXDB_SPILL_DB_PATH``. If even that directory is unwritable the
+    storage layer degrades gracefully (spill disabled, no ERROR log).
+    """
+    if os.environ.get("INFLUXDB_SPILL_DB_PATH"):
+        return
+    spill_path = Path(state_db).parent / "influx_spill.sqlite3"
+    os.environ["INFLUXDB_SPILL_DB_PATH"] = str(spill_path)
+
+
 def _ensure_writable_log_dir(state_db: str) -> None:
     """Point the center's ``LOGGING`` at a writable directory.
 
@@ -71,11 +89,16 @@ def ensure_setup(
     settings_module: str | None = None,
     state_db: str | None = None,
     run_migrations: bool = True,
+    sample_window: float | None = None,
 ) -> str:
     """Idempotent Django bootstrap for the edge-agent process.
 
     Returns the SQLite path actually being used. Safe to call from
     anywhere — internally guarded by a lock + once-flag.
+
+    ``sample_window`` (seconds) sets the WebSocketSink broadcast cadence —
+    and therefore the 1 Hz ``sample_batch`` aggregation window — via the
+    ``WS_BROADCAST_INTERVAL_S`` env the center settings reads.
     """
     global _setup_done
 
@@ -94,6 +117,12 @@ def ensure_setup(
         # so logging into BASE_DIR/logs would abort django.setup() (XIU-61
         # defect B). Must happen before the settings module is imported.
         _ensure_writable_log_dir(chosen_db)
+        # Same treatment for the InfluxDB spill queue (M2 defect B, M3 fix).
+        _ensure_writable_spill_path(chosen_db)
+        # Set the sample-aggregation window before settings import so the
+        # WebSocketSink picks it up as its broadcast cadence.
+        if sample_window is not None:
+            os.environ.setdefault("WS_BROADCAST_INTERVAL_S", str(float(sample_window)))
         # The center settings parses ALLOWED_HOSTS / SECRET_KEY at import time;
         # nothing else is needed for ORM-only usage. Leave whatever the
         # operator set in the env in place.

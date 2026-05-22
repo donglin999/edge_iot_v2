@@ -36,11 +36,14 @@ from .protocol import (
     FRAME_ACK,
     FRAME_APPLY_CONFIG,
     FRAME_ERROR,
+    LIFECYCLE_SESSION_ONLINE,
     PROTOCOL_VERSION,
     make_config_applied,
     make_heartbeat,
+    make_lifecycle,
     make_register,
-    make_task_state,
+    make_sample_batch,
+    task_state_to_lifecycle_event,
 )
 
 logger = logging.getLogger("edge_agent.agent")
@@ -106,6 +109,12 @@ class EdgeAgent:
         self._outbox: "queue.Queue[dict]" = queue.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._current_ws = None
+        # M3 uplink: a single per-process monotonic sequence shared by every
+        # ``lifecycle`` / ``sample_batch`` frame. Assigned under the lock so
+        # the seq order matches the FIFO outbox order (see _enqueue_uplink).
+        self._uplink_lock = threading.Lock()
+        self._uplink_seq = 0
+        self._sample_hook_registered = False
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -158,6 +167,14 @@ class EdgeAgent:
                 logger.info("reconnecting in %.0fs", delay)
                 await self._sleep(delay)
         finally:
+            # Drop the uplink hook so a stopped agent stops feeding the
+            # (now-dead) outbox from any lingering WebSocketSink thread.
+            if self._sample_hook_registered:
+                with suppress(Exception):
+                    from acquisition.services import uplink as acq_uplink
+
+                    acq_uplink.clear_sample_hook()
+                self._sample_hook_registered = False
             # Stop task threads off the loop thread — TaskRunner.stop()
             # flips AcquisitionSession rows (sync ORM).
             if self._runner is not None:
@@ -172,6 +189,14 @@ class EdgeAgent:
         # Successful register means we have a real edge identity — reset
         # the backoff so the next disconnect starts from 1 s again.
         self._backoff.reset()
+        # M3: announce the session is up. The center logs this into its
+        # lifecycle event timeline; ``session.offline`` is synthesised
+        # center-side on disconnect (a closing socket cannot send a frame).
+        self._enqueue_uplink(lambda seq: make_lifecycle(
+            edge_id=self.config.edge_id,
+            monotonic_seq=seq,
+            event=LIFECYCLE_SESSION_ONLINE,
+        ))
 
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws), name="edge-agent.heartbeat")
         reader_task = asyncio.create_task(self._read_loop(ws), name="edge-agent.reader")
@@ -279,16 +304,39 @@ class EdgeAgent:
             from .runner import TaskRunner
             from .state import EdgeStateStore
 
-            db_path = ensure_setup()
+            db_path = ensure_setup(sample_window=self.config.uplink_sample_window)
             if self._state_store is None:
                 self._state_store = EdgeStateStore(db_path)
             if self._runner is None:
                 self._runner = TaskRunner(on_state=self._emit_task_state)
+            self._register_sample_hook()
         except Exception:  # noqa: BLE001
             logger.exception(
                 "edge-agent runtime bootstrap failed — control-plane will "
                 "stay up but config dispatch is disabled this session"
             )
+
+    def _register_sample_hook(self) -> None:
+        """Wire the acquisition pipeline's 1 Hz windows into the uplink.
+
+        Honors ``EDGE_UPLINK_SAMPLES``: when disabled we simply never
+        register, so the WebSocketSink's emit stays a no-op. Importable
+        only after ``ensure_setup`` has put ``backend`` on ``sys.path``.
+        """
+        if not self.config.uplink_samples:
+            logger.info("edge-agent: sample uplink disabled (EDGE_UPLINK_SAMPLES)")
+            return
+        try:
+            from acquisition.services import uplink as acq_uplink
+
+            acq_uplink.register_sample_hook(self._on_sample_window)
+            self._sample_hook_registered = True
+            logger.info(
+                "edge-agent: sample uplink enabled (window=%.2fs)",
+                self.config.uplink_sample_window,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("edge-agent: could not register sample uplink hook")
 
     def _replay_cached_config(self) -> None:
         """Re-import the last persisted apply_config snapshot on cold start."""
@@ -386,19 +434,66 @@ class EdgeAgent:
         )
 
     def _emit_task_state(self, task_id: int, task_code: str, state: str, error: Optional[str]) -> None:
-        """Callback used by TaskRunner — runs on a worker thread."""
+        """Callback used by TaskRunner — runs on a worker thread.
+
+        M3: emits a v0.3 ``lifecycle`` frame (``task.*`` event) carrying a
+        ``monotonic_seq`` instead of the v0.2 ``task_state`` frame.
+        """
         try:
-            frame = make_task_state(
-                edge_id=self.config.edge_id,
-                task_id=task_id,
-                task_code=task_code,
-                state=state,
-                error=error,
-            )
+            event = task_state_to_lifecycle_event(state)
         except ValueError:
-            logger.exception("invalid task_state from runner")
+            logger.exception("invalid task state from runner: %r", state)
             return
-        self.enqueue_frame(frame)
+        self._enqueue_uplink(lambda seq: make_lifecycle(
+            edge_id=self.config.edge_id,
+            monotonic_seq=seq,
+            event=event,
+            task_id=task_id,
+            task_code=task_code,
+            error=error,
+        ))
+
+    def _on_sample_window(self, window) -> None:
+        """Sample-uplink hook — runs on the WebSocketSink broadcast thread.
+
+        ``window`` is an ``acquisition.services.uplink.SampleWindow``. We
+        resolve ``task_code`` from the runner's worker table (no ORM hit)
+        and ship one ``sample_batch`` frame per window.
+        """
+        task_id = window.task_id
+        if task_id is None:
+            return
+        task_code = str(task_id)
+        if self._runner is not None:
+            resolved = self._runner.task_code_for(int(task_id))
+            if resolved:
+                task_code = resolved
+        self._enqueue_uplink(lambda seq: make_sample_batch(
+            edge_id=self.config.edge_id,
+            monotonic_seq=seq,
+            task_id=int(task_id),
+            task_code=task_code,
+            samples=list(window.samples),
+            window_start=window.window_start,
+            window_end=window.window_end,
+        ))
+
+    def _enqueue_uplink(self, build_frame: Callable[[int], dict]) -> None:
+        """Assign the next ``monotonic_seq`` and enqueue an uplink frame.
+
+        The seq increment, frame build, and outbox put all happen under
+        ``_uplink_lock`` so the sequence numbers land on the FIFO outbox
+        in strictly increasing order even when several worker threads
+        (task runner + WebSocketSink broadcaster) emit concurrently.
+        """
+        with self._uplink_lock:
+            self._uplink_seq += 1
+            try:
+                frame = build_frame(self._uplink_seq)
+            except Exception:  # noqa: BLE001
+                logger.exception("uplink frame build failed (seq=%d)", self._uplink_seq)
+                return
+            self._outbox.put_nowait(frame)
 
     def enqueue_frame(self, frame: dict) -> None:
         """Thread-safe queue from background workers to the WS sender."""
