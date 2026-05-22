@@ -15,6 +15,7 @@ from edge_agent.agent import EdgeAgent
 from edge_agent.config import EdgeConfig
 from edge_agent.protocol import (
     LIFECYCLE_EVENTS,
+    PROTOCOL_VERSION,
     make_lifecycle,
     make_sample_batch,
     task_state_to_lifecycle_event,
@@ -39,7 +40,7 @@ class TestProtocolBuilders:
     def test_make_lifecycle_session_event(self):
         frame = make_lifecycle(edge_id="e1", monotonic_seq=1, event="session.online")
         assert frame["type"] == "lifecycle"
-        assert frame["v"] == "0.3"
+        assert frame["v"] == PROTOCOL_VERSION
         assert frame["monotonic_seq"] == 1
         assert "task_id" not in frame
 
