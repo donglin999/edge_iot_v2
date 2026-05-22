@@ -1,4 +1,4 @@
-# Distributed control-plane protocol — v0.2 (M2)
+# Distributed control-plane protocol — v0.3 (M3)
 
 Wire format for the WebSocket channel between each **edge-agent** and the
 **center** (`fleet/` Django app). One persistent WS connection per edge.
@@ -7,160 +7,171 @@ Wire format for the WebSocket channel between each **edge-agent** and the
 - Endpoint: `ws[s]://<center>/ws/fleet/`
 - Authentication: activation token, presented in the first `register` frame.
 
-Every frame carries `"v": "0.2"`. The center also accepts `"v": "0.1"`
-during the upgrade window so a stale agent can still register; older
-agents simply never see the new v0.2 frame types.
+Every frame carries `"v": "0.3"`. The center also accepts `"v": "0.1"`
+and `"v": "0.2"` during the upgrade window so a stale agent can still
+register; older agents simply never see the newer frame types.
 
 ## Common envelope
 
 | field   | type     | required | notes                                              |
 |---------|----------|----------|----------------------------------------------------|
-| `v`     | string   | yes      | Protocol version, e.g. `"0.2"`. Bump on breaking change. |
+| `v`     | string   | yes      | Protocol version, e.g. `"0.3"`. Bump on breaking change. |
 | `type`  | string   | yes      | See per-direction tables below.                    |
 
 Per-type fields below.
 
-## v0.1 frames (unchanged)
+## v0.1 / v0.2 frames (unchanged)
 
-These exist exactly as defined in v0.1. Listed here in short form; see
-the v0.1 history for full schemas.
+These exist exactly as defined in their introducing version. v0.3 is a
+**pure increment** — it adds two new edge → center frame types and does
+not change any v0.1/v0.2 field. The M1/M2 public contract is preserved.
 
-| frame       | direction        | purpose                                                          |
-|-------------|------------------|------------------------------------------------------------------|
-| `register`  | edge → center    | First frame; presents `edge_id` + activation `token` + `version`.|
-| `heartbeat` | edge → center    | ~1 Hz liveness; updates `last_seen`.                             |
-| `ack`       | center → edge    | Acks a `register` / `heartbeat` / `apply_config` / `task_state`. |
-| `error`     | center → edge    | Fatal protocol/auth error; center closes the socket.             |
+| frame            | direction        | version | purpose                                       |
+|------------------|------------------|---------|-----------------------------------------------|
+| `register`       | edge → center    | v0.1    | First frame; `edge_id` + `token` + `version`. |
+| `heartbeat`      | edge → center    | v0.1    | ~1 Hz liveness; updates `last_seen`.          |
+| `ack`            | center → edge    | v0.1    | Acks a prior edge → center frame.             |
+| `error`          | center → edge    | v0.1    | Fatal protocol/auth error; center closes.     |
+| `apply_config`   | center → edge    | v0.2    | Full task/device/point snapshot.              |
+| `config_applied` | edge → center    | v0.2    | Result of applying a snapshot.                |
+| `task_state`     | edge → center    | v0.2    | Per-task lifecycle transition (no seq).       |
 
-`ack` now carries an optional `ref` matching the acked frame's `type`
-(e.g. `ref="apply_config"`).
+`task_state` is **retained** so a v0.2 edge talking to a v0.3 center keeps
+working. A v0.3 edge no longer emits `task_state`; it emits the richer
+`lifecycle` frame instead (see below). The center accepts both.
 
-The error codes for `register` (`bad_frame` / `auth_failed` /
-`unknown_edge`, closed with 4400/4401/4404) are unchanged.
+See this file's git history for the full v0.1/v0.2 field schemas of the
+frames above.
 
-## `apply_config` — center → edge  (v0.2)
+## Uplink sequencing — `monotonic_seq`
 
-Center pushes the full configuration snapshot the edge should run. The
-center may resend any time (config edit, edge reconnect, periodic
-reconcile). The edge MUST treat each frame as a full replacement of its
-local state — anything not in `tasks` is no longer assigned to it.
+v0.3 introduces a single per-edge **uplink sequence number**. Every
+`lifecycle` and `sample_batch` frame carries `monotonic_seq`: a strictly
+increasing integer assigned by the edge-agent at enqueue time, shared
+across both frame types so they form one ordered stream.
+
+- The counter starts at `1` on each edge-agent **process start** and
+  increments by 1 per uplink frame. It is *not* persisted across restarts
+  this milestone — a restarted agent's stream simply restarts at 1.
+- The center stores the highest value it has seen per edge as
+  `EdgeNode.last_uplink_seq`.
+- A frame whose `monotonic_seq` is **≤** the stored value is a duplicate /
+  replay: the center still applies it idempotently but does not move
+  `last_uplink_seq` backward.
+- A jump of more than 1 is a **gap** (frames lost while offline). The
+  center logs it; closing the gap is M5 (offline backfill) — out of scope
+  here, which only implements the online path.
+- A frame whose `monotonic_seq` is far **below** the stored value (e.g. 1
+  after 5000) is treated as an agent restart: the center accepts it and
+  resets `last_uplink_seq` to the new stream.
+
+`register` / `heartbeat` / `config_applied` / `task_state` do **not**
+carry `monotonic_seq` — they are control frames, not part of the uplink
+data stream.
+
+## `lifecycle` — edge → center  (v0.3)
+
+Reports a session- or task-level lifecycle event. Supersedes `task_state`
+for v0.3 edges. Sent on every state change.
 
 ```json
 {
-  "v": "0.2",
-  "type": "apply_config",
-  "version": 7,
-  "tasks": [
-    {
-      "id": 12,
-      "code": "modbus-line-1",
-      "name": "Modbus Line 1",
-      "sample_rate_hz": 1.0,
-      "is_active": true,
-      "point_ids": [101, 102, 103]
-    }
-  ],
-  "devices": [
-    {
-      "id": 5,
-      "code": "modbus-tcp-1",
-      "name": "Modbus TCP #1",
-      "protocol": "modbus_tcp",
-      "ip_address": "mock-modbus-edge",
-      "port": 5020,
-      "metadata": {}
-    }
-  ],
-  "points": [
-    {
-      "id": 101,
-      "device_id": 5,
-      "code": "holding_0",
-      "address": "40001",
-      "sample_rate_hz": 1.0,
-      "extra": {"register_type": "holding", "data_type": "uint16"},
-      "template": {"name": "Holding 0", "unit": "", "data_type": "uint16",
-                   "coefficient": 1.0, "precision": 0}
-    }
+  "v": "0.3",
+  "type": "lifecycle",
+  "edge_id": "edge-shanghai-line-1",
+  "monotonic_seq": 7,
+  "event": "task.running",
+  "ts": "2026-05-22T03:14:07.221Z",
+  "task_id": 12,
+  "task_code": "modbus-line-1"
+}
+```
+
+| field           | type    | required | notes                                                          |
+|-----------------|---------|----------|-----------------------------------------------------------------|
+| `monotonic_seq` | integer | yes      | Per-edge uplink sequence (see above).                           |
+| `event`         | string  | yes      | One of the event names below.                                  |
+| `ts`            | string  | yes      | Edge wall-clock ISO-8601 UTC; informational (clock may drift).  |
+| `task_id`       | integer | cond.    | Required for every `task.*` event; `AcqTask.id`.                |
+| `task_code`     | string  | cond.    | Required for every `task.*` event; human-readable code.         |
+| `error`         | string  | cond.    | Required when `event == "task.error"`; short description.       |
+
+`event` values:
+
+| event             | scope   | meaning                                               |
+|-------------------|---------|-------------------------------------------------------|
+| `session.online`  | session | Edge-agent has registered; control plane is up.       |
+| `task.starting`   | task    | Runner is spawning the task's acquisition thread.     |
+| `task.running`    | task    | Acquisition service is reading.                       |
+| `task.stopping`   | task    | Runner asked the task to stop.                        |
+| `task.stopped`    | task    | Task thread exited cleanly.                           |
+| `task.error`      | task    | Task crashed or failed to start; see `error`.         |
+
+The `task.*` events map 1:1 onto the v0.2 `task_state` states, so the
+center folds them into the same `EdgeTaskStatus` row (the `state` column
+stores the part after `task.`). The center also appends every `lifecycle`
+frame to an `EdgeLifecycleEvent` log table for an audit timeline.
+
+`session.offline` is **not** an uplink event — a closing socket cannot
+reliably send a final frame. The center synthesises a `session.offline`
+row in `EdgeLifecycleEvent` itself when the WS disconnects.
+
+## `sample_batch` — edge → center  (v0.3)
+
+Carries one aggregation window of sampled point values. The edge-agent
+aggregates the acquisition pipeline's readings over a fixed window
+(default 1 Hz, latest value wins per `point_code`) and ships one
+`sample_batch` per window per task.
+
+```json
+{
+  "v": "0.3",
+  "type": "sample_batch",
+  "edge_id": "edge-shanghai-line-1",
+  "monotonic_seq": 8,
+  "task_id": 12,
+  "task_code": "modbus-line-1",
+  "window_start": "2026-05-22T03:14:06.000Z",
+  "window_end": "2026-05-22T03:14:07.000Z",
+  "samples": [
+    {"point_code": "holding_0", "value": 123.4, "quality": "good",
+     "timestamp": "2026-05-22T03:14:06.880Z"},
+    {"point_code": "holding_1", "value": 7,     "quality": "good",
+     "timestamp": "2026-05-22T03:14:06.880Z"}
   ]
 }
 ```
 
-| field      | type    | required | notes                                                                |
-|------------|---------|----------|----------------------------------------------------------------------|
-| `version`  | integer | yes      | Monotonically increasing per edge. Persisted as `last_applied_version`. |
-| `tasks`    | array   | yes      | All `AcqTask`s currently assigned to this edge (`AcqTask.edge_id == edge.id`). May be empty. |
-| `devices`  | array   | yes      | All `Device`s referenced by `tasks[*].point_ids`. Joined transitively. |
-| `points`   | array   | yes      | All `Point`s referenced by `tasks[*].point_ids`. Carries inline `template`. |
+| field           | type    | required | notes                                                       |
+|-----------------|---------|----------|--------------------------------------------------------------|
+| `monotonic_seq` | integer | yes      | Per-edge uplink sequence (see above).                        |
+| `task_id`       | integer | yes      | `AcqTask.id` the samples belong to.                          |
+| `task_code`     | string  | yes      | Human-readable task code.                                    |
+| `window_start`  | string  | yes      | ISO-8601 UTC start of the aggregation window.                |
+| `window_end`    | string  | yes      | ISO-8601 UTC end of the aggregation window.                  |
+| `samples`       | array   | yes      | Aggregated readings; may be empty (a quiet window).          |
 
-Each task object's fields are: `id`, `code`, `name`, `sample_rate_hz`,
-`is_active`, `point_ids` (list of `Point.id`). Each device follows the
-existing `DeviceSerializer` shape (`id`, `code`, `name`, `protocol`,
-`ip_address`, `port`, `metadata`). Each point carries `id`, `device_id`,
-`code`, `address`, `sample_rate_hz`, `extra`, plus an inline `template`
-sub-object so the edge has everything it needs to run without a follow-up
-fetch.
+Each `samples[*]` object: `point_code` (string), `value` (number / bool /
+string), `quality` (`good` / `bad` / `uncertain`), `timestamp` (ISO-8601
+UTC of the underlying reading).
 
-## `config_applied` — edge → center  (v0.2)
+The center writes each sample into its **aggregation cache**
+(`EdgeSample`, one row per (edge, task, point_code), updated in place) and
+— when `CENTER_EDGE_SAMPLE_TO_INFLUX` is enabled (default on) — also into
+InfluxDB under measurement `edge_sample`. The InfluxDB copy is meant for a
+short-retention bucket (default 7 days, set as the bucket's retention
+policy); it can be disabled entirely by setting
+`CENTER_EDGE_SAMPLE_TO_INFLUX=false`.
 
-Reports the result of applying a snapshot. Sent once per `apply_config`.
+### Aggregation window — edge-agent configuration
 
-```json
-{
-  "v": "0.2",
-  "type": "config_applied",
-  "edge_id": "edge-shanghai-line-1",
-  "version": 7,
-  "status": "ok"
-}
-```
+| env var                    | default | meaning                                              |
+|-----------------------------|---------|------------------------------------------------------|
+| `EDGE_UPLINK_SAMPLES`       | `true`  | Master switch for `sample_batch` uplink.             |
+| `EDGE_UPLINK_SAMPLE_WINDOW` | `1.0`   | Aggregation window in seconds (≥ 0.05).              |
 
-On failure:
-
-```json
-{
-  "v": "0.2",
-  "type": "config_applied",
-  "edge_id": "edge-shanghai-line-1",
-  "version": 7,
-  "status": "error",
-  "error": "device protocol 'mqtt' not yet supported on edge"
-}
-```
-
-| field      | type    | required | notes                                                  |
-|------------|---------|----------|--------------------------------------------------------|
-| `version`  | integer | yes      | Echoes back the `version` from the `apply_config` frame. |
-| `status`   | string  | yes      | `"ok"` or `"error"`.                                    |
-| `error`    | string  | no       | Short description; required when `status == "error"`.   |
-
-## `task_state` — edge → center  (v0.2)
-
-Reports a lifecycle transition for one running task. Sent on every state
-change; the edge MUST NOT send `task_state` for a task that is not (or
-no longer) in its local task list.
-
-```json
-{
-  "v": "0.2",
-  "type": "task_state",
-  "edge_id": "edge-shanghai-line-1",
-  "task_id": 12,
-  "task_code": "modbus-line-1",
-  "state": "running"
-}
-```
-
-| field        | type    | required | notes                                                         |
-|--------------|---------|----------|---------------------------------------------------------------|
-| `task_id`    | integer | yes      | `AcqTask.id`, exactly as received in `apply_config.tasks[*]`. |
-| `task_code`  | string  | yes      | `AcqTask.code`, included for logs.                            |
-| `state`      | string  | yes      | One of `starting`, `running`, `stopping`, `stopped`, `error`. |
-| `error`      | string  | no       | Required when `state == "error"`; short description.          |
-
-The center persists the latest state per (edge, task) into the
-`EdgeTaskStatus` table and exposes it via the existing
-`/api/acquisition/` page so the operator sees "task X on edge Y → running".
+Setting `EDGE_UPLINK_SAMPLES=false` stops the edge emitting `sample_batch`
+frames entirely (lifecycle frames are unaffected).
 
 ## Frame ordering / acks
 
@@ -171,27 +182,29 @@ The center persists the latest state per (edge, task) into the
 | `apply_config`   | (center → edge; no ack from center)    |
 | `config_applied` | `ack` with `ref="config_applied"`      |
 | `task_state`     | `ack` with `ref="task_state"`          |
+| `lifecycle`      | `ack` with `ref="lifecycle"`           |
+| `sample_batch`   | `ack` with `ref="sample_batch"`        |
 
-The edge MAY ignore acks for `task_state` / `config_applied`; they exist
-for at-least-once delivery hooks the center may grow later.
+The edge MAY ignore acks for `lifecycle` / `sample_batch`; they exist for
+at-least-once delivery hooks the center may grow later (M5).
 
 ## Reconnect behaviour (client side)
 
-Unchanged from v0.1:
+Unchanged from v0.1/v0.2:
 
 - On any close that isn't `1000`/`1001`, the edge waits an
   exponential-backoff delay (1 → 2 → 4 → 8 → 16 → 30 s, capped at 30 s)
   and reconnects.
 - The backoff timer is **reset to 1 s** after the next successful
-  `register` ack, so a transient blip does not keep the agent at
-  30 s indefinitely.
-- On reconnect the center re-pushes the latest `apply_config` so the
-  edge converges back to the desired state without polling.
+  `register` ack.
+- On reconnect the center re-pushes the latest `apply_config`.
+- Uplink frames produced while the socket is down are buffered in a
+  bounded in-process queue and flushed on reconnect (online path only;
+  durable cross-restart buffering / backfill is M5).
 
-## Out of scope for v0.2 (planned for M3+)
+## Out of scope for v0.3 (planned for M4+)
 
-- `sample` / `sample_batch` (edge → center 1Hz aggregated readings) — M3
 - `alarm` rule sync + `alarm_event` (edge → center) — M4
-- Offline buffering / backfill — M5
+- Durable offline buffering / `monotonic_seq` gap backfill — M5
 - Historical query proxy — M6
 - mTLS / signed bootstrap, beyond the bare activation token
