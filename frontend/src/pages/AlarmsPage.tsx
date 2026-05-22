@@ -31,6 +31,7 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import { apiClient } from '../services/apiClient';
 import { fetchAllPages } from '../services/pagination';
+import { listEdges, type EdgeNode } from '../services/fleet';
 
 const { Title, Text } = Typography;
 
@@ -58,6 +59,9 @@ interface Alarm {
   status: 'firing' | 'acked' | 'cleared';
   fired_at: string;
   message: string;
+  // M4: source edge for distributed alarms; null = center-local alarm.
+  edge: number | null;
+  edge_name: string | null;
 }
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -77,6 +81,9 @@ const AlarmsPage = () => {
   const [rules, setRules] = useState<AlarmRule[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<'all' | 'firing' | 'acked' | 'cleared'>('all');
+  // M4: filter alarms by source edge; 'all' = no filter.
+  const [edgeFilter, setEdgeFilter] = useState<'all' | number>('all');
+  const [edges, setEdges] = useState<EdgeNode[]>([]);
   const [tab, setTab] = useState<'alarms' | 'rules'>('alarms');
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<AlarmRule | null>(null);
@@ -93,6 +100,7 @@ const AlarmsPage = () => {
               limit,
               offset,
               ...(statusFilter === 'all' ? {} : { status: statusFilter }),
+              ...(edgeFilter === 'all' ? {} : { edge: edgeFilter }),
             },
           });
           return res.data;
@@ -109,13 +117,24 @@ const AlarmsPage = () => {
     } finally {
       setLoading(false);
     }
-  }, [statusFilter]);
+  }, [statusFilter, edgeFilter]);
 
   useEffect(() => {
     refresh();
     const interval = setInterval(refresh, 15000);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  // M4: load the edge roster once for the 来源 edge filter dropdown.
+  useEffect(() => {
+    const controller = new AbortController();
+    listEdges(controller.signal)
+      .then(setEdges)
+      .catch(() => {
+        /* aborted on unmount or fleet unavailable — filter just stays empty */
+      });
+    return () => controller.abort();
+  }, []);
 
   const ackAlarm = async (id: number) => {
     await apiClient.post(`/acquisition/alarms/${id}/ack/`);
@@ -177,6 +196,14 @@ const AlarmsPage = () => {
       dataIndex: 'severity',
       width: 90,
       render: (s: string) => <Tag color={SEVERITY_COLORS[s]}>{s.toUpperCase()}</Tag>,
+    },
+    {
+      // M4: which edge reported this alarm; null = center-local (non-distributed).
+      title: '来源 edge',
+      dataIndex: 'edge_name',
+      width: 130,
+      render: (name: string | null) =>
+        name ? <Tag color="geekblue">{name}</Tag> : <Text type="secondary">中心</Text>,
     },
     { title: '规则', dataIndex: 'rule_name' },
     { title: '设备', dataIndex: 'device_code' },
@@ -299,7 +326,7 @@ const AlarmsPage = () => {
               label: `告警记录 (${alarms.length})`,
               children: (
                 <>
-                  <Space style={{ marginBottom: 16 }}>
+                  <Space style={{ marginBottom: 16 }} wrap>
                     <Segmented
                       value={statusFilter}
                       onChange={(v) => setStatusFilter(v as typeof statusFilter)}
@@ -308,6 +335,15 @@ const AlarmsPage = () => {
                         { label: '未确认', value: 'firing' },
                         { label: '已确认', value: 'acked' },
                         { label: '已恢复', value: 'cleared' },
+                      ]}
+                    />
+                    <Select
+                      value={edgeFilter}
+                      onChange={(v) => setEdgeFilter(v)}
+                      style={{ width: 200 }}
+                      options={[
+                        { label: '全部来源', value: 'all' as const },
+                        ...edges.map((e) => ({ label: e.name, value: e.id })),
                       ]}
                     />
                   </Space>
