@@ -64,8 +64,30 @@ const AcquisitionControlPage = () => {
     }
   }, []);
 
+  // Fleet task-status stream (XIU-64 / M3). The center pushes a full
+  // `snapshot` frame on connect (and again after every reconnect), then a
+  // `task_status` frame per (edge, task) lifecycle change. Snapshot frames
+  // replace the table wholesale; task_status frames upsert one row by id.
+  const handleFleetMessage = useCallback((message: WebSocketMessage) => {
+    if (message.type === 'snapshot') {
+      setTaskStatuses(message.data as EdgeTaskStatus[]);
+    } else if (message.type === 'task_status') {
+      const row = message.data as EdgeTaskStatus;
+      setTaskStatuses((prev) => {
+        const existingIndex = prev.findIndex((s) => s.id === row.id);
+        if (existingIndex >= 0) {
+          const updated = [...prev];
+          updated[existingIndex] = row;
+          return updated;
+        }
+        return [...prev, row];
+      });
+    }
+  }, []);
+
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${wsProtocol}//${window.location.host}/ws/acquisition/global/`;
+  const fleetWsUrl = `${wsProtocol}//${window.location.host}/ws/fleet/task-statuses/`;
 
   // WebSocket is fully gated by the realtime toggle: when off, the socket is
   // closed and the polling effect below becomes the single update source.
@@ -73,6 +95,14 @@ const AcquisitionControlPage = () => {
     url: wsUrl,
     onMessage: handleWebSocketMessage,
     enabled: useWebSocketUpdates,
+  });
+
+  // Fleet task-status WebSocket — exponential backoff on reconnect (3s → 30s).
+  const { status: fleetWsStatus } = useWebSocket({
+    url: fleetWsUrl,
+    onMessage: handleFleetMessage,
+    enabled: useWebSocketUpdates,
+    maxReconnectInterval: 30000,
   });
 
   // Single update-source effect: poll only when the WebSocket is NOT the
@@ -103,6 +133,35 @@ const AcquisitionControlPage = () => {
       aborter?.abort();
     };
   }, [useWebSocketUpdates, wsStatus]);
+
+  // REST fallback for edge task statuses — mirrors the sessions poll above.
+  // Runs only while the fleet WebSocket is NOT the live channel (toggle off
+  // or socket not connected); the WS snapshot/task_status path is otherwise
+  // the single source of truth.
+  useEffect(() => {
+    const wsActive =
+      useWebSocketUpdates && fleetWsStatus === WebSocketStatus.CONNECTED;
+    if (wsActive) {
+      return;
+    }
+
+    let aborter: AbortController | null = null;
+    const poll = () => {
+      aborter?.abort();
+      aborter = new AbortController();
+      listTaskStatuses(undefined, aborter.signal)
+        .then(setTaskStatuses)
+        .catch((err) => {
+          if (!isAbortError(err)) console.error(err);
+        });
+    };
+
+    const interval = setInterval(poll, 5000);
+    return () => {
+      clearInterval(interval);
+      aborter?.abort();
+    };
+  }, [useWebSocketUpdates, fleetWsStatus]);
 
   const getSessionForTask = (taskId: number) => {
     return activeSessions.find((s) => s.task === taskId);

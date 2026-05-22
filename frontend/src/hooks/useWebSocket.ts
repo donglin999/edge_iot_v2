@@ -14,6 +14,14 @@ export interface UseWebSocketOptions {
   autoReconnect?: boolean;
   reconnectInterval?: number;
   /**
+   * Upper bound for reconnect backoff. When set greater than
+   * `reconnectInterval`, the reconnect delay grows exponentially
+   * (interval, ×2, ×4, …) capped at this value, and resets to the base
+   * interval once a connection succeeds. When unset the delay stays fixed
+   * at `reconnectInterval` (backward-compatible default).
+   */
+  maxReconnectInterval?: number;
+  /**
    * When false the hook keeps the socket closed (and closes an open one).
    * Lets a parent toggle realtime updates on/off without unmounting.
    */
@@ -36,6 +44,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     onError,
     autoReconnect = true,
     reconnectInterval = 3000,
+    maxReconnectInterval,
     enabled = true,
   } = options;
 
@@ -43,6 +52,9 @@ export function useWebSocket(options: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldConnectRef = useRef(true);
+  // Number of consecutive failed connects — drives exponential backoff.
+  // Reset to 0 on a successful open or an explicit (re)connect.
+  const reconnectAttemptsRef = useRef(0);
 
   // Keep the latest callbacks/config in refs. The WebSocket lifecycle must NOT
   // restart just because a parent re-rendered with new callback identities —
@@ -54,6 +66,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
   const onErrorRef = useRef(onError);
   const autoReconnectRef = useRef(autoReconnect);
   const reconnectIntervalRef = useRef(reconnectInterval);
+  const maxReconnectIntervalRef = useRef(maxReconnectInterval);
 
   useEffect(() => {
     onMessageRef.current = onMessage;
@@ -62,6 +75,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     onErrorRef.current = onError;
     autoReconnectRef.current = autoReconnect;
     reconnectIntervalRef.current = reconnectInterval;
+    maxReconnectIntervalRef.current = maxReconnectInterval;
   });
 
   const connect = useCallback(() => {
@@ -77,6 +91,8 @@ export function useWebSocket(options: UseWebSocketOptions) {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
+        // A clean connection resets the backoff ladder.
+        reconnectAttemptsRef.current = 0;
         setStatus(WebSocketStatus.CONNECTED);
         onOpenRef.current?.();
       };
@@ -94,11 +110,21 @@ export function useWebSocket(options: UseWebSocketOptions) {
         setStatus(WebSocketStatus.DISCONNECTED);
         onCloseRef.current?.();
 
-        // Auto-reconnect if enabled and component is still mounted
+        // Auto-reconnect if enabled and component is still mounted.
+        // With `maxReconnectInterval` set the delay grows exponentially
+        // (base, ×2, ×4, …) capped at the max; otherwise it stays fixed.
         if (autoReconnectRef.current && shouldConnectRef.current) {
+          const base = reconnectIntervalRef.current;
+          const max = maxReconnectIntervalRef.current;
+          const attempt = reconnectAttemptsRef.current;
+          const delay =
+            max && max > base
+              ? Math.min(base * 2 ** attempt, max)
+              : base;
+          reconnectAttemptsRef.current = attempt + 1;
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
-          }, reconnectIntervalRef.current);
+          }, delay);
         }
       };
 
@@ -116,6 +142,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
 
   const disconnect = useCallback(() => {
     shouldConnectRef.current = false;
+    reconnectAttemptsRef.current = 0;
 
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
