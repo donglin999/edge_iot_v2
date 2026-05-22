@@ -118,6 +118,12 @@ class Alarm(TimeStampedModel):
     rule = models.ForeignKey(AlarmRule, on_delete=models.CASCADE, related_name="alarms")
     session = models.ForeignKey(AcquisitionSession, on_delete=models.CASCADE,
                                  related_name="alarms", null=True, blank=True)
+    # M4 (distributed): set on alarms the center received via an ``alarm_event``
+    # uplink frame — identifies which edge gateway locally triggered the
+    # alarm. Null for monolith / center-local alarms. Soft FK string target
+    # so ``acquisition`` keeps no import-time dependency on ``fleet``.
+    edge = models.ForeignKey("fleet.EdgeNode", on_delete=models.SET_NULL,
+                             related_name="alarms", null=True, blank=True)
     point_code = models.CharField(max_length=128)
     device_code = models.CharField(max_length=255, blank=True)
     value = models.JSONField()
@@ -136,4 +142,7 @@ class Alarm(TimeStampedModel):
             # M3: composite index for "active alarms of a point" lookups
             # (filter by point_code + status together).
             models.Index(fields=["point_code", "status"], name="alarm_point_status_idx"),
+            # M4: "alarms reported by edge X, newest first" for the
+            # /alarms center page filtered by source edge.
+            models.Index(fields=["edge", "-fired_at"], name="alarm_edge_fired_idx"),
         ]

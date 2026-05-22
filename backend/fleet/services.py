@@ -71,6 +71,27 @@ def _serialize_device(device: Device) -> Dict[str, Any]:
     }
 
 
+def _serialize_alarm_rule(rule) -> Dict[str, Any]:
+    """Shape one ``acquisition.AlarmRule`` row for the ``apply_config`` wire.
+
+    The pk is carried verbatim so the edge mirrors the rule under the same
+    primary key the center uses — that keeps ``alarm_event.rule_id`` stable
+    across both sides.
+    """
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "point_code": rule.point_code,
+        "device_code": rule.device_code or "",
+        "operator": rule.operator,
+        "threshold": rule.threshold,
+        "threshold_high": rule.threshold_high,
+        "severity": rule.severity,
+        "is_active": bool(rule.is_active),
+        "description": rule.description or "",
+    }
+
+
 def _serialize_point(point: Point) -> Dict[str, Any]:
     tpl = point.template
     return {
@@ -130,7 +151,23 @@ def build_apply_config_payload(edge: EdgeNode, *, version: int) -> Dict[str, Any
         tasks=tasks_payload,
         devices=devices_payload,
         points=points_payload,
+        alarm_rules=_active_alarm_rules_payload(),
     )
+
+
+def _active_alarm_rules_payload() -> List[Dict[str, Any]]:
+    """All currently-active alarm rules, shaped for ``apply_config`` (M4).
+
+    Rules are global (not edge-scoped) — every edge gets the full active
+    set and only fires on the points it actually owns, since the shared
+    ``evaluate_readings`` already filters by ``point_code`` / ``device_code``.
+    Sending only the *active* rules means a deactivated or deleted rule
+    drops out of the snapshot and the edge culls it on the next apply.
+    """
+    from acquisition.models import AlarmRule  # lazy: avoid app-load ordering
+
+    rules = AlarmRule.objects.filter(is_active=True).order_by("id")
+    return [_serialize_alarm_rule(r) for r in rules]
 
 
 def reconcile_assignments(edge: EdgeNode) -> Tuple[int, List[EdgeAssignment]]:
@@ -219,9 +256,38 @@ def sync_assignments(edge: EdgeNode) -> Dict[str, Any]:
         "assignment_count": len(assignments),
         "device_count": len(frame["devices"]),
         "point_count": len(frame["points"]),
+        "alarm_rule_count": len(frame.get("alarm_rules") or []),
         "delivered": delivered,
         "frame": frame,
     }
+
+
+def sync_alarm_rules_to_edges() -> List[Dict[str, Any]]:
+    """Re-push ``apply_config`` (carrying the latest alarm rules) to every edge.
+
+    Called from the :mod:`fleet.signals` handler whenever an ``AlarmRule`` is
+    created, updated, or deleted at the center. Each online edge gets a fresh
+    snapshot so a threshold change takes effect without an operator manually
+    re-syncing. Offline edges are skipped — they pick up the new rules from
+    the snapshot the center re-pushes on their next register.
+
+    Reuses :func:`sync_assignments` (the M2 sync path): the assignment
+    reconcile is idempotent for an unchanged task set, so the only material
+    change in the re-pushed frame is the ``alarm_rules`` array.
+    """
+    edges = list(EdgeNode.objects.filter(status=EdgeStatus.ONLINE))
+    results: List[Dict[str, Any]] = []
+    for edge in edges:
+        try:
+            summary = sync_assignments(edge)
+            results.append(summary)
+        except Exception:  # noqa: BLE001
+            logger.exception("fleet: alarm-rule re-sync failed for edge=%s", edge.name)
+    if results:
+        logger.info(
+            "fleet: alarm rules re-synced to %d online edge(s)", len(results)
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------

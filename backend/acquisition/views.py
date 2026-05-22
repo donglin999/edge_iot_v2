@@ -926,13 +926,17 @@ class AlarmRuleSerializer(drf_serializers.ModelSerializer):
 class AlarmSerializer(drf_serializers.ModelSerializer):
     rule_name = drf_serializers.CharField(source="rule.name", read_only=True)
     severity = drf_serializers.CharField(source="rule.severity", read_only=True)
+    # M4: source edge name for distributed alarms (null for center-local).
+    edge_name = drf_serializers.CharField(
+        source="edge.name", read_only=True, allow_null=True, default=None,
+    )
 
     class Meta:
         model = acq_models.Alarm
         fields = "__all__"
         read_only_fields = (
             "id", "fired_at", "created_at", "updated_at",
-            "rule_name", "severity",
+            "rule_name", "severity", "edge_name",
         )
 
 
@@ -946,7 +950,7 @@ class AlarmViewSet(mixins.ListModelMixin,
                    mixins.RetrieveModelMixin,
                    viewsets.GenericViewSet):
     """List + acknowledge alarms (acked / cleared transitions)."""
-    queryset = acq_models.Alarm.objects.select_related("rule", "session__task")
+    queryset = acq_models.Alarm.objects.select_related("rule", "session__task", "edge")
     serializer_class = AlarmSerializer
 
     def get_queryset(self):
@@ -954,6 +958,10 @@ class AlarmViewSet(mixins.ListModelMixin,
         status_param = self.request.query_params.get("status")
         if status_param:
             qs = qs.filter(status=status_param)
+        # M4: filter the /alarms center page by source edge.
+        edge_param = self.request.query_params.get("edge")
+        if edge_param:
+            qs = qs.filter(edge_id=edge_param)
         return qs
 
     @action(detail=True, methods=["post"], url_path="ack")

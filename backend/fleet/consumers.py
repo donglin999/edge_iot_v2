@@ -44,9 +44,11 @@ from .models import (
 )
 from .protocol import (
     ACCEPTED_PROTOCOL_VERSIONS,
+    ALARM_STATES,
     ERROR_AUTH,
     ERROR_BAD_FRAME,
     ERROR_UNKNOWN_EDGE,
+    FRAME_ALARM_EVENT,
     FRAME_CONFIG_APPLIED,
     FRAME_HEARTBEAT,
     FRAME_LIFECYCLE,
@@ -198,6 +200,8 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             await self._handle_lifecycle(content)
         elif frame_type == FRAME_SAMPLE_BATCH:
             await self._handle_sample_batch(content)
+        elif frame_type == FRAME_ALARM_EVENT:
+            await self._handle_alarm_event(content)
         else:
             await self._fail(ERROR_BAD_FRAME, f"unknown frame type: {frame_type!r}", CLOSE_BAD_FRAME)
 
@@ -334,6 +338,44 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         window_end = _parse_ts(frame.get("window_end"))
         await self._record_sample_batch(self.edge_id, seq, task_id, task_code, samples, window_end)
         await self.send_json(make_ack(ref=FRAME_SAMPLE_BATCH))
+
+    async def _handle_alarm_event(self, frame: dict) -> None:
+        """v0.4: an edge-triggered alarm carrying ``monotonic_seq``."""
+        if self.edge_id is None:
+            await self._fail(ERROR_BAD_FRAME, "alarm_event before register", CLOSE_BAD_FRAME)
+            return
+        try:
+            seq = int(frame.get("monotonic_seq"))
+        except (TypeError, ValueError):
+            await self._fail(ERROR_BAD_FRAME, "alarm_event missing/invalid monotonic_seq", CLOSE_BAD_FRAME)
+            return
+        if seq <= 0:
+            await self._fail(ERROR_BAD_FRAME, "alarm_event monotonic_seq must be >= 1", CLOSE_BAD_FRAME)
+            return
+        try:
+            rule_id = int(frame.get("rule_id"))
+        except (TypeError, ValueError):
+            await self._fail(ERROR_BAD_FRAME, "alarm_event missing/invalid rule_id", CLOSE_BAD_FRAME)
+            return
+        point_code = frame.get("point_code")
+        if not isinstance(point_code, str) or not point_code:
+            await self._fail(ERROR_BAD_FRAME, "alarm_event missing point_code", CLOSE_BAD_FRAME)
+            return
+        status = frame.get("status") or "firing"
+        if status not in ALARM_STATES:
+            await self._fail(ERROR_BAD_FRAME, f"alarm_event bad status: {status!r}", CLOSE_BAD_FRAME)
+            return
+        await self._record_alarm_event(
+            self.edge_id,
+            seq,
+            rule_id,
+            point_code,
+            str(frame.get("device_code") or ""),
+            frame.get("value"),
+            str(frame.get("message") or ""),
+            status,
+        )
+        await self.send_json(make_ack(ref=FRAME_ALARM_EVENT))
 
     # ---- channel-layer fan-out -------------------------------------------
 
@@ -570,6 +612,87 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             edge_pk, task_code or task_id, seq, len(samples), written,
         )
         return written
+
+    @database_sync_to_async
+    def _record_alarm_event(
+        self,
+        edge_pk: int,
+        seq: int,
+        rule_id: int,
+        point_code: str,
+        device_code: str,
+        value,
+        message: str,
+        status: str,
+    ) -> int:
+        """Persist an inbound ``alarm_event`` into the center alarm table.
+
+        Reuses ``acquisition.Alarm`` with the ``edge`` FK set so the center
+        ``/alarms`` page can show which edge gateway triggered the alarm.
+        Returns the created ``Alarm.pk``, or 0 on a dropped duplicate /
+        unknown-rule frame.
+        """
+        from acquisition.models import Alarm, AlarmRule
+        from django.db import transaction
+
+        with transaction.atomic():
+            edge = EdgeNode.objects.select_for_update().get(pk=edge_pk)
+            verdict = self._classify_and_log_seq(edge, seq, "alarm_event")
+            if verdict == UPLINK_SEQ_DUPLICATE:
+                logger.debug(
+                    "fleet: alarm_event duplicate seq=%s edge=%s — dropping",
+                    seq, edge.name,
+                )
+                return 0
+
+            rule = AlarmRule.objects.filter(pk=rule_id).first()
+            alarm_pk = 0
+            if rule is None:
+                # Rule deleted center-side between the edge firing and us
+                # receiving — drop the alarm but still advance the stream.
+                logger.info(
+                    "fleet: alarm_event for unknown rule_id=%s edge=%s — "
+                    "dropped, seq still advanced",
+                    rule_id, edge.name,
+                )
+            elif status == "firing":
+                # Idempotent: one open (rule, edge, point) alarm at a time.
+                # A redelivered frame or an edge restart re-firing the same
+                # condition must not pile up duplicate rows.
+                existing = Alarm.objects.filter(
+                    rule=rule,
+                    edge=edge,
+                    point_code=point_code,
+                    device_code=device_code,
+                    status=Alarm.STATUS_FIRING,
+                ).first()
+                if existing is None:
+                    alarm = Alarm.objects.create(
+                        rule=rule,
+                        edge=edge,
+                        session=None,
+                        point_code=point_code,
+                        device_code=device_code,
+                        value=value,
+                        message=message,
+                        status=Alarm.STATUS_FIRING,
+                    )
+                    alarm_pk = alarm.pk
+                else:
+                    alarm_pk = existing.pk
+                    logger.debug(
+                        "fleet: alarm_event already open edge=%s rule=%s point=%s",
+                        edge.name, rule_id, point_code,
+                    )
+
+            edge.last_uplink_seq = seq
+            edge.save(update_fields=["last_uplink_seq", "updated_at"])
+
+        logger.info(
+            "fleet: alarm_event edge=%s rule=%s point=%s value=%s seq=%s alarm=%s",
+            edge_pk, rule_id, point_code, value, seq, alarm_pk or "-",
+        )
+        return alarm_pk
 
     @staticmethod
     def _mirror_samples_to_influx(edge_pk, task_code, samples, window_end) -> None:
