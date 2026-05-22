@@ -213,7 +213,12 @@ class TestM2DeleteOwnedTasks:
             delete_owned_tasks(sender=config_models.Device, instance=device)
         # 2 lookups + delete machinery; an N+1 would add one .exists() per
         # task (5+ extra). Allow headroom for the cascade delete statements.
-        assert counter.count <= 10, f"too many queries: {counter.count}"
+        # Distributed-M3 (XIU-63) added two SET_NULL FKs to AcqTask
+        # (EdgeLifecycleEvent.task / EdgeSample.task), so the cascade now
+        # issues two extra bulk UPDATE statements. That cost is *constant*
+        # (verified flat at n=5/30/100), so the "not N+1" guarantee still
+        # holds — the threshold is bumped 10 -> 14 to absorb the new FKs.
+        assert counter.count <= 14, f"too many queries: {counter.count}"
 
 
 class _QueryCounter:
