@@ -42,9 +42,11 @@ existing field's meaning. The M1/M2/M3 public contract is preserved:
     re-sending from its durable outbox after a reconnect.
   A v0.4 peer ignores every one of these fields.
 
-  v0.5 does **not** change the meaning of any existing field. In
-  particular `alarm_event.status` still only takes `firing` from the edge;
-  `cleared` remains reserved (a later milestone).
+  v0.5 also **lights up** `alarm_event.status: "cleared"` — the field has
+  been on the wire (reserved) since v0.4, so this is not a frame change.
+  The edge now emits an `alarm_event` on a clear transition as well as a
+  fire; the center closes the matching open `Alarm`. No existing field
+  changes meaning.
 
 | frame            | direction        | version | purpose                                       |
 |------------------|------------------|---------|-----------------------------------------------|
@@ -313,7 +315,7 @@ fire transition its local `AlarmSink` detects.
 | `device_code`   | string        | no       | Device the point belongs to; `""` if rule is device-agnostic.|
 | `value`         | number/bool/str | yes    | The breaching value (engineering units).                     |
 | `severity`      | string        | no       | `info` / `warning` / `critical`; mirrors the rule.           |
-| `status`        | string        | no       | `firing` (default). `cleared` is reserved for M5.            |
+| `status`        | string        | no       | `firing` (default) or `cleared` — both emitted since v0.5.   |
 | `message`       | string        | no       | Human-readable alarm text.                                   |
 | `fired_at`      | string        | no       | Edge wall-clock ISO-8601 UTC; informational.                 |
 

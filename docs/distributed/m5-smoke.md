@@ -1,6 +1,6 @@
 # M5 smoke test — 离线降级 + 断线回补 + outbox 持久化
 
-End-to-end verification for the M5 milestone ([XIU-71]). Extends the M3/M4
+End-to-end verification for the M5 milestone ([XIU-72]). Extends the M3/M4
 smoke runbooks (`m3-smoke.md`, `m4-smoke.md`): M3 proved the online uplink
 stream, M4 the alarm channel. M5 proves the edge survives the **center
 being unreachable for ≥ 1 h** — including an **edge-agent restart mid
@@ -20,20 +20,25 @@ the uplink rate (`EDGE_UPLINK_SAMPLE_WINDOW=0.1`) — 10 min of wall clock
 at 10 Hz buffers the same frame count as 1 h at the spec'd 1 Hz, while
 also exercising the durable-outbox depth.
 
-## Option A — scripted (recommended)
+## Option A — scripted (recommended, no Docker)
 
-`scripts/chaos_offline_backfill.py` automates steps 1–9 below: it brings
-the stack up, registers an edge, pushes a Modbus task + an alarm rule,
-stops the center container, restarts the edge-agent mid-outage, restores
-the center, then asserts zero-loss / zero-duplicate on the center side.
+`scripts/chaos_offline_backfill.py` drives the *real* durable outbox
+(`edge_agent.outbox.DurableOutbox`) through a center outage and asserts the
+zero-loss guarantee — no Docker, no Redis, runs in seconds, CI-friendly.
+The wall-clock hour is modelled by the frame count produced while offline.
 
 ```bash
-python3 scripts/chaos_offline_backfill.py --offline-seconds 120 --restart-edge
+python3 scripts/chaos_offline_backfill.py                       # all scenarios
+python3 scripts/chaos_offline_backfill.py --scenario restart    # one scenario
+python3 scripts/chaos_offline_backfill.py --outage-frames 7200  # ~2 h @ 1 Hz
 ```
 
-Exit code `0` = PASS. The script prints a per-stream
-(`lifecycle` / `sample_batch` / `alarm_event`) reconciliation table. Use
-Option B below to run / inspect the steps by hand.
+Exit code `0` = PASS. It covers three scenarios: **long** (outage →
+backfill → resume, zero loss / contiguous seq), **restart** (short
+<100-frame session, edge-agent restarts mid-outage — the M3 short-restart
+gap), and **overflow** (outage past the buffer cap — bounded, drops oldest,
+one signalled gap). The Docker steps below are the manual QA回归 for the
+real 1-hour outage.
 
 ## 1. Start the center
 
@@ -193,7 +198,7 @@ docker compose -f docker-compose.center.yml down
 
 ## Last verified
 
-Unit suites green on branch `distributed/m5-offline` ([XIU-71]):
+Unit suites green on branch `distributed/m5-offline` ([XIU-72]):
 backend `tests/test_fleet_m5.py` + `test_fleet*` 68 passed,
 `tests/` acquisition/alarm 100 passed (1 pre-existing Redis env-skip);
 edge-agent suite 68 passed (incl. new `test_outbox.py` /
@@ -201,4 +206,4 @@ edge-agent suite 68 passed (incl. new `test_outbox.py` /
 QA回归 checklist — to be run by the test engineer before integration
 review (same as M3 [XIU-65] / M4 [XIU-69]).
 
-[XIU-71]: ../../  "distributed M5 offline + backfill"
+[XIU-72]: ../../  "distributed M5 offline + backfill"
