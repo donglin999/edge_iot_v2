@@ -22,7 +22,7 @@ import json
 import logging
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -48,6 +48,9 @@ class CachedConfig:
     tasks: List[Dict[str, Any]]
     devices: List[Dict[str, Any]]
     points: List[Dict[str, Any]]
+    # v0.4 (M4): threshold rules the edge evaluates locally. Optional on
+    # the wire — a v0.3 center omits it and this stays an empty list.
+    alarm_rules: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def task_ids(self) -> List[int]:
@@ -137,13 +140,17 @@ def parse_apply_config(frame: Dict[str, Any]) -> CachedConfig:
     tasks = frame.get("tasks") or []
     devices = frame.get("devices") or []
     points = frame.get("points") or []
+    alarm_rules = frame.get("alarm_rules") or []
     if not isinstance(tasks, list) or not isinstance(devices, list) or not isinstance(points, list):
         raise ValueError("tasks/devices/points must be lists")
+    if not isinstance(alarm_rules, list):
+        raise ValueError("alarm_rules must be a list")
     return CachedConfig(
         version=version,
         tasks=list(tasks),
         devices=list(devices),
         points=list(points),
+        alarm_rules=list(alarm_rules),
     )
 
 
@@ -166,6 +173,7 @@ def persist_to_orm(cached: CachedConfig) -> None:
     """
     from django.db import transaction
 
+    from acquisition.models import AlarmRule
     from configuration.models import (
         AcqTask,
         Device,
@@ -253,8 +261,32 @@ def persist_to_orm(cached: CachedConfig) -> None:
             for pid in wanted_point_ids - existing:
                 TaskPoint.objects.create(task=obj, point_id=pid)
 
+        # --- alarm rules (M4) -------------------------------------------
+        # The center mirrors every active threshold rule to the edge under
+        # the same pk so ``alarm_event.rule_id`` is stable across both
+        # sides. The local AlarmSink evaluates these in-process.
+        keep_rule_ids: List[int] = []
+        for rule in cached.alarm_rules:
+            obj, _ = AlarmRule.objects.update_or_create(
+                pk=int(rule["id"]),
+                defaults={
+                    "name": str(rule.get("name") or f"rule-{rule['id']}"),
+                    "point_code": str(rule.get("point_code") or ""),
+                    "device_code": str(rule.get("device_code") or ""),
+                    "operator": str(rule.get("operator") or "gt"),
+                    "threshold": rule.get("threshold"),
+                    "threshold_high": rule.get("threshold_high"),
+                    "severity": str(rule.get("severity") or "warning"),
+                    "is_active": bool(rule.get("is_active", True)),
+                    "description": str(rule.get("description") or ""),
+                },
+            )
+            keep_rule_ids.append(obj.pk)
+
         # --- cull anything not in the snapshot --------------------------
         AcqTask.objects.exclude(pk__in=keep_task_ids).delete()
+        # Drop rules the center no longer sends (deleted / deactivated).
+        AlarmRule.objects.exclude(pk__in=keep_rule_ids).delete()
         # Points/devices may still be referenced by other (now-deleted)
         # task rows, but with the snapshot being authoritative we drop
         # those too. Devices keep their (site, code) keys stable, so

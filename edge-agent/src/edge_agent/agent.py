@@ -38,6 +38,7 @@ from .protocol import (
     FRAME_ERROR,
     LIFECYCLE_SESSION_ONLINE,
     PROTOCOL_VERSION,
+    make_alarm_event,
     make_config_applied,
     make_heartbeat,
     make_lifecycle,
@@ -115,6 +116,7 @@ class EdgeAgent:
         self._uplink_lock = threading.Lock()
         self._uplink_seq = 0
         self._sample_hook_registered = False
+        self._alarm_hook_registered = False
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -169,12 +171,16 @@ class EdgeAgent:
         finally:
             # Drop the uplink hook so a stopped agent stops feeding the
             # (now-dead) outbox from any lingering WebSocketSink thread.
-            if self._sample_hook_registered:
+            if self._sample_hook_registered or self._alarm_hook_registered:
                 with suppress(Exception):
                     from acquisition.services import uplink as acq_uplink
 
-                    acq_uplink.clear_sample_hook()
+                    if self._sample_hook_registered:
+                        acq_uplink.clear_sample_hook()
+                    if self._alarm_hook_registered:
+                        acq_uplink.clear_alarm_hook()
                 self._sample_hook_registered = False
+                self._alarm_hook_registered = False
             # Stop task threads off the loop thread — TaskRunner.stop()
             # flips AcquisitionSession rows (sync ORM).
             if self._runner is not None:
@@ -310,6 +316,7 @@ class EdgeAgent:
             if self._runner is None:
                 self._runner = TaskRunner(on_state=self._emit_task_state)
             self._register_sample_hook()
+            self._register_alarm_hook()
         except Exception:  # noqa: BLE001
             logger.exception(
                 "edge-agent runtime bootstrap failed — control-plane will "
@@ -337,6 +344,23 @@ class EdgeAgent:
             )
         except Exception:  # noqa: BLE001
             logger.exception("edge-agent: could not register sample uplink hook")
+
+    def _register_alarm_hook(self) -> None:
+        """Wire the acquisition AlarmSink's fire events into the uplink (M4).
+
+        The local AlarmSink evaluates the threshold rules pushed via
+        ``apply_config``; each fired alarm is relayed here and shipped to
+        the center as a v0.4 ``alarm_event`` frame. Importable only after
+        ``ensure_setup`` has put ``backend`` on ``sys.path``.
+        """
+        try:
+            from acquisition.services import uplink as acq_uplink
+
+            acq_uplink.register_alarm_hook(self._on_alarm_event)
+            self._alarm_hook_registered = True
+            logger.info("edge-agent: alarm uplink enabled")
+        except Exception:  # noqa: BLE001
+            logger.exception("edge-agent: could not register alarm uplink hook")
 
     def _replay_cached_config(self) -> None:
         """Re-import the last persisted apply_config snapshot on cold start."""
@@ -476,6 +500,27 @@ class EdgeAgent:
             samples=list(window.samples),
             window_start=window.window_start,
             window_end=window.window_end,
+        ))
+
+    def _on_alarm_event(self, event) -> None:
+        """Alarm-uplink hook — runs on the AlarmSink writer thread.
+
+        ``event`` is an ``acquisition.services.uplink.AlarmEvent``. We ship
+        one ``alarm_event`` frame per fired alarm, carrying a ``monotonic_seq``
+        from the same per-process counter the lifecycle / sample_batch
+        frames use (M3 uplink stream semantics).
+        """
+        self._enqueue_uplink(lambda seq: make_alarm_event(
+            edge_id=self.config.edge_id,
+            monotonic_seq=seq,
+            rule_id=int(event.rule_id),
+            point_code=str(event.point_code),
+            device_code=str(event.device_code or ""),
+            value=event.value,
+            severity=str(event.severity or "warning"),
+            status=str(event.status or "firing"),
+            message=str(event.message or ""),
+            fired_at=event.fired_at,
         ))
 
     def _enqueue_uplink(self, build_frame: Callable[[int], dict]) -> None:

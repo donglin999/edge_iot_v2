@@ -40,10 +40,33 @@ class SampleWindow:
     samples: List[Dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class AlarmEvent:
+    """One locally-triggered alarm, ready for an ``alarm_event`` uplink frame.
+
+    Built by :class:`~acquisition.services.sinks.AlarmSink` from the
+    :class:`~acquisition.models.Alarm` row that :func:`evaluate_readings`
+    just created, so the edge-agent can relay it to the center without a
+    second ORM read. ``rule_id`` is the center-side ``AlarmRule.pk`` (rules
+    are mirrored to the edge under the same pk via ``apply_config``).
+    """
+
+    rule_id: int
+    point_code: str
+    device_code: str
+    value: Any
+    severity: str = "warning"
+    status: str = "firing"
+    message: str = ""
+    fired_at: Optional[str] = None
+
+
 SampleHook = Callable[[SampleWindow], None]
+AlarmHook = Callable[[AlarmEvent], None]
 
 _lock = threading.Lock()
 _sample_hook: Optional[SampleHook] = None
+_alarm_hook: Optional[AlarmHook] = None
 
 
 def register_sample_hook(hook: SampleHook) -> None:
@@ -85,3 +108,50 @@ def emit_sample_window(window: SampleWindow) -> None:
         hook(window)
     except Exception:  # noqa: BLE001
         logger.exception("acquisition uplink: sample hook raised — dropping window")
+
+
+# --- alarm uplink (M4) ------------------------------------------------------
+
+
+def register_alarm_hook(hook: AlarmHook) -> None:
+    """Install the process-global alarm-event callback (edge deployments).
+
+    Replaces any previous hook. The :class:`AlarmSink` calls
+    :func:`emit_alarm` for every alarm :func:`evaluate_readings` fires; on
+    an edge gateway the edge-agent registers a hook here that relays the
+    event to the center as a v0.4 ``alarm_event`` frame. In a monolith
+    nothing registers, so :func:`emit_alarm` stays a cheap no-op.
+    """
+    global _alarm_hook
+    with _lock:
+        _alarm_hook = hook
+    logger.info("acquisition uplink: alarm hook registered (%r)", hook)
+
+
+def clear_alarm_hook() -> None:
+    """Remove the alarm-event callback — emits become no-ops again."""
+    global _alarm_hook
+    with _lock:
+        _alarm_hook = None
+
+
+def has_alarm_hook() -> bool:
+    with _lock:
+        return _alarm_hook is not None
+
+
+def emit_alarm(event: AlarmEvent) -> None:
+    """Forward one triggered alarm to the registered hook, if any.
+
+    A missing hook (monolith deployment) is the common case and returns
+    immediately. Any error raised by the hook is swallowed and logged —
+    the uplink is best-effort and MUST NOT break local alarm evaluation.
+    """
+    with _lock:
+        hook = _alarm_hook
+    if hook is None:
+        return
+    try:
+        hook(event)
+    except Exception:  # noqa: BLE001
+        logger.exception("acquisition uplink: alarm hook raised — dropping event")

@@ -458,7 +458,12 @@ class AlarmSink(Sink):
         try:
             from .alarms import evaluate_readings
 
-            evaluate_readings(self.session, meta["device_code"], adapter)
+            fired = evaluate_readings(self.session, meta["device_code"], adapter)
+            # M4 (distributed): relay every freshly-fired alarm up the
+            # uplink hook. No-op in a monolith (no hook registered); on an
+            # edge the edge-agent ships each as an ``alarm_event`` frame.
+            if fired:
+                self._emit_alarm_events(fired)
         except Exception as exc:  # noqa: BLE001
             logger.warning("AlarmSink evaluate failed: %s", exc)
         finally:
@@ -471,6 +476,33 @@ class AlarmSink(Sink):
                 connection.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    @staticmethod
+    def _emit_alarm_events(fired) -> None:
+        """Relay freshly-fired alarms to the optional uplink hook (M4).
+
+        Best-effort and isolated from evaluation: a hook failure must not
+        affect the local ``Alarm`` rows ``evaluate_readings`` already wrote.
+        """
+        from . import uplink
+
+        if not uplink.has_alarm_hook():
+            return
+        for alarm in fired:
+            try:
+                rule = alarm.rule
+                uplink.emit_alarm(uplink.AlarmEvent(
+                    rule_id=alarm.rule_id,
+                    point_code=alarm.point_code,
+                    device_code=alarm.device_code or "",
+                    value=alarm.value,
+                    severity=getattr(rule, "severity", "warning"),
+                    status=alarm.status,
+                    message=alarm.message or "",
+                    fired_at=alarm.fired_at.isoformat() if alarm.fired_at else None,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("AlarmSink alarm uplink failed: %s", exc)
 
     # --------------------------------------------------------------- lifecycle
     def flush(self) -> None:
