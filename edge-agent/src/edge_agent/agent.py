@@ -110,50 +110,59 @@ class EdgeAgent:
     # ---- lifecycle ---------------------------------------------------------
 
     def stop(self) -> None:
+        # Only flip the stop flag here — this is called from the signal
+        # handler, which runs on the event-loop thread. The task runner's
+        # shutdown touches the sync Django ORM (session rows) and MUST NOT
+        # run on the loop thread; ``run()`` does it in an executor below.
         self._stop.set()
-        if self._runner is not None:
-            try:
-                self._runner.stop_all()
-            except Exception:  # noqa: BLE001
-                logger.exception("runner.stop_all failed during shutdown")
 
     async def run(self) -> None:
         """Top-level loop: connect → run session → reconnect on failure."""
-        self._loop = asyncio.get_running_loop()
-        self._bootstrap_runtime()
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        # Django bootstrap, migrations, and the cached-config replay all
+        # touch the synchronous Django ORM. Running sync ORM on the asyncio
+        # loop thread raises ``SynchronousOnlyOperation`` (XIU-61 defect C),
+        # so every ORM-touching step runs in the default thread-pool
+        # executor instead.
+        await loop.run_in_executor(None, self._bootstrap_runtime)
         # Replay the most recent cached apply_config so power-cycled edges
         # resume acquisition immediately, without waiting for the center.
+        await loop.run_in_executor(None, self._replay_cached_config)
+
         try:
-            self._replay_cached_config()
-        except Exception:  # noqa: BLE001
-            logger.exception("replay cached config failed — continuing")
+            while not self._stop.is_set():
+                try:
+                    ws = await self._connect(self.config.center_url)
+                except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
+                    delay = self._backoff.next()
+                    logger.warning("connect failed (%s); retry in %.0fs", exc, delay)
+                    await self._sleep(delay)
+                    continue
 
-        while not self._stop.is_set():
-            try:
-                ws = await self._connect(self.config.center_url)
-            except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
+                self._current_ws = ws
+                try:
+                    await self._run_session(ws)
+                except ConnectionClosed as exc:
+                    logger.warning("connection closed by peer: code=%s reason=%s", exc.code, exc.reason)
+                except Exception:
+                    logger.exception("session crashed")
+                finally:
+                    self._current_ws = None
+                    with suppress(Exception):
+                        await ws.close()
+
+                if self._stop.is_set():
+                    break
                 delay = self._backoff.next()
-                logger.warning("connect failed (%s); retry in %.0fs", exc, delay)
+                logger.info("reconnecting in %.0fs", delay)
                 await self._sleep(delay)
-                continue
-
-            self._current_ws = ws
-            try:
-                await self._run_session(ws)
-            except ConnectionClosed as exc:
-                logger.warning("connection closed by peer: code=%s reason=%s", exc.code, exc.reason)
-            except Exception:
-                logger.exception("session crashed")
-            finally:
-                self._current_ws = None
+        finally:
+            # Stop task threads off the loop thread — TaskRunner.stop()
+            # flips AcquisitionSession rows (sync ORM).
+            if self._runner is not None:
                 with suppress(Exception):
-                    await ws.close()
-
-            if self._stop.is_set():
-                break
-            delay = self._backoff.next()
-            logger.info("reconnecting in %.0fs", delay)
-            await self._sleep(delay)
+                    await loop.run_in_executor(None, self._runner.stop_all)
 
     # ---- session -----------------------------------------------------------
 
@@ -305,11 +314,34 @@ class EdgeAgent:
             self._runner.reconcile(cached.task_ids)
 
     async def _handle_apply_config(self, frame: dict) -> None:
-        """Persist a fresh apply_config snapshot and reconcile runners."""
+        """Persist a fresh apply_config snapshot and reconcile runners.
+
+        The actual work — ``apply_frame`` (Django ORM writes) and
+        ``runner.reconcile`` (spawns task threads, also ORM) — is sync and
+        MUST NOT run on the asyncio loop thread, so it is dispatched to the
+        thread-pool executor (XIU-61 defect C).
+        """
         if self._state_store is None or self._runner is None:
             logger.error("apply_config received before runtime bootstrap")
+            self.enqueue_frame(
+                make_config_applied(
+                    edge_id=self.config.edge_id,
+                    version=int(frame.get("version") or 0),
+                    status=CONFIG_APPLIED_ERROR,
+                    error="edge runtime not ready (Django bootstrap failed)",
+                )
+            )
             return
 
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._apply_config_blocking, frame)
+
+    def _apply_config_blocking(self, frame: dict) -> None:
+        """Sync body of apply_config handling — runs in a worker thread.
+
+        Enqueues the ``config_applied`` reply onto the thread-safe outbox;
+        the ``_outbox_loop`` coroutine forwards it on the WS.
+        """
         version = frame.get("version")
         from .state import apply_frame
 
@@ -317,20 +349,34 @@ class EdgeAgent:
             cached = apply_frame(self._state_store, frame)
         except Exception as exc:  # noqa: BLE001
             logger.exception("apply_config v=%s failed to persist", version)
-            reply = make_config_applied(
-                edge_id=self.config.edge_id,
-                version=int(version or 0),
-                status=CONFIG_APPLIED_ERROR,
-                error=str(exc),
+            self.enqueue_frame(
+                make_config_applied(
+                    edge_id=self.config.edge_id,
+                    version=int(version or 0),
+                    status=CONFIG_APPLIED_ERROR,
+                    error=str(exc),
+                )
             )
-            self.enqueue_frame(reply)
             return
 
         logger.info(
             "apply_config v=%s: tasks=%d devices=%d points=%d — reconciling runners",
             cached.version, len(cached.tasks), len(cached.devices), len(cached.points),
         )
-        self._runner.reconcile(cached.task_ids)
+        try:
+            self._runner.reconcile(cached.task_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("apply_config v=%s: runner reconcile failed", version)
+            self.enqueue_frame(
+                make_config_applied(
+                    edge_id=self.config.edge_id,
+                    version=cached.version,
+                    status=CONFIG_APPLIED_ERROR,
+                    error=f"reconcile failed: {exc}",
+                )
+            )
+            return
+
         self.enqueue_frame(
             make_config_applied(
                 edge_id=self.config.edge_id,

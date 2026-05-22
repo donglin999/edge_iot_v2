@@ -166,14 +166,59 @@ KAFKA_TOPIC = env.str("KAFKA_TOPIC", default="acquisition_data")
 #
 # M6: the ``acquisition`` logger defaults to INFO (was DEBUG — every read
 # cycle spammed the file). Override per-environment with ACQUISITION_LOG_LEVEL.
-# The file handler is now an AsyncRotatingFileHandler: records are queued and a
+# The file handler is an AsyncRotatingFileHandler: records are queued and a
 # background thread does the disk write + rollover, so logging never blocks an
 # acquisition cycle.
-(BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+#
+# M2 (XIU-59): the log directory is now env-configurable via DJANGO_LOG_DIR.
+# The edge-agent imports ``control_plane.settings`` to run the acquisition
+# pipeline, but mounts the center code read-only (``backend:/opt/backend:ro``)
+# — writing into ``BASE_DIR/logs`` there raises OSError and aborts
+# ``django.setup()``. We therefore (a) let the edge point DJANGO_LOG_DIR at a
+# writable path, and (b) probe writability and gracefully fall back to
+# console-only logging if the directory cannot be written, so importing the
+# settings never crashes on a read-only filesystem.
+LOG_DIR = Path(env.str("DJANGO_LOG_DIR", default=str(BASE_DIR / "logs")))
+
+_file_logging_ok = True
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _probe = LOG_DIR / ".write_probe"
+    _probe.touch()
+    _probe.unlink()
+except OSError:
+    # Read-only mount (edge-agent) or otherwise unwritable — keep console
+    # logging only. The acquisition pipeline still logs to stdout/journald.
+    _file_logging_ok = False
 
 ACQUISITION_LOG_LEVEL = env.str("ACQUISITION_LOG_LEVEL", default="INFO").upper()
 
 _VERBOSE_LOG_FORMAT = "{levelname} {asctime} {module} {process:d} {thread:d} {message}"
+
+# Handler set shared by every logger below — file is included only when the
+# log directory is writable.
+_LOG_HANDLERS = ["console", "file"] if _file_logging_ok else ["console"]
+
+_LOG_HANDLER_DEFS = {
+    "console": {
+        "level": "INFO",
+        "class": "logging.StreamHandler",
+        "formatter": "simple",
+    },
+}
+if _file_logging_ok:
+    _LOG_HANDLER_DEFS["file"] = {
+        "level": "INFO",
+        # Async queue handler — owns its own RotatingFileHandler + listener
+        # thread. The target handler carries the verbose format (fmt/style),
+        # so no "formatter" key is set on the queue handler itself.
+        "class": "control_plane.logging_utils.AsyncRotatingFileHandler",
+        "filename": str(LOG_DIR / "application.log"),
+        "maxBytes": 10485760,
+        "backupCount": 5,
+        "fmt": _VERBOSE_LOG_FORMAT,
+        "style": "{",
+    }
 
 LOGGING = {
     "version": 1,
@@ -188,37 +233,19 @@ LOGGING = {
             "style": "{",
         },
     },
-    "handlers": {
-        "console": {
-            "level": "INFO",
-            "class": "logging.StreamHandler",
-            "formatter": "simple",
-        },
-        "file": {
-            "level": "INFO",
-            # Async queue handler — owns its own RotatingFileHandler + listener
-            # thread. The target handler carries the verbose format (fmt/style),
-            # so no "formatter" key is set on the queue handler itself.
-            "class": "control_plane.logging_utils.AsyncRotatingFileHandler",
-            "filename": str(BASE_DIR / "logs" / "application.log"),
-            "maxBytes": 10485760,
-            "backupCount": 5,
-            "fmt": _VERBOSE_LOG_FORMAT,
-            "style": "{",
-        },
-    },
+    "handlers": _LOG_HANDLER_DEFS,
     "loggers": {
         "django": {
-            "handlers": ["console", "file"],
+            "handlers": _LOG_HANDLERS,
             "level": "INFO",
         },
         "acquisition": {
-            "handlers": ["console", "file"],
+            "handlers": _LOG_HANDLERS,
             "level": ACQUISITION_LOG_LEVEL,
             "propagate": False,
         },
         "storage": {
-            "handlers": ["console", "file"],
+            "handlers": _LOG_HANDLERS,
             "level": "INFO",
             "propagate": False,
         },
@@ -226,18 +253,18 @@ LOGGING = {
         # reply lingers in the socket buffer; the library auto-reconnects and
         # the next read succeeds. Suppress to CRITICAL to keep logs readable.
         "modbus_tk": {
-            "handlers": ["console", "file"],
+            "handlers": _LOG_HANDLERS,
             "level": "CRITICAL",
             "propagate": False,
         },
         "modbus_tcp": {
-            "handlers": ["console", "file"],
+            "handlers": _LOG_HANDLERS,
             "level": "CRITICAL",
             "propagate": False,
         },
     },
     "root": {
-        "handlers": ["console", "file"],
+        "handlers": _LOG_HANDLERS,
         "level": "INFO",
     },
 }

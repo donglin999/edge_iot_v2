@@ -170,6 +170,85 @@ class _StubService:
         return {"status": "completed"}
 
 
+@pytest.mark.asyncio
+async def test_handle_apply_config_real_orm_no_async_violation(django_edge):
+    """Regression for XIU-61 defect C — apply_config must not run sync ORM
+    on the asyncio loop thread.
+
+    Uses the *real* EdgeStateStore + TaskRunner (only the AcquisitionService
+    is stubbed) and drives ``_handle_apply_config`` from inside a running
+    event loop. Before the fix this raised
+    ``django.core.exceptions.SynchronousOnlyOperation``; after the fix the
+    ORM writes are dispatched to a thread-pool executor and succeed.
+    """
+    from edge_agent.state import EdgeStateStore
+    from configuration.models import AcqTask, Device, Point
+
+    # This test body runs ON the asyncio loop thread, so its own ORM calls
+    # must go through a worker thread too — otherwise the test setup itself
+    # trips the very guard we are checking the production code against.
+    def _clean():
+        AcqTask.objects.all().delete()
+        Device.objects.all().delete()
+        Point.objects.all().delete()
+
+    await asyncio.to_thread(_clean)
+
+    store = EdgeStateStore(django_edge)
+    services: list[_StubService] = []
+
+    def factory(t, session):
+        svc = _StubService(t, session)
+        services.append(svc)
+        return svc
+
+    runner = TaskRunner(on_state=lambda *a: None, service_factory=factory)
+    agent = EdgeAgent(_cfg(), state_store=store, runner=runner)
+
+    try:
+        # The production path: _handle_apply_config dispatches the sync ORM
+        # work to an executor. If it ran ORM on the loop thread this await
+        # would raise SynchronousOnlyOperation.
+        await agent._handle_apply_config(_real_frame(version=1))
+
+        reply = agent._outbox.get_nowait()
+        assert reply["type"] == FRAME_CONFIG_APPLIED
+        assert reply["status"] == "ok", reply
+        assert reply["version"] == 1
+        # Snapshot landed in the ORM and the task runner picked it up.
+        assert await asyncio.to_thread(AcqTask.objects.filter(pk=77).exists)
+        assert runner.running_task_ids() == [77]
+    finally:
+        for svc in services:
+            svc._stop.set()
+        await asyncio.to_thread(runner.stop_all)
+
+
+def _real_frame(version: int = 1) -> dict:
+    """A structurally-complete apply_config frame for ORM persistence."""
+    return {
+        "v": "0.2",
+        "type": "apply_config",
+        "version": version,
+        "tasks": [
+            {"id": 77, "code": "orm-task", "name": "ORM Task",
+             "sample_rate_hz": 1.0, "is_active": True, "point_ids": [701]},
+        ],
+        "devices": [
+            {"id": 70, "code": "orm-dev", "name": "ORM Device",
+             "protocol": "modbus_tcp", "ip_address": "127.0.0.1",
+             "port": 5020, "metadata": {}},
+        ],
+        "points": [
+            {"id": 701, "device_id": 70, "code": "orm-p0", "address": "40001",
+             "sample_rate_hz": 1.0, "extra": {},
+             "template": {"name": "T", "english_name": "t", "unit": "",
+                          "data_type": "uint16", "coefficient": 1.0,
+                          "precision": 0}},
+        ],
+    }
+
+
 def test_runner_reconcile_starts_and_stops(django_edge):
     """TaskRunner.reconcile spawns / stops task threads, emitting states."""
     from configuration.models import AcqTask

@@ -82,6 +82,9 @@ services:
       - DJANGO_SETTINGS_MODULE=control_plane.settings
       - BACKEND_DIR=/opt/backend
       - EDGE_STATE_DB=/var/lib/edge-agent/edge_state.db
+      # The center code is mounted read-only, so its LOGGING must not write
+      # into /opt/backend/logs. Point it at the writable state volume.
+      - DJANGO_LOG_DIR=/var/lib/edge-agent/logs
       - PYTHONPATH=/opt/backend:/app/src
       # --- local InfluxDB the pipeline writes samples into -------------
       - INFLUXDB_HOST=edge-influxdb

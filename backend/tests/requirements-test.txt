@@ -3,3 +3,5 @@ pytest>=7.4.0
 pytest-django>=4.5.2
 pytest-cov>=4.1.0
 pytest-mock>=3.11.1
+# M2 (XIU-59): test_fleet_m2.py has async WS-consumer tests that need this.
+pytest-asyncio>=0.23.0

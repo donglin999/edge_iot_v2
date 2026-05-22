@@ -47,6 +47,12 @@ docker compose -f docker-compose.edge.yml up -d --build
 docker compose -f docker-compose.edge.yml logs -f edge-agent
 ```
 
+> The `/ws/fleet/` endpoint is a machine-to-machine channel authenticated
+> by the activation token, so it is **not** behind Django's
+> `AllowedHostsOriginValidator` — connecting from an arbitrary LAN IP does
+> not require adding that IP to the center's `ALLOWED_HOSTS`. (The
+> browser-facing `/acquisition` operator-UI sockets still are.)
+
 Within a few seconds the edge-agent log shows
 `registered with center as edge=edge-smoke-1` and the `/fleet` page flips
 the edge to `online`.

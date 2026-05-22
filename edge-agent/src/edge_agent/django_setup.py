@@ -44,6 +44,28 @@ def _ensure_backend_on_path() -> None:
         sys.path.insert(0, backend_dir)
 
 
+def _ensure_writable_log_dir(state_db: str) -> None:
+    """Point the center's ``LOGGING`` at a writable directory.
+
+    The center settings writes ``application.log`` into ``DJANGO_LOG_DIR``
+    (default ``BASE_DIR/logs``). On the edge ``BASE_DIR`` is the read-only
+    ``/opt/backend`` mount, so we redirect the log dir next to the
+    edge-side state DB — the same writable volume — unless the operator
+    already set ``DJANGO_LOG_DIR`` explicitly. The center settings also
+    falls back to console-only logging if the dir is unwritable, so this
+    is belt-and-suspenders: it just gives the edge real file logs.
+    """
+    if os.environ.get("DJANGO_LOG_DIR"):
+        return
+    log_dir = Path(state_db).parent / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["DJANGO_LOG_DIR"] = str(log_dir)
+    except OSError:
+        # Leave DJANGO_LOG_DIR unset — settings will fall back to console.
+        logger.warning("edge-agent: could not create log dir %s", log_dir)
+
+
 def ensure_setup(
     *,
     settings_module: str | None = None,
@@ -67,6 +89,11 @@ def ensure_setup(
         # everything else can use those defaults (DEBUG=True, dev secret key).
         chosen_db = _ensure_state_db_path(state_db or _DEFAULT_STATE_DB)
         os.environ["DJANGO_DB_NAME"] = chosen_db
+        # Redirect the center's file logging to a writable dir BEFORE
+        # django.setup() — the center code is mounted read-only on the edge,
+        # so logging into BASE_DIR/logs would abort django.setup() (XIU-61
+        # defect B). Must happen before the settings module is imported.
+        _ensure_writable_log_dir(chosen_db)
         # The center settings parses ALLOWED_HOSTS / SECRET_KEY at import time;
         # nothing else is needed for ORM-only usage. Leave whatever the
         # operator set in the env in place.

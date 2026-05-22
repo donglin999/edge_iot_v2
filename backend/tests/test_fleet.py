@@ -125,9 +125,12 @@ class TestSweepAndAPI:
         data = resp.json()
         if isinstance(data, dict) and "results" in data:
             data = data["results"]
-        assert len(data) == 1
-        assert data[0]["name"] == "alpha"
-        assert data[0]["status"] == "offline"
+        # Filter to the edge this test created rather than asserting a
+        # global count — the file-based test DB is shared across test
+        # modules, so other suites' edges may also be present.
+        alpha = [e for e in data if e["name"] == "alpha"]
+        assert len(alpha) == 1
+        assert alpha[0]["status"] == "offline"
 
     def test_create_endpoint_returns_one_shot_token(self):
         client = APIClient()
@@ -155,7 +158,28 @@ class TestSweepAndAPI:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _inmemory_channel_layer():
+    """Swap the Redis channel layer for an in-memory one for WS tests.
+
+    Since M2 (XIU-59) the FleetConsumer joins a per-edge channel group on
+    register; without this the consumer test would need a live Redis. We
+    reset the cached layer registry so each test gets a fresh layer.
+    """
+    from channels.layers import channel_layers
+
+    original = settings.CHANNEL_LAYERS
+    settings.CHANNEL_LAYERS = {
+        "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
+    }
+    channel_layers.backends = {}
+    yield
+    settings.CHANNEL_LAYERS = original
+    channel_layers.backends = {}
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_inmemory_channel_layer")
 class TestFleetConsumer:
     async def test_register_then_heartbeat_marks_edge_online(self, django_db_blocker):
         from asgiref.sync import sync_to_async
