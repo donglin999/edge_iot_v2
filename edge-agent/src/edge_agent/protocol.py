@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
 
-PROTOCOL_VERSION = "0.3"
+PROTOCOL_VERSION = "0.4"
 
 # --- frame type constants ---------------------------------------------------
 
@@ -25,6 +25,14 @@ FRAME_TASK_STATE = "task_state"
 # v0.3 uplink
 FRAME_LIFECYCLE = "lifecycle"
 FRAME_SAMPLE_BATCH = "sample_batch"
+# v0.4 alarm uplink
+FRAME_ALARM_EVENT = "alarm_event"
+
+# --- v0.4 alarm event states ------------------------------------------------
+
+ALARM_STATE_FIRING = "firing"
+ALARM_STATE_CLEARED = "cleared"
+ALARM_STATES = frozenset({ALARM_STATE_FIRING, ALARM_STATE_CLEARED})
 
 # --- task lifecycle states (edge → center) ---------------------------------
 
@@ -197,4 +205,41 @@ def make_sample_batch(
         "window_start": str(window_start),
         "window_end": str(window_end),
         "samples": list(samples),
+    }
+
+
+def make_alarm_event(
+    *,
+    edge_id: str,
+    monotonic_seq: int,
+    rule_id: int,
+    point_code: str,
+    value: Any,
+    device_code: str = "",
+    severity: str = "warning",
+    status: str = ALARM_STATE_FIRING,
+    message: str = "",
+    fired_at: str | None = None,
+) -> Dict[str, Any]:
+    """Edge → center: a locally-triggered alarm (v0.4).
+
+    ``rule_id`` is the center-side ``AlarmRule.pk`` — rule definitions live
+    at the center and are mirrored to the edge via ``apply_config``, so the
+    pk is stable across both sides and lets the center re-attach the event.
+    """
+    if status not in ALARM_STATES:
+        raise ValueError(f"invalid alarm_event status: {status!r}")
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": FRAME_ALARM_EVENT,
+        "edge_id": edge_id,
+        "monotonic_seq": int(monotonic_seq),
+        "rule_id": int(rule_id),
+        "point_code": str(point_code),
+        "device_code": str(device_code or ""),
+        "value": value,
+        "severity": str(severity or "warning"),
+        "status": status,
+        "message": str(message or ""),
+        "fired_at": fired_at or _utc_now_iso(),
     }

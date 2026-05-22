@@ -4,6 +4,13 @@ Single source of truth for the JSON frames exchanged between the center
 and each `edge-agent` over `/ws/fleet/`. The protocol doc lives in
 ``docs/distributed/protocol.md`` and is authoritative.
 
+v0.4 (M4) adds the alarm channel — a pure increment over v0.3:
+
+- ``apply_config`` now also carries an ``alarm_rules`` array (threshold
+  rules the edge evaluates locally). The field is optional; a v0.3 edge
+  ignores it and a v0.4 center sending to a v0.3 edge is harmless.
+- ``alarm_event`` edge → center  a locally-triggered alarm + ``monotonic_seq``
+
 v0.3 (M3) adds the uplink data channel:
 
 - ``lifecycle``    edge → center  session/task lifecycle event + ``monotonic_seq``
@@ -25,10 +32,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
 
-PROTOCOL_VERSION = "0.3"
+PROTOCOL_VERSION = "0.4"
 # Versions the center is willing to talk to. Add older majors here when
 # an upgrade boundary needs explicit shim support.
-ACCEPTED_PROTOCOL_VERSIONS = frozenset({"0.1", "0.2", "0.3"})
+ACCEPTED_PROTOCOL_VERSIONS = frozenset({"0.1", "0.2", "0.3", "0.4"})
 
 # --- frame type constants ---------------------------------------------------
 
@@ -44,6 +51,8 @@ FRAME_TASK_STATE = "task_state"
 # v0.3
 FRAME_LIFECYCLE = "lifecycle"
 FRAME_SAMPLE_BATCH = "sample_batch"
+# v0.4
+FRAME_ALARM_EVENT = "alarm_event"
 
 # --- error codes ------------------------------------------------------------
 
@@ -96,6 +105,14 @@ LIFECYCLE_EVENTS: frozenset = frozenset(
 
 SAMPLE_QUALITIES: frozenset = frozenset({"good", "bad", "uncertain"})
 
+# --- v0.4 alarm event states ------------------------------------------------
+
+# Reported on an inbound ``alarm_event`` frame. M4 emits ``firing`` only;
+# ``cleared`` is reserved (clear-transition uplink is M5).
+ALARM_STATE_FIRING = "firing"
+ALARM_STATE_CLEARED = "cleared"
+ALARM_STATES: frozenset = frozenset({ALARM_STATE_FIRING, ALARM_STATE_CLEARED})
+
 
 def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -143,12 +160,17 @@ def make_apply_config(
     tasks: list[Dict[str, Any]],
     devices: list[Dict[str, Any]],
     points: list[Dict[str, Any]],
+    alarm_rules: list[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Center → edge: full configuration snapshot for the edge to apply.
 
     ``version`` is a monotonically-increasing integer per edge — the edge
     persists it as ``last_applied_version`` so a redelivered or stale frame
     can be rejected by comparison.
+
+    ``alarm_rules`` (v0.4) is the set of threshold rules the edge evaluates
+    locally; it is always present from a v0.4 center (possibly empty) and
+    silently ignored by a v0.3 edge.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -157,6 +179,46 @@ def make_apply_config(
         "tasks": list(tasks),
         "devices": list(devices),
         "points": list(points),
+        "alarm_rules": list(alarm_rules or []),
+    }
+
+
+def make_alarm_event(
+    *,
+    edge_id: str,
+    monotonic_seq: int,
+    rule_id: int,
+    point_code: str,
+    value: Any,
+    device_code: str = "",
+    severity: str = "warning",
+    status: str = ALARM_STATE_FIRING,
+    message: str = "",
+    fired_at: str | None = None,
+) -> Dict[str, Any]:
+    """Edge → center: a locally-triggered alarm (v0.4).
+
+    The edge evaluates the threshold rules pushed via ``apply_config``
+    against its acquisition readings and emits one ``alarm_event`` per
+    fire transition. ``rule_id`` is the center-side ``AlarmRule.pk`` (rule
+    definitions live at the center; the edge only mirrors them) so the
+    center can re-attach the event to its own rule row.
+    """
+    if status not in ALARM_STATES:
+        raise ValueError(f"invalid alarm_event status: {status!r}")
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": FRAME_ALARM_EVENT,
+        "edge_id": edge_id,
+        "monotonic_seq": int(monotonic_seq),
+        "rule_id": int(rule_id),
+        "point_code": str(point_code),
+        "device_code": str(device_code or ""),
+        "value": value,
+        "severity": str(severity or "warning"),
+        "status": status,
+        "message": str(message or ""),
+        "fired_at": fired_at or _utc_now_iso(),
     }
 
 

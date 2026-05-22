@@ -1,4 +1,4 @@
-# Distributed control-plane protocol — v0.3 (M3)
+# Distributed control-plane protocol — v0.4 (M4)
 
 Wire format for the WebSocket channel between each **edge-agent** and the
 **center** (`fleet/` Django app). One persistent WS connection per edge.
@@ -7,9 +7,9 @@ Wire format for the WebSocket channel between each **edge-agent** and the
 - Endpoint: `ws[s]://<center>/ws/fleet/`
 - Authentication: activation token, presented in the first `register` frame.
 
-Every frame carries `"v": "0.3"`. The center also accepts `"v": "0.1"`
-and `"v": "0.2"` during the upgrade window so a stale agent can still
-register; older agents simply never see the newer frame types.
+Every frame carries `"v": "0.4"`. The center also accepts `"v": "0.1"`,
+`"v": "0.2"` and `"v": "0.3"` during the upgrade window so a stale agent
+can still register; older agents simply never see the newer frame types.
 
 ## Common envelope
 
@@ -20,11 +20,18 @@ register; older agents simply never see the newer frame types.
 
 Per-type fields below.
 
-## v0.1 / v0.2 frames (unchanged)
+## Version increments (unchanged frames)
 
-These exist exactly as defined in their introducing version. v0.3 is a
-**pure increment** — it adds two new edge → center frame types and does
-not change any v0.1/v0.2 field. The M1/M2 public contract is preserved.
+Every version bump on this protocol is a **pure increment** — a new
+version adds frame types or *optional* fields and never changes an
+existing field's meaning. The M1/M2/M3 public contract is preserved:
+
+- **v0.3** added two edge → center frame types (`lifecycle`,
+  `sample_batch`) and the per-edge `monotonic_seq` uplink counter.
+- **v0.4** adds one edge → center frame type (`alarm_event`) and one
+  *optional* field on the existing `apply_config` frame (`alarm_rules`).
+  A v0.3 edge ignores `alarm_rules`; a v0.4 center sending it to a v0.3
+  edge is harmless.
 
 | frame            | direction        | version | purpose                                       |
 |------------------|------------------|---------|-----------------------------------------------|
@@ -32,7 +39,7 @@ not change any v0.1/v0.2 field. The M1/M2 public contract is preserved.
 | `heartbeat`      | edge → center    | v0.1    | ~1 Hz liveness; updates `last_seen`.          |
 | `ack`            | center → edge    | v0.1    | Acks a prior edge → center frame.             |
 | `error`          | center → edge    | v0.1    | Fatal protocol/auth error; center closes.     |
-| `apply_config`   | center → edge    | v0.2    | Full task/device/point snapshot.              |
+| `apply_config`   | center → edge    | v0.2    | Full task/device/point snapshot; v0.4 also carries `alarm_rules`. |
 | `config_applied` | edge → center    | v0.2    | Result of applying a snapshot.                |
 | `task_state`     | edge → center    | v0.2    | Per-task lifecycle transition (no seq).       |
 
@@ -46,9 +53,10 @@ frames above.
 ## Uplink sequencing — `monotonic_seq`
 
 v0.3 introduces a single per-edge **uplink sequence number**. Every
-`lifecycle` and `sample_batch` frame carries `monotonic_seq`: a strictly
-increasing integer (`>= 1`) assigned by the edge-agent at enqueue time,
-shared across both frame types so they form one ordered stream.
+`lifecycle`, `sample_batch` and (v0.4) `alarm_event` frame carries
+`monotonic_seq`: a strictly increasing integer (`>= 1`) assigned by the
+edge-agent at enqueue time, shared across all uplink frame types so they
+form one ordered stream.
 
 Edge side:
 
@@ -190,6 +198,98 @@ policy); it can be disabled entirely by setting
 Setting `EDGE_UPLINK_SAMPLES=false` stops the edge emitting `sample_batch`
 frames entirely (lifecycle frames are unaffected).
 
+## `apply_config` — `alarm_rules` (v0.4)
+
+v0.4 adds one **optional** array field, `alarm_rules`, to the existing
+`apply_config` frame. It carries every threshold rule the edge evaluates
+locally. A v0.4 center always includes it (possibly empty `[]`); a v0.3
+edge ignores the unknown field.
+
+```json
+{
+  "v": "0.4",
+  "type": "apply_config",
+  "version": 7,
+  "tasks": [ ... ], "devices": [ ... ], "points": [ ... ],
+  "alarm_rules": [
+    {"id": 3, "name": "holding_0 过高", "point_code": "holding_0",
+     "device_code": "", "operator": "gt", "threshold": 100.0,
+     "threshold_high": null, "severity": "warning",
+     "is_active": true, "description": ""}
+  ]
+}
+```
+
+Each `alarm_rules[*]` object mirrors one center-side `AlarmRule` row:
+
+| field            | type            | notes                                                       |
+|------------------|-----------------|--------------------------------------------------------------|
+| `id`             | integer         | Center `AlarmRule.pk`; the edge mirrors the rule under it.  |
+| `name`           | string          | Human-readable rule name.                                   |
+| `point_code`     | string          | Reading `code` the rule matches.                            |
+| `device_code`    | string          | Empty = "any device with this point".                      |
+| `operator`       | string          | `gt`/`ge`/`lt`/`le`/`eq`/`ne`/`between`/`outside`.          |
+| `threshold`      | number / null   | Primary threshold.                                          |
+| `threshold_high` | number / null   | Upper bound for `between` / `outside`.                      |
+| `severity`       | string          | `info` / `warning` / `critical`.                            |
+| `is_active`      | bool            | Center sends only active rules; field kept for clarity.     |
+| `description`    | string          | Optional free text.                                         |
+
+Rule definitions are authored and stored **only at the center**. The
+center sends the full active set on every `apply_config` and on every
+rule create / update / delete (the center re-pushes a fresh snapshot to
+each online edge). The edge mirrors the snapshot into its local SQLite
+under the same primary keys and **culls** any rule no longer present, so
+a deactivated or deleted rule stops firing on the edge. The edge's
+in-process `AlarmSink` evaluates these rules against live readings
+exactly as a monolith deployment does — the evaluation code
+(`acquisition/services/alarms.py`) is shared, not duplicated.
+
+## `alarm_event` — edge → center  (v0.4)
+
+Reports one locally-triggered alarm. Emitted by the edge-agent on every
+fire transition its local `AlarmSink` detects.
+
+```json
+{
+  "v": "0.4",
+  "type": "alarm_event",
+  "edge_id": "edge-shanghai-line-1",
+  "monotonic_seq": 12,
+  "rule_id": 3,
+  "point_code": "holding_0",
+  "device_code": "plc-1",
+  "value": 137.0,
+  "severity": "warning",
+  "status": "firing",
+  "message": "holding_0=137.0 触发规则 [holding_0 过高] > 100.0",
+  "fired_at": "2026-05-22T03:14:09.880Z"
+}
+```
+
+| field           | type          | required | notes                                                       |
+|-----------------|---------------|----------|--------------------------------------------------------------|
+| `monotonic_seq` | integer       | yes      | Per-edge uplink sequence (see above).                        |
+| `rule_id`       | integer       | yes      | Center `AlarmRule.pk` the alarm belongs to.                  |
+| `point_code`    | string        | yes      | Reading code that breached the threshold.                    |
+| `device_code`   | string        | no       | Device the point belongs to; `""` if rule is device-agnostic.|
+| `value`         | number/bool/str | yes    | The breaching value (engineering units).                     |
+| `severity`      | string        | no       | `info` / `warning` / `critical`; mirrors the rule.           |
+| `status`        | string        | no       | `firing` (default). `cleared` is reserved for M5.            |
+| `message`       | string        | no       | Human-readable alarm text.                                   |
+| `fired_at`      | string        | no       | Edge wall-clock ISO-8601 UTC; informational.                 |
+
+On receipt the center classifies `monotonic_seq` exactly like a
+`lifecycle` frame (duplicate → drop, advance / gap → record). For a
+non-duplicate `firing` event it creates an `acquisition.Alarm` row with
+the `edge` FK set to the reporting edge — that is what lets the center
+`/alarms` page show **which edge** raised each alarm. The center
+deduplicates idempotently: one open `firing` `Alarm` per
+`(rule, edge, point_code, device_code)`, so a redelivered frame or an
+edge restart re-firing the same condition does not pile up rows. An
+`alarm_event` whose `rule_id` no longer exists center-side is dropped,
+but the uplink sequence still advances.
+
 ## Frame ordering / acks
 
 | frame            | acked by center?                       |
@@ -201,9 +301,10 @@ frames entirely (lifecycle frames are unaffected).
 | `task_state`     | `ack` with `ref="task_state"`          |
 | `lifecycle`      | `ack` with `ref="lifecycle"`           |
 | `sample_batch`   | `ack` with `ref="sample_batch"`        |
+| `alarm_event`    | `ack` with `ref="alarm_event"`         |
 
-The edge MAY ignore acks for `lifecycle` / `sample_batch`; they exist for
-at-least-once delivery hooks the center may grow later (M5).
+The edge MAY ignore acks for `lifecycle` / `sample_batch` / `alarm_event`;
+they exist for at-least-once delivery hooks the center may grow later (M5).
 
 ## Reconnect behaviour (client side)
 
@@ -219,9 +320,15 @@ Unchanged from v0.1/v0.2:
   bounded in-process queue and flushed on reconnect (online path only;
   durable cross-restart buffering / backfill is M5).
 
-## Out of scope for v0.3 (planned for M4+)
+## Out of scope for v0.4 (planned for M5+)
 
-- `alarm` rule sync + `alarm_event` (edge → center) — M4
-- Durable offline buffering / `monotonic_seq` gap backfill — M5
+- Durable offline buffering / `monotonic_seq` gap backfill — M5. M4
+  alarms ride the existing online uplink stream; an offline edge buffers
+  `alarm_event` frames in the same bounded in-process queue as
+  `lifecycle` / `sample_batch` and flushes them on reconnect (online
+  path only — cross-restart durability is M5).
+- `alarm_event` clear-transition (`status: "cleared"`) uplink — M5. M4
+  reports fire transitions only; the `status` field is already on the
+  wire so M5 can light up clears without another version bump.
 - Historical query proxy — M6
 - mTLS / signed bootstrap, beyond the bare activation token
