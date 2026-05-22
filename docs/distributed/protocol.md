@@ -47,23 +47,40 @@ frames above.
 
 v0.3 introduces a single per-edge **uplink sequence number**. Every
 `lifecycle` and `sample_batch` frame carries `monotonic_seq`: a strictly
-increasing integer assigned by the edge-agent at enqueue time, shared
-across both frame types so they form one ordered stream.
+increasing integer (`>= 1`) assigned by the edge-agent at enqueue time,
+shared across both frame types so they form one ordered stream.
+
+Edge side:
 
 - The counter starts at `1` on each edge-agent **process start** and
-  increments by 1 per uplink frame. It is *not* persisted across restarts
-  this milestone — a restarted agent's stream simply restarts at 1.
+  increments by 1 per uplink frame. It is per-process: it keeps counting
+  across WS reconnects within the same process; a process restart restarts
+  it at `1`. It is not persisted to disk this milestone.
+
+Center side:
+
 - The center stores the highest value it has seen per edge as
-  `EdgeNode.last_uplink_seq`.
-- A frame whose `monotonic_seq` is **≤** the stored value is a duplicate /
-  replay: the center still applies it idempotently but does not move
-  `last_uplink_seq` backward.
-- A jump of more than 1 is a **gap** (frames lost while offline). The
-  center logs it; closing the gap is M5 (offline backfill) — out of scope
-  here, which only implements the online path.
-- A frame whose `monotonic_seq` is far **below** the stored value (e.g. 1
-  after 5000) is treated as an agent restart: the center accepts it and
-  resets `last_uplink_seq` to the new stream.
+  `EdgeNode.last_uplink_seq`, and **resets it to `0` on every `register`**.
+  A new WS session is a new uplink stream — a fresh socket means the prior
+  high-water mark no longer applies.
+- The **first frame after a register** (`last_uplink_seq == 0`) is always
+  accepted as `advanced`, whatever its `monotonic_seq`. This covers both a
+  cold start (the edge sends seq `1`) and a reconnect of a long-running
+  agent (the edge's per-process counter is already at seq `N`). Without
+  this, a short-session restart — agent emits a few frames, restarts, new
+  stream from seq `1` — would see seq `1..N` mis-classified as stale
+  duplicates and dropped.
+- Within an established stream (`last_uplink_seq > 0`):
+  - `monotonic_seq <= last_uplink_seq` is a **duplicate** / replay: the
+    center applies it idempotently and does **not** move the high-water
+    mark backward.
+  - `monotonic_seq == last_uplink_seq + 1` **advances** the stream.
+  - `monotonic_seq > last_uplink_seq + 1` is a **gap** (frames lost while
+    offline): the center logs it, still records the frame, and advances
+    the mark. Closing the gap is M5 (offline backfill) — out of scope
+    here, which only implements the online path.
+- A frame with `monotonic_seq <= 0` is malformed and rejected with a
+  `bad_frame` error.
 
 `register` / `heartbeat` / `config_applied` / `task_state` do **not**
 carry `monotonic_seq` — they are control frames, not part of the uplink

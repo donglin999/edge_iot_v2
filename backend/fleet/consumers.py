@@ -40,7 +40,6 @@ from .models import (
     EdgeTaskStatus,
     UPLINK_SEQ_DUPLICATE,
     UPLINK_SEQ_GAP,
-    UPLINK_SEQ_RESTART,
     classify_uplink_seq,
 )
 from .protocol import (
@@ -288,6 +287,9 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         except (TypeError, ValueError):
             await self._fail(ERROR_BAD_FRAME, "lifecycle missing/invalid monotonic_seq", CLOSE_BAD_FRAME)
             return
+        if seq <= 0:
+            await self._fail(ERROR_BAD_FRAME, "lifecycle monotonic_seq must be >= 1", CLOSE_BAD_FRAME)
+            return
         event = frame.get("event")
         if event not in LIFECYCLE_EVENTS:
             await self._fail(ERROR_BAD_FRAME, f"lifecycle bad event: {event!r}", CLOSE_BAD_FRAME)
@@ -315,6 +317,9 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             seq = int(frame.get("monotonic_seq"))
         except (TypeError, ValueError):
             await self._fail(ERROR_BAD_FRAME, "sample_batch missing/invalid monotonic_seq", CLOSE_BAD_FRAME)
+            return
+        if seq <= 0:
+            await self._fail(ERROR_BAD_FRAME, "sample_batch monotonic_seq must be >= 1", CLOSE_BAD_FRAME)
             return
         try:
             task_id = int(frame.get("task_id"))
@@ -407,22 +412,21 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                 "last_reported_at": timezone.now(),
             },
         )
+        # Push the change to browser /acquisition clients too — a v0.2 edge
+        # (rolling-upgrade window) reports via task_state, not lifecycle, so
+        # without this its status changes would never reach the live feed.
+        broadcast_task_status(edge_pk, task_id)
 
     # ---- M3 uplink: lifecycle + sample_batch ------------------------------
 
     def _classify_and_log_seq(self, edge: EdgeNode, seq: int, kind: str) -> str:
-        """Classify an inbound uplink seq and log gap / restart transitions."""
+        """Classify an inbound uplink seq and log a gap transition."""
         verdict = classify_uplink_seq(edge.last_uplink_seq, seq)
         if verdict == UPLINK_SEQ_GAP:
             logger.warning(
                 "fleet: %s uplink seq gap edge=%s last=%s got=%s "
                 "(frames lost — M5 backfill)",
                 kind, edge.name, edge.last_uplink_seq, seq,
-            )
-        elif verdict == UPLINK_SEQ_RESTART:
-            logger.info(
-                "fleet: edge=%s uplink stream reset (agent restart) last=%s got=%s",
-                edge.name, edge.last_uplink_seq, seq,
             )
         return verdict
 

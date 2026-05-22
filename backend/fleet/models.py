@@ -97,7 +97,13 @@ class EdgeNode(models.Model):
     def mark_online(self, *, version: str | None = None) -> None:
         self.last_seen = timezone.now()
         self.status = EdgeStatus.ONLINE
-        update_fields = ["last_seen", "status", "updated_at"]
+        # A fresh register == a fresh WS session == a fresh uplink stream.
+        # Reset the high-water seq so the new stream's first frame is read
+        # as ``advanced``, never mis-classified as a stale ``duplicate``
+        # (XIU-63 review MAJOR: a short-session restart left seq 1..N being
+        # dropped until the new stream caught up to the old high-water mark).
+        self.last_uplink_seq = 0
+        update_fields = ["last_seen", "status", "last_uplink_seq", "updated_at"]
         if version is not None and version != self.version:
             self.version = version
             update_fields.append("version")
@@ -315,14 +321,9 @@ class EdgeSample(models.Model):
 
 # Outcome of comparing an inbound uplink seq against the stored high-water
 # mark. See ``docs/distributed/protocol.md`` § Uplink sequencing.
-UPLINK_SEQ_ADVANCED = "advanced"   # seq == prev + 1 — the normal case
+UPLINK_SEQ_ADVANCED = "advanced"   # first frame of a stream, or seq == prev + 1
 UPLINK_SEQ_GAP = "gap"             # seq > prev + 1 — frames lost (M5 backfill)
 UPLINK_SEQ_DUPLICATE = "duplicate" # 0 < seq <= prev — replay; apply idempotently
-UPLINK_SEQ_RESTART = "restart"     # seq far below prev — agent process restarted
-
-# A drop this large below the high-water mark is read as an agent restart
-# (its per-process counter reset to 1) rather than a stale duplicate.
-_UPLINK_RESTART_GAP = 100
 
 
 def classify_uplink_seq(prev: int, incoming: int) -> str:
@@ -331,12 +332,19 @@ def classify_uplink_seq(prev: int, incoming: int) -> str:
     Pure function (no DB) so it is trivially unit-testable. The caller
     persists ``EdgeNode.last_uplink_seq`` for every outcome except
     ``duplicate`` (which must not move the high-water mark backward).
+
+    ``prev == 0`` means "no frame seen since the last register" — the
+    center zeroes ``last_uplink_seq`` on every register (a new WS session
+    is a new uplink stream), so whatever seq the edge is at, the first
+    frame we observe is the start of the stream, not a gap. This is what
+    makes a short-session agent restart safe: the edge's per-process
+    counter resets to 1, the center reset to 0, and seq 1 is ``advanced``.
     """
     prev = int(prev or 0)
     incoming = int(incoming or 0)
+    if prev == 0:
+        return UPLINK_SEQ_ADVANCED
     if incoming <= prev:
-        if prev - incoming >= _UPLINK_RESTART_GAP:
-            return UPLINK_SEQ_RESTART
         return UPLINK_SEQ_DUPLICATE
     if incoming == prev + 1:
         return UPLINK_SEQ_ADVANCED
