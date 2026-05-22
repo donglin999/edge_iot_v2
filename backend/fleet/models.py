@@ -43,9 +43,18 @@ class EdgeNode(models.Model):
     )
     labels = models.JSONField(default=dict, blank=True)
     # M3: highest uplink ``monotonic_seq`` (lifecycle / sample_batch) the
-    # center has accepted from this edge. Drives duplicate / gap / restart
+    # center has accepted from this edge. Drives duplicate / gap / backfill
     # detection — see ``docs/distributed/protocol.md`` § Uplink sequencing.
+    # M5: this is now durable across the edge's WS sessions — register no
+    # longer resets it (the edge's seq counter is persistent too), so the
+    # center can tell a reconnecting edge exactly which frames to backfill.
     last_uplink_seq = models.PositiveBigIntegerField(default=0)
+    # M5 (v0.5): depth of the edge's durable uplink outbox, mirrored from
+    # the ``buffer`` field on each heartbeat. Non-zero means the edge is
+    # sitting on un-shipped frames (offline, or mid-backfill).
+    buffer_backlog = models.PositiveBigIntegerField(default=0)
+    # M5: last time the edge backfilled replayed frames after a reconnect.
+    last_backfill_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -97,13 +106,14 @@ class EdgeNode(models.Model):
     def mark_online(self, *, version: str | None = None) -> None:
         self.last_seen = timezone.now()
         self.status = EdgeStatus.ONLINE
-        # A fresh register == a fresh WS session == a fresh uplink stream.
-        # Reset the high-water seq so the new stream's first frame is read
-        # as ``advanced``, never mis-classified as a stale ``duplicate``
-        # (XIU-63 review MAJOR: a short-session restart left seq 1..N being
-        # dropped until the new stream caught up to the old high-water mark).
-        self.last_uplink_seq = 0
-        update_fields = ["last_seen", "status", "last_uplink_seq", "updated_at"]
+        # M5: register does NOT reset ``last_uplink_seq``. The edge's seq
+        # counter is now persistent (it lives in the edge's durable SQLite
+        # outbox and survives a process restart), so the high-water mark
+        # stays valid across WS sessions — that is exactly what lets the
+        # center tell a reconnecting edge which frames to backfill. The M3
+        # short-session-restart concern that motivated the reset no longer
+        # applies: the edge resumes its counter from N+1, never from 1.
+        update_fields = ["last_seen", "status", "updated_at"]
         if version is not None and version != self.version:
             self.version = version
             update_fields.append("version")
@@ -333,12 +343,15 @@ def classify_uplink_seq(prev: int, incoming: int) -> str:
     persists ``EdgeNode.last_uplink_seq`` for every outcome except
     ``duplicate`` (which must not move the high-water mark backward).
 
-    ``prev == 0`` means "no frame seen since the last register" — the
-    center zeroes ``last_uplink_seq`` on every register (a new WS session
-    is a new uplink stream), so whatever seq the edge is at, the first
-    frame we observe is the start of the stream, not a gap. This is what
-    makes a short-session agent restart safe: the edge's per-process
-    counter resets to 1, the center reset to 0, and seq 1 is ``advanced``.
+    ``prev == 0`` means "no uplink frame ever accepted from this edge" — a
+    brand-new edge. Its first frame is the start of the stream, not a gap.
+
+    M5: ``last_uplink_seq`` is NOT reset on register anymore. The edge's
+    seq counter is persistent (durable outbox) and the center reports its
+    high-water mark in the register ack, so a reconnecting edge resumes at
+    ``prev + 1`` and backfills any gap proactively. A ``gap`` verdict here
+    therefore means the edge skipped frames it could not buffer (outbox
+    cap exceeded) — rare, and still recorded so the stream stays monotonic.
     """
     prev = int(prev or 0)
     incoming = int(incoming or 0)

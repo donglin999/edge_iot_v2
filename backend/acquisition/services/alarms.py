@@ -59,12 +59,18 @@ def evaluate_readings(
 
     ``readings`` is the same shape ``protocol.read_points`` returns:
     ``{"code": ..., "value": ..., "quality": ..., ...}``.
+
+    Returns the alarm **transitions** this evaluation produced — both
+    newly-fired (``status="firing"``) and newly-cleared
+    (``status="cleared"``) ``Alarm`` rows. M5: the edge AlarmSink relays
+    each transition upstream, so a clear must be reported too; callers that
+    only care about fires can filter on ``alarm.status``.
     """
     rules = list(AlarmRule.objects.filter(is_active=True))
     if not rules:
         return []
 
-    fired: List[Alarm] = []
+    transitions: List[Alarm] = []
     by_code: dict[str, List[AlarmRule]] = {}
     for r in rules:
         # An empty device_code on the rule means "any device with this point"
@@ -99,11 +105,18 @@ def evaluate_readings(
                         f"{rule.get_operator_display()} {rule.threshold}"
                     ),
                 )
-                fired.append(alarm)
+                transitions.append(alarm)
                 logger.warning("ALARM %s: %s", rule.severity, alarm.message)
             elif not triggered and existing:
                 existing.status = Alarm.STATUS_CLEARED
                 existing.cleared_at = timezone.now()
-                existing.save(update_fields=["status", "cleared_at", "updated_at"])
+                # Carry the clearing value so the uplink frame + center
+                # reflect the reading that resolved the alarm.
+                existing.value = value
+                existing.save(
+                    update_fields=["status", "cleared_at", "value", "updated_at"]
+                )
+                # M5: a clear is a transition the edge must relay upstream.
+                transitions.append(existing)
                 logger.info("ALARM cleared: rule=%s code=%s value=%s", rule.name, code, value)
-    return fired
+    return transitions

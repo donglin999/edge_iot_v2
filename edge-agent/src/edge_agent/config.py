@@ -36,6 +36,19 @@ class EdgeConfig:
     # M3 uplink: 1 Hz aggregated sample_batch frames.
     uplink_samples: bool = True
     uplink_sample_window: float = 1.0
+    # M5 backfill: when reconnecting after an offline window the durable
+    # outbox is drained in batches of ``backfill_batch`` frames, pausing
+    # ``backfill_pause`` seconds between full batches so a large backfill
+    # does not flood the center the instant the socket comes back.
+    backfill_batch: int = 200
+    backfill_pause: float = 0.2
+    # M5 offline buffer ceiling — the durable outbox keeps at most this
+    # many un-acked frames; past it the oldest are dropped (with a
+    # throttled warning) so a multi-hour center outage can never OOM the
+    # edge. Default comfortably rides out the spec'd 1 h outage (~3.6k
+    # frames at 1 Hz) with headroom; the chaos test lowers it to exercise
+    # the overflow path.
+    uplink_buffer_max: int = 10000
 
     @classmethod
     def from_env(cls, env: Dict[str, str] | None = None) -> "EdgeConfig":
@@ -66,6 +79,39 @@ class EdgeConfig:
         else:
             window = 1.0
 
+        batch_raw = env.get("EDGE_BACKFILL_BATCH", "")
+        if batch_raw:
+            try:
+                batch = max(1, int(batch_raw))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_BACKFILL_BATCH must be an integer: {exc}"
+                ) from exc
+        else:
+            batch = 200
+
+        pause_raw = env.get("EDGE_BACKFILL_PAUSE_S", "")
+        if pause_raw:
+            try:
+                pause = max(0.0, float(pause_raw))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_BACKFILL_PAUSE_S must be a number: {exc}"
+                ) from exc
+        else:
+            pause = 0.2
+
+        cap_raw = env.get("EDGE_UPLINK_BUFFER_MAX", "")
+        if cap_raw:
+            try:
+                buffer_max = max(1, int(cap_raw))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_UPLINK_BUFFER_MAX must be an integer: {exc}"
+                ) from exc
+        else:
+            buffer_max = 10000
+
         return cls(
             edge_id=env["EDGE_ID"],
             edge_token=env["EDGE_TOKEN"],
@@ -74,4 +120,7 @@ class EdgeConfig:
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
             uplink_samples=_parse_bool(env.get("EDGE_UPLINK_SAMPLES", ""), True),
             uplink_sample_window=window,
+            backfill_batch=batch,
+            backfill_pause=pause,
+            uplink_buffer_max=buffer_max,
         )

@@ -154,6 +154,9 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         self.edge_id: int | None = None
         self.edge_name: str | None = None
         self._group_name: str | None = None
+        # M5: stamp ``EdgeNode.last_backfill_at`` once per session, on the
+        # first uplink frame the edge tags as backfilled history.
+        self._backfill_seen: bool = False
         await self.accept()
         logger.info("fleet: ws connected (awaiting register frame)")
 
@@ -234,18 +237,44 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         self.edge_name = result.name
         self._group_name = edge_group_name(result.pk)
         await self.channel_layer.group_add(self._group_name, self.channel_name)
+        # M5 (v0.5): the edge advertises its persistent uplink high-water
+        # mark. If it is behind ours the edge's durable buffer was wiped —
+        # log it; the edge's own sync_to_center fast-forwards its counter,
+        # so the stream stays monotonic without center-side intervention.
+        try:
+            edge_seq = int(frame.get("uplink_seq") or 0)
+        except (TypeError, ValueError):
+            edge_seq = 0
+        if edge_seq and edge_seq < result.last_uplink_seq:
+            logger.warning(
+                "fleet: edge=%s register uplink_seq=%s behind center "
+                "last_uplink_seq=%s — edge buffer reset? (edge will "
+                "fast-forward)",
+                result.name, edge_seq, result.last_uplink_seq,
+            )
         logger.info(
-            "fleet: registered edge=%s v=%s wire=%s proto=%s",
+            "fleet: registered edge=%s v=%s wire=%s proto=%s seq=%s edge_seq=%s",
             result.name, version, wire_version or "n/a", PROTOCOL_VERSION,
+            result.last_uplink_seq, edge_seq,
         )
-        await self.send_json(make_ack(ref=FRAME_REGISTER))
+        # M5: the register ack carries the high-water uplink seq so the edge
+        # knows where to resume its durable-outbox backfill from.
+        await self.send_json(
+            make_ack(ref=FRAME_REGISTER, last_uplink_seq=result.last_uplink_seq)
+        )
 
     async def _handle_heartbeat(self, frame: dict) -> None:
         if self.edge_id is None:
             await self._fail(ERROR_BAD_FRAME, "heartbeat before register", CLOSE_BAD_FRAME)
             return
-        await self._touch(self.edge_id)
-        await self.send_json(make_ack(ref=FRAME_HEARTBEAT))
+        # M5 (v0.5): mirror the edge's durable-outbox depth so /fleet can
+        # surface an edge sitting on un-shipped uplink frames.
+        try:
+            backlog = int(frame.get("buffer") or 0)
+        except (TypeError, ValueError):
+            backlog = 0
+        seq = await self._touch(self.edge_id, backlog)
+        await self.send_json(make_ack(ref=FRAME_HEARTBEAT, last_uplink_seq=seq))
 
     async def _handle_config_applied(self, frame: dict) -> None:
         if self.edge_id is None:
@@ -309,8 +338,11 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             task_code = str(frame.get("task_code") or "")
         error = frame.get("error") or ""
         edge_ts = _parse_ts(frame.get("ts"))
-        await self._record_lifecycle(self.edge_id, seq, event, task_id, task_code, error, edge_ts)
-        await self.send_json(make_ack(ref=FRAME_LIFECYCLE))
+        ack_seq = await self._record_lifecycle(
+            self.edge_id, seq, event, task_id, task_code, error, edge_ts
+        )
+        await self._note_backfill(frame)
+        await self.send_json(make_ack(ref=FRAME_LIFECYCLE, last_uplink_seq=ack_seq))
 
     async def _handle_sample_batch(self, frame: dict) -> None:
         """v0.3: one aggregation window of point samples carrying a seq."""
@@ -336,8 +368,11 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             return
         task_code = str(frame.get("task_code") or "")
         window_end = _parse_ts(frame.get("window_end"))
-        await self._record_sample_batch(self.edge_id, seq, task_id, task_code, samples, window_end)
-        await self.send_json(make_ack(ref=FRAME_SAMPLE_BATCH))
+        ack_seq = await self._record_sample_batch(
+            self.edge_id, seq, task_id, task_code, samples, window_end
+        )
+        await self._note_backfill(frame)
+        await self.send_json(make_ack(ref=FRAME_SAMPLE_BATCH, last_uplink_seq=ack_seq))
 
     async def _handle_alarm_event(self, frame: dict) -> None:
         """v0.4: an edge-triggered alarm carrying ``monotonic_seq``."""
@@ -365,7 +400,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         if status not in ALARM_STATES:
             await self._fail(ERROR_BAD_FRAME, f"alarm_event bad status: {status!r}", CLOSE_BAD_FRAME)
             return
-        await self._record_alarm_event(
+        ack_seq = await self._record_alarm_event(
             self.edge_id,
             seq,
             rule_id,
@@ -375,7 +410,29 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             str(frame.get("message") or ""),
             status,
         )
-        await self.send_json(make_ack(ref=FRAME_ALARM_EVENT))
+        await self._note_backfill(frame)
+        await self.send_json(make_ack(ref=FRAME_ALARM_EVENT, last_uplink_seq=ack_seq))
+
+    async def _note_backfill(self, frame: dict) -> None:
+        """Stamp ``EdgeNode.last_backfill_at`` on backfilled-history frames.
+
+        The edge tags every frame it replays from its durable outbox after
+        a reconnect with ``backfill: true``. We stamp once per WS session
+        (a fresh consumer instance per connection) so /fleet can show when
+        an edge last drained an offline backlog.
+        """
+        if self._backfill_seen or self.edge_id is None:
+            return
+        if not frame.get("backfill"):
+            return
+        self._backfill_seen = True
+        await self._stamp_backfill_at(self.edge_id)
+
+    @database_sync_to_async
+    def _stamp_backfill_at(self, edge_pk: int) -> None:
+        EdgeNode.objects.filter(pk=edge_pk).update(
+            last_backfill_at=timezone.now(), updated_at=timezone.now()
+        )
 
     # ---- channel-layer fan-out -------------------------------------------
 
@@ -406,11 +463,23 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         return node
 
     @database_sync_to_async
-    def _touch(self, pk: int) -> None:
+    def _touch(self, pk: int, buffer_backlog: int = 0) -> int:
+        """Refresh ``last_seen`` and return the edge's high-water uplink seq.
+
+        The seq rides the heartbeat ack so the edge can keep pruning its
+        durable outbox even during a quiet window with no uplink traffic.
+        ``buffer_backlog`` (M5) mirrors the edge's durable-outbox depth.
+        """
         EdgeNode.objects.filter(pk=pk).update(
             last_seen=timezone.now(),
             status="online",
+            buffer_backlog=max(0, int(buffer_backlog)),
         )
+        return (
+            EdgeNode.objects.filter(pk=pk)
+            .values_list("last_uplink_seq", flat=True)
+            .first()
+        ) or 0
 
     @database_sync_to_async
     def _record_config_applied(self, edge_pk: int, version: int, status: str, error: str) -> None:
@@ -482,8 +551,12 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         task_code: str,
         error: str,
         edge_ts,
-    ) -> None:
-        """Persist a ``lifecycle`` frame: event-log row + EdgeTaskStatus fold."""
+    ) -> int:
+        """Persist a ``lifecycle`` frame: event-log row + EdgeTaskStatus fold.
+
+        Returns the edge's post-state ``last_uplink_seq`` — it rides the
+        ack so the edge can prune its durable outbox (M5).
+        """
         from configuration.models import AcqTask
         from django.db import transaction
 
@@ -498,7 +571,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                     "fleet: lifecycle duplicate seq=%s edge=%s — dropping",
                     seq, edge.name,
                 )
-                return
+                return edge.last_uplink_seq
 
             resolved_task_id = None
             if task_id is not None and AcqTask.objects.filter(pk=task_id).exists():
@@ -540,6 +613,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             "fleet: lifecycle edge=%s event=%s seq=%s%s",
             edge_pk, event, seq, f" task={task_code}" if task_code else "",
         )
+        return seq
 
     @database_sync_to_async
     def _record_sample_batch(
@@ -553,8 +627,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
     ) -> int:
         """Persist a ``sample_batch`` into the EdgeSample aggregation cache.
 
-        Returns the number of samples folded into the cache (0 on a dropped
-        duplicate or an unknown task).
+        Returns the edge's post-state ``last_uplink_seq`` for the M5 ack.
         """
         from configuration.models import AcqTask
         from django.db import transaction
@@ -567,7 +640,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                     "fleet: sample_batch duplicate seq=%s edge=%s — dropping",
                     seq, edge.name,
                 )
-                return 0
+                return edge.last_uplink_seq
 
             resolved_task_id = (
                 task_id if AcqTask.objects.filter(pk=task_id).exists() else None
@@ -611,7 +684,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             "fleet: sample_batch edge=%s task=%s seq=%s samples=%d cached=%d",
             edge_pk, task_code or task_id, seq, len(samples), written,
         )
-        return written
+        return seq
 
     @database_sync_to_async
     def _record_alarm_event(
@@ -629,8 +702,10 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
 
         Reuses ``acquisition.Alarm`` with the ``edge`` FK set so the center
         ``/alarms`` page can show which edge gateway triggered the alarm.
-        Returns the created ``Alarm.pk``, or 0 on a dropped duplicate /
-        unknown-rule frame.
+
+        ``status == "firing"`` opens an idempotent alarm row; ``"cleared"``
+        (M5) closes the matching open row. Returns the edge's post-state
+        ``last_uplink_seq`` for the M5 ack.
         """
         from acquisition.models import Alarm, AlarmRule
         from django.db import transaction
@@ -643,7 +718,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                     "fleet: alarm_event duplicate seq=%s edge=%s — dropping",
                     seq, edge.name,
                 )
-                return 0
+                return edge.last_uplink_seq
 
             rule = AlarmRule.objects.filter(pk=rule_id).first()
             alarm_pk = 0
@@ -684,15 +759,40 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                         "fleet: alarm_event already open edge=%s rule=%s point=%s",
                         edge.name, rule_id, point_code,
                     )
+            elif status == "cleared":
+                # M5 clear-transition: close the matching open alarm row.
+                # Idempotent — a redelivered ``cleared`` frame, or one for
+                # an alarm that never fired center-side, simply closes
+                # nothing. ``.update()`` over the (rule, edge, point) key
+                # handles the (rare) case of more than one open row.
+                closed = (
+                    Alarm.objects.filter(
+                        rule=rule,
+                        edge=edge,
+                        point_code=point_code,
+                        device_code=device_code,
+                        status=Alarm.STATUS_FIRING,
+                    ).update(
+                        status=Alarm.STATUS_CLEARED,
+                        value=value,
+                        cleared_at=timezone.now(),
+                        updated_at=timezone.now(),
+                    )
+                )
+                logger.info(
+                    "fleet: alarm_event cleared edge=%s rule=%s point=%s — "
+                    "closed %d open alarm(s)",
+                    edge.name, rule_id, point_code, closed,
+                )
 
             edge.last_uplink_seq = seq
             edge.save(update_fields=["last_uplink_seq", "updated_at"])
 
         logger.info(
-            "fleet: alarm_event edge=%s rule=%s point=%s value=%s seq=%s alarm=%s",
-            edge_pk, rule_id, point_code, value, seq, alarm_pk or "-",
+            "fleet: alarm_event edge=%s rule=%s point=%s value=%s seq=%s status=%s alarm=%s",
+            edge_pk, rule_id, point_code, value, seq, status, alarm_pk or "-",
         )
-        return alarm_pk
+        return seq
 
     @staticmethod
     def _mirror_samples_to_influx(edge_pk, task_code, samples, window_end) -> None:

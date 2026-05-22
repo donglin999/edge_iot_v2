@@ -374,7 +374,18 @@ class TestEdgeLocalEvaluation:
         assert len(fired) == 1
         assert fired[0].rule_id == rule.id
         assert fired[0].point_code == pt
-        # An in-range reading fires nothing.
+        assert fired[0].status == "firing"
+        # M5: a reading dropping back in-range is a clear *transition* —
+        # evaluate_readings returns the now-cleared Alarm so the edge can
+        # relay a ``cleared`` alarm_event upstream.
+        cleared = evaluate_readings(
+            None, "plc-1",
+            [{"code": pt, "value": 50.0, "quality": "good"}],
+        )
+        assert len(cleared) == 1
+        assert cleared[0].status == "cleared"
+        assert cleared[0].rule_id == rule.id
+        # A second in-range reading is a no-op — nothing left to clear.
         assert evaluate_readings(
             None, "plc-1",
             [{"code": pt, "value": 50.0, "quality": "good"}],

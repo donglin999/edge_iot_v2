@@ -32,10 +32,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
 
-PROTOCOL_VERSION = "0.4"
+PROTOCOL_VERSION = "0.5"
 # Versions the center is willing to talk to. Add older majors here when
 # an upgrade boundary needs explicit shim support.
-ACCEPTED_PROTOCOL_VERSIONS = frozenset({"0.1", "0.2", "0.3", "0.4"})
+ACCEPTED_PROTOCOL_VERSIONS = frozenset({"0.1", "0.2", "0.3", "0.4", "0.5"})
 
 # --- frame type constants ---------------------------------------------------
 
@@ -118,7 +118,20 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def make_register(*, edge_id: str, token: str, version: str, labels: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def make_register(
+    *,
+    edge_id: str,
+    token: str,
+    version: str,
+    labels: Dict[str, Any] | None = None,
+    uplink_seq: int = 0,
+) -> Dict[str, Any]:
+    """Edge → center: first frame of a session.
+
+    ``uplink_seq`` (v0.5) is the edge's persistent uplink high-water mark —
+    the center compares it against its own ``last_uplink_seq`` to detect an
+    edge whose durable buffer was wiped. Additive; a v0.4 center ignores it.
+    """
     return {
         "v": PROTOCOL_VERSION,
         "type": FRAME_REGISTER,
@@ -126,10 +139,24 @@ def make_register(*, edge_id: str, token: str, version: str, labels: Dict[str, A
         "token": token,
         "version": version,
         "labels": labels or {},
+        "uplink_seq": int(uplink_seq),
     }
 
 
-def make_heartbeat(*, edge_id: str, cpu: float = 0.0, mem: float = 0.0, uptime: float = 0.0, tasks: int = 0) -> Dict[str, Any]:
+def make_heartbeat(
+    *,
+    edge_id: str,
+    cpu: float = 0.0,
+    mem: float = 0.0,
+    uptime: float = 0.0,
+    tasks: int = 0,
+    buffer: int = 0,
+) -> Dict[str, Any]:
+    """Edge → center: ~1 Hz liveness ping.
+
+    ``buffer`` (v0.5) is the depth of the edge's durable uplink outbox; the
+    center mirrors it onto ``EdgeNode.buffer_backlog``. Additive.
+    """
     return {
         "v": PROTOCOL_VERSION,
         "type": FRAME_HEARTBEAT,
@@ -138,11 +165,23 @@ def make_heartbeat(*, edge_id: str, cpu: float = 0.0, mem: float = 0.0, uptime: 
         "mem": mem,
         "uptime": uptime,
         "tasks": tasks,
+        "buffer": int(buffer),
     }
 
 
-def make_ack(*, ref: str | None = None) -> Dict[str, Any]:
-    return {"v": PROTOCOL_VERSION, "type": FRAME_ACK, "ref": ref}
+def make_ack(*, ref: str | None = None, last_uplink_seq: int | None = None) -> Dict[str, Any]:
+    """Center → edge: acknowledge a prior frame.
+
+    ``last_uplink_seq`` (M5) carries the center's current high-water uplink
+    sequence for this edge. It rides every ack — ``register`` (so the edge
+    knows where to start its reconnect backfill), ``heartbeat`` and each
+    per-uplink-frame ack (so the edge can prune its durable outbox up to
+    the confirmed seq). Additive: a pre-M5 edge simply ignores the field.
+    """
+    frame: Dict[str, Any] = {"v": PROTOCOL_VERSION, "type": FRAME_ACK, "ref": ref}
+    if last_uplink_seq is not None:
+        frame["last_uplink_seq"] = int(last_uplink_seq)
+    return frame
 
 
 def make_error(*, code: str, message: str = "") -> Dict[str, Any]:

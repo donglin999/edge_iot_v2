@@ -13,6 +13,7 @@ import pytest
 
 from edge_agent.agent import EdgeAgent
 from edge_agent.config import EdgeConfig
+from edge_agent.outbox import DurableOutbox
 from edge_agent.protocol import (
     LIFECYCLE_EVENTS,
     PROTOCOL_VERSION,
@@ -116,34 +117,42 @@ class TestUplinkConfig:
 
 
 class TestAgentUplink:
-    def test_enqueue_uplink_assigns_monotonic_seq(self):
-        agent = EdgeAgent(_cfg())
+    """M5: ``_enqueue_uplink`` now persists into the durable outbox rather
+    than the (renamed) in-memory control queue."""
+
+    @staticmethod
+    def _agent(tmp_path):
+        ob = DurableOutbox(str(tmp_path / "outbox.db"))
+        return EdgeAgent(_cfg(), durable_outbox=ob), ob
+
+    def test_enqueue_uplink_assigns_monotonic_seq(self, tmp_path):
+        agent, ob = self._agent(tmp_path)
         for _ in range(3):
             agent._enqueue_uplink(lambda seq: {"type": "x", "monotonic_seq": seq})
-        seqs = [agent._outbox.get_nowait()["monotonic_seq"] for _ in range(3)]
+        seqs = [frame["monotonic_seq"] for _, frame in ob.pending()]
         assert seqs == [1, 2, 3]
 
-    def test_emit_task_state_produces_lifecycle_with_seq(self):
-        agent = EdgeAgent(_cfg())
+    def test_emit_task_state_produces_lifecycle_with_seq(self, tmp_path):
+        agent, ob = self._agent(tmp_path)
         agent._emit_task_state(5, "t5", "running", None)
         agent._emit_task_state(5, "t5", "stopped", None)
 
-        f1 = agent._outbox.get_nowait()
-        f2 = agent._outbox.get_nowait()
+        rows = ob.pending()
+        f1, f2 = rows[0][1], rows[1][1]
         assert (f1["type"], f1["event"], f1["monotonic_seq"]) == (
             "lifecycle", "task.running", 1,
         )
         assert (f2["event"], f2["monotonic_seq"]) == ("task.stopped", 2)
 
-    def test_emit_task_state_drops_invalid_state(self):
-        agent = EdgeAgent(_cfg())
+    def test_emit_task_state_drops_invalid_state(self, tmp_path):
+        agent, ob = self._agent(tmp_path)
         agent._emit_task_state(5, "t5", "not-a-state", None)
-        assert agent._outbox.empty()
+        assert ob.depth() == 0
 
-    def test_on_sample_window_builds_sample_batch(self):
+    def test_on_sample_window_builds_sample_batch(self, tmp_path):
         from acquisition.services.uplink import SampleWindow
 
-        agent = EdgeAgent(_cfg())  # no runner → task_code falls back to id
+        agent, ob = self._agent(tmp_path)  # no runner → task_code falls back to id
         window = SampleWindow(
             session_id=1, task_id=42,
             window_start="2026-05-22T02:59:59Z",
@@ -153,20 +162,20 @@ class TestAgentUplink:
         )
         agent._on_sample_window(window)
 
-        frame = agent._outbox.get_nowait()
+        frame = ob.pending()[0][1]
         assert frame["type"] == "sample_batch"
         assert frame["task_id"] == 42
         assert frame["task_code"] == "42"
         assert frame["monotonic_seq"] == 1
         assert len(frame["samples"]) == 1
 
-    def test_on_sample_window_ignores_missing_task_id(self):
+    def test_on_sample_window_ignores_missing_task_id(self, tmp_path):
         from acquisition.services.uplink import SampleWindow
 
-        agent = EdgeAgent(_cfg())
+        agent, ob = self._agent(tmp_path)
         window = SampleWindow(
             session_id=1, task_id=None,
             window_start="a", window_end="b", samples=[],
         )
         agent._on_sample_window(window)
-        assert agent._outbox.empty()
+        assert ob.depth() == 0

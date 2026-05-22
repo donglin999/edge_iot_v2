@@ -394,27 +394,40 @@ async def test_task_status_consumer_pushes_live_change(_inmemory_channel_layer):
 
 
 @pytest.mark.asyncio
-async def test_register_resets_last_uplink_seq(_inmemory_channel_layer):
-    """Every register zeroes the high-water mark — a new socket is a new
-    uplink stream."""
-    node, token = await sync_to_async(EdgeNode.issue)(name="edge-m3-reset")
+async def test_register_preserves_last_uplink_seq(_inmemory_channel_layer):
+    """M5: register no longer zeroes the high-water mark.
+
+    The edge's uplink seq counter is now persistent (durable outbox), so
+    the center keeps ``last_uplink_seq`` across WS sessions and reports it
+    in the register ack — that is what lets a reconnecting edge backfill
+    exactly the frames the center missed.
+    """
+    node, token = await sync_to_async(EdgeNode.issue)(name="edge-m5-preserve")
     node.last_uplink_seq = 99
     await sync_to_async(node.save)(update_fields=["last_uplink_seq"])
 
     comm = WebsocketCommunicator(fleet_application, "/ws/fleet/")
     await comm.connect()
-    await _register(comm, "edge-m3-reset", token)
+    ack = await _register(comm, "edge-m5-preserve", token)
 
+    # The high-water mark survives the register and rides the ack back.
+    assert ack["type"] == FRAME_ACK
+    assert ack["last_uplink_seq"] == 99
     await sync_to_async(node.refresh_from_db)()
-    assert node.last_uplink_seq == 0
+    assert node.last_uplink_seq == 99
     await comm.disconnect()
 
 
 @pytest.mark.asyncio
 async def test_short_session_restart_keeps_new_stream(_inmemory_channel_layer):
-    """XIU-63 review MAJOR regression: an agent that emitted a few frames,
-    restarted, and re-registered must have its new stream's opening frames
-    recorded — not dropped as stale duplicates."""
+    """M5 closes the M3 short-session-restart gap.
+
+    An agent that emitted a few frames, restarted, and reconnected resumes
+    its *persistent* seq counter at N+1 — the center preserves the
+    high-water mark and reports it in the register ack, so the new stream's
+    frames are recorded and never dropped as stale duplicates (see memory
+    m3-smoke-short-session-restart-gap, the known M3 smoke gap closed here).
+    """
     node, token = await sync_to_async(EdgeNode.issue)(name="edge-m3-restart")
     task = await sync_to_async(_make_task)(code="m3-restart", edge=node)
 
@@ -433,23 +446,25 @@ async def test_short_session_restart_keeps_new_stream(_inmemory_channel_layer):
     assert node.last_uplink_seq == 2
     await comm1.disconnect()
 
-    # --- session 2: agent restarted, new stream restarts at seq=1 ---
+    # --- session 2: agent restarted; persistent counter resumes at 3 ---
     comm2 = WebsocketCommunicator(fleet_application, "/ws/fleet/")
     await comm2.connect()
-    await _register(comm2, "edge-m3-restart", token)
-    # register reset the high-water mark.
+    ack = await _register(comm2, "edge-m3-restart", token)
+    # M5: the high-water mark is preserved and reported back, so the edge
+    # resumes at seq 3 rather than mistakenly restarting its stream at 1.
+    assert ack["last_uplink_seq"] == 2
     await sync_to_async(node.refresh_from_db)()
-    assert node.last_uplink_seq == 0
+    assert node.last_uplink_seq == 2
 
-    # seq=1 again — old logic judged this DUPLICATE and silently dropped it.
+    # The edge resumes its persistent seq counter: the next frame is seq=3.
     await comm2.send_json_to(make_lifecycle(
-        edge_id="edge-m3-restart", monotonic_seq=1, event="task.running",
+        edge_id="edge-m3-restart", monotonic_seq=3, event="task.running",
         task_id=task.id, task_code=task.code))
     ack = await comm2.receive_json_from()
     assert ack["type"] == FRAME_ACK
 
     await sync_to_async(node.refresh_from_db)()
-    assert node.last_uplink_seq == 1  # advanced, not stuck at 2
+    assert node.last_uplink_seq == 3  # advanced from 2, no gap
     # The new stream's task.running was recorded — one row per session.
     running_rows = await sync_to_async(
         EdgeLifecycleEvent.objects.filter(edge=node, event="task.running").count

@@ -19,6 +19,12 @@ class EdgeNodeSerializer(serializers.ModelSerializer):
             "version",
             "labels",
             "last_seen",
+            # M5 offline/backfill observability — lets /fleet show whether
+            # an edge is sitting on un-shipped uplink frames and when it
+            # last drained a backfill.
+            "last_uplink_seq",
+            "buffer_backlog",
+            "last_backfill_at",
             "created_at",
             "updated_at",
         )

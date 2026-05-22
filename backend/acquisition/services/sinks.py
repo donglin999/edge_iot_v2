@@ -458,12 +458,13 @@ class AlarmSink(Sink):
         try:
             from .alarms import evaluate_readings
 
-            fired = evaluate_readings(self.session, meta["device_code"], adapter)
-            # M4 (distributed): relay every freshly-fired alarm up the
-            # uplink hook. No-op in a monolith (no hook registered); on an
-            # edge the edge-agent ships each as an ``alarm_event`` frame.
-            if fired:
-                self._emit_alarm_events(fired)
+            transitions = evaluate_readings(self.session, meta["device_code"], adapter)
+            # M4/M5 (distributed): relay every alarm transition up the
+            # uplink hook — ``firing`` (M4) and ``cleared`` (M5). No-op in a
+            # monolith (no hook registered); on an edge the edge-agent ships
+            # each as an ``alarm_event`` frame.
+            if transitions:
+                self._emit_alarm_events(transitions)
         except Exception as exc:  # noqa: BLE001
             logger.warning("AlarmSink evaluate failed: %s", exc)
         finally:
@@ -478,9 +479,12 @@ class AlarmSink(Sink):
                 pass
 
     @staticmethod
-    def _emit_alarm_events(fired) -> None:
-        """Relay freshly-fired alarms to the optional uplink hook (M4).
+    def _emit_alarm_events(transitions) -> None:
+        """Relay alarm transitions to the optional uplink hook (M4/M5).
 
+        ``transitions`` are the ``Alarm`` rows :func:`evaluate_readings`
+        just fired or cleared; each carries its own ``status`` so the
+        edge-agent ships a ``firing`` or ``cleared`` ``alarm_event`` frame.
         Best-effort and isolated from evaluation: a hook failure must not
         affect the local ``Alarm`` rows ``evaluate_readings`` already wrote.
         """
@@ -488,7 +492,7 @@ class AlarmSink(Sink):
 
         if not uplink.has_alarm_hook():
             return
-        for alarm in fired:
+        for alarm in transitions:
             try:
                 rule = alarm.rule
                 uplink.emit_alarm(uplink.AlarmEvent(

@@ -1,4 +1,4 @@
-# Distributed control-plane protocol — v0.4 (M4)
+# Distributed control-plane protocol — v0.5 (M5)
 
 Wire format for the WebSocket channel between each **edge-agent** and the
 **center** (`fleet/` Django app). One persistent WS connection per edge.
@@ -7,9 +7,9 @@ Wire format for the WebSocket channel between each **edge-agent** and the
 - Endpoint: `ws[s]://<center>/ws/fleet/`
 - Authentication: activation token, presented in the first `register` frame.
 
-Every frame carries `"v": "0.4"`. The center also accepts `"v": "0.1"`,
-`"v": "0.2"` and `"v": "0.3"` during the upgrade window so a stale agent
-can still register; older agents simply never see the newer frame types.
+Every frame carries `"v": "0.5"`. The center also accepts `"v": "0.1"`
+through `"v": "0.4"` during the upgrade window so a stale agent can still
+register; older agents simply never see the newer frame types / fields.
 
 ## Common envelope
 
@@ -32,6 +32,19 @@ existing field's meaning. The M1/M2/M3 public contract is preserved:
   *optional* field on the existing `apply_config` frame (`alarm_rules`).
   A v0.3 edge ignores `alarm_rules`; a v0.4 center sending it to a v0.3
   edge is harmless.
+- **v0.5** adds **no new frame types** — only *optional* fields, for
+  offline degradation + reconnect backfill (M5):
+  - `register.uplink_seq` — the edge's persistent uplink high-water mark.
+  - `ack.last_uplink_seq` — the center's high-water mark, returned on
+    every ack so the edge knows where to backfill from / prune to.
+  - `heartbeat.buffer` — depth of the edge's durable outbox.
+  - `backfill: true` — set on a replayed uplink frame the edge is
+    re-sending from its durable outbox after a reconnect.
+  A v0.4 peer ignores every one of these fields.
+
+  v0.5 does **not** change the meaning of any existing field. In
+  particular `alarm_event.status` still only takes `firing` from the edge;
+  `cleared` remains reserved (a later milestone).
 
 | frame            | direction        | version | purpose                                       |
 |------------------|------------------|---------|-----------------------------------------------|
@@ -58,41 +71,66 @@ v0.3 introduces a single per-edge **uplink sequence number**. Every
 edge-agent at enqueue time, shared across all uplink frame types so they
 form one ordered stream.
 
-Edge side:
+Edge side (**v0.5 — persistent counter**):
 
-- The counter starts at `1` on each edge-agent **process start** and
-  increments by 1 per uplink frame. It is per-process: it keeps counting
-  across WS reconnects within the same process; a process restart restarts
-  it at `1`. It is not persisted to disk this milestone.
+- The counter lives in the edge's durable SQLite outbox
+  (`edge_uplink_meta.seq_high`). It increments by 1 per uplink frame and
+  **survives a process restart** — a restarted edge resumes at `N+1`, not
+  `1`. This is the change from v0.3/v0.4's per-process counter and is what
+  makes restart-safe backfill possible.
+- Every uplink frame is persisted to the outbox **before** it hits the
+  wire, so a crash between persist and send cannot lose it.
 
-Center side:
+Center side (**v0.5 — no register reset**):
 
-- The center stores the highest value it has seen per edge as
-  `EdgeNode.last_uplink_seq`, and **resets it to `0` on every `register`**.
-  A new WS session is a new uplink stream — a fresh socket means the prior
-  high-water mark no longer applies.
-- The **first frame after a register** (`last_uplink_seq == 0`) is always
-  accepted as `advanced`, whatever its `monotonic_seq`. This covers both a
-  cold start (the edge sends seq `1`) and a reconnect of a long-running
-  agent (the edge's per-process counter is already at seq `N`). Without
-  this, a short-session restart — agent emits a few frames, restarts, new
-  stream from seq `1` — would see seq `1..N` mis-classified as stale
-  duplicates and dropped.
+- The center stores the highest value it has accepted per edge as
+  `EdgeNode.last_uplink_seq`. v0.5 **no longer resets it on `register`** —
+  the edge counter is persistent, so the high-water mark stays valid
+  across WS sessions. The center returns it in the `register` ack
+  (`last_uplink_seq`) so the reconnecting edge knows its backfill start.
 - Within an established stream (`last_uplink_seq > 0`):
   - `monotonic_seq <= last_uplink_seq` is a **duplicate** / replay: the
     center applies it idempotently and does **not** move the high-water
-    mark backward.
+    mark backward. This is what makes backfill safe — a re-sent frame the
+    center already had is dropped, never doubled.
   - `monotonic_seq == last_uplink_seq + 1` **advances** the stream.
-  - `monotonic_seq > last_uplink_seq + 1` is a **gap** (frames lost while
-    offline): the center logs it, still records the frame, and advances
-    the mark. Closing the gap is M5 (offline backfill) — out of scope
-    here, which only implements the online path.
+  - `monotonic_seq > last_uplink_seq + 1` is a **gap**: the center logs
+    it, still records the frame, and advances the mark. In normal M5
+    operation the edge backfills proactively so the center never sees a
+    gap; a gap verdict means the edge's durable outbox overflowed its cap.
+- `last_uplink_seq == 0` means no frame ever accepted (a brand-new edge);
+  its first frame is `advanced`.
 - A frame with `monotonic_seq <= 0` is malformed and rejected with a
   `bad_frame` error.
 
 `register` / `heartbeat` / `config_applied` / `task_state` do **not**
 carry `monotonic_seq` — they are control frames, not part of the uplink
 data stream.
+
+## Offline degradation + reconnect backfill (v0.5 — M5)
+
+When the center is unreachable the edge keeps acquiring and keeps
+evaluating alarms locally; uplink frames accumulate in the **durable
+SQLite outbox** instead of an in-process queue, so they survive an
+edge-agent restart mid-outage.
+
+On reconnect:
+
+1. The edge `register`s, advertising its `uplink_seq` (persistent
+   high-water). The center replies `ack` with its own `last_uplink_seq`.
+2. The edge prunes outbox frames `<= last_uplink_seq` (already delivered)
+   and **backfills** the rest in `monotonic_seq` order, tagged
+   `backfill: true`. Backfill is sent in batches with a pause between
+   them so a large backlog cannot flood the center on reconnect.
+3. The center processes backfilled frames through the **same**
+   `classify_uplink_seq` path — duplicates are dropped idempotently, so
+   backfill produces **zero loss and zero duplicate** rows.
+4. The center acks each accepted frame with the new `last_uplink_seq`;
+   the edge prunes its outbox up to that point, keeping the table small.
+
+If the edge's durable buffer was wiped (its `uplink_seq` is behind the
+center), `sync_to_center` fast-forwards the edge counter to the center's
+mark so the stream stays monotonic.
 
 ## `lifecycle` — edge → center  (v0.3)
 
@@ -303,12 +341,11 @@ but the uplink sequence still advances.
 | `sample_batch`   | `ack` with `ref="sample_batch"`        |
 | `alarm_event`    | `ack` with `ref="alarm_event"`         |
 
-The edge MAY ignore acks for `lifecycle` / `sample_batch` / `alarm_event`;
-they exist for at-least-once delivery hooks the center may grow later (M5).
+v0.5: every `ack` carries `last_uplink_seq` — the center's high-water
+mark for this edge. The edge uses it to prune its durable outbox up to the
+confirmed seq; on the `register` ack it is also the backfill start point.
 
 ## Reconnect behaviour (client side)
-
-Unchanged from v0.1/v0.2:
 
 - On any close that isn't `1000`/`1001`, the edge waits an
   exponential-backoff delay (1 → 2 → 4 → 8 → 16 → 30 s, capped at 30 s)
@@ -316,19 +353,12 @@ Unchanged from v0.1/v0.2:
 - The backoff timer is **reset to 1 s** after the next successful
   `register` ack.
 - On reconnect the center re-pushes the latest `apply_config`.
-- Uplink frames produced while the socket is down are buffered in a
-  bounded in-process queue and flushed on reconnect (online path only;
-  durable cross-restart buffering / backfill is M5).
+- v0.5: uplink frames produced while the socket is down accumulate in the
+  edge's **durable SQLite outbox** — they survive an edge-agent restart
+  mid-outage and are backfilled in `monotonic_seq` order on reconnect
+  (see *Offline degradation + reconnect backfill* above).
 
-## Out of scope for v0.4 (planned for M5+)
+## Out of scope for v0.5 (planned for M6+)
 
-- Durable offline buffering / `monotonic_seq` gap backfill — M5. M4
-  alarms ride the existing online uplink stream; an offline edge buffers
-  `alarm_event` frames in the same bounded in-process queue as
-  `lifecycle` / `sample_batch` and flushes them on reconnect (online
-  path only — cross-restart durability is M5).
-- `alarm_event` clear-transition (`status: "cleared"`) uplink — M5. M4
-  reports fire transitions only; the `status` field is already on the
-  wire so M5 can light up clears without another version bump.
 - Historical query proxy — M6
-- mTLS / signed bootstrap, beyond the bare activation token
+- mTLS / signed bootstrap, beyond the bare activation token — M7

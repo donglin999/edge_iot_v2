@@ -15,6 +15,7 @@ import pytest
 
 from edge_agent.agent import EdgeAgent
 from edge_agent.config import EdgeConfig
+from edge_agent.outbox import DurableOutbox
 from edge_agent.protocol import (
     FRAME_CONFIG_APPLIED,
     FRAME_TASK_STATE,
@@ -108,7 +109,7 @@ async def test_handle_apply_config_persists_and_replies_ok(monkeypatch):
     assert store.saved and store.saved[-1]["version"] == 3
     assert runner.reconciled == [[12, 13]]
 
-    reply = agent._outbox.get_nowait()
+    reply = agent._control_outbox.get_nowait()
     assert reply["type"] == FRAME_CONFIG_APPLIED
     assert reply["version"] == 3
     assert reply["status"] == "ok"
@@ -129,19 +130,19 @@ async def test_handle_apply_config_replies_error_on_failure(monkeypatch):
 
     # Runner must NOT be reconciled on a failed apply.
     assert runner.reconciled == []
-    reply = agent._outbox.get_nowait()
+    reply = agent._control_outbox.get_nowait()
     assert reply["type"] == FRAME_CONFIG_APPLIED
     assert reply["status"] == "error"
     assert reply["version"] == 4
     assert "bad device protocol" in reply["error"]
 
 
-def test_emit_task_state_enqueues_frame():
+def test_emit_task_state_enqueues_frame(tmp_path):
     """v0.3: task state transitions are emitted as ``lifecycle`` frames."""
-    agent = EdgeAgent(_cfg())
+    agent = EdgeAgent(_cfg(), durable_outbox=DurableOutbox(str(tmp_path / "o.db")))
     agent._emit_task_state(12, "task-12", TASK_STATE_RUNNING, None)
 
-    frame = agent._outbox.get_nowait()
+    frame = agent._durable_outbox.pending()[0][1]
     assert frame["type"] == "lifecycle"
     assert frame["event"] == "task.running"
     assert frame["task_id"] == 12
@@ -214,7 +215,7 @@ async def test_handle_apply_config_real_orm_no_async_violation(django_edge):
         # would raise SynchronousOnlyOperation.
         await agent._handle_apply_config(_real_frame(version=1))
 
-        reply = agent._outbox.get_nowait()
+        reply = agent._control_outbox.get_nowait()
         assert reply["type"] == FRAME_CONFIG_APPLIED
         assert reply["status"] == "ok", reply
         assert reply["version"] == 1

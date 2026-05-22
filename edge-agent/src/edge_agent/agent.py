@@ -11,6 +11,19 @@ center. On top of the v0.1 register/heartbeat loop, M2 adds:
 On startup, before the first WS connect, the agent replays the most
 recent cached ``apply_config`` frame from disk so a power-cycled edge
 continues acquiring without needing to wait for the center to reconnect.
+
+M5 adds offline degradation + reconnect backfill:
+
+* uplink frames (``lifecycle`` / ``sample_batch`` / ``alarm_event``) are
+  persisted in a SQLite :class:`~edge_agent.outbox.DurableOutbox` *before*
+  they hit the wire — they survive an edge restart in the middle of an
+  outage.
+* on reconnect the center reports its ``last_uplink_seq`` in the register
+  ack; the agent prunes everything already delivered and backfills the
+  seq gap (batched / throttled so a long backlog does not flood the
+  center).
+* the center acks each accepted uplink frame with its new
+  ``last_uplink_seq``; the agent prunes the outbox up to that point.
 """
 from __future__ import annotations
 
@@ -95,6 +108,7 @@ class EdgeAgent:
         backoff: ExponentialBackoff | None = None,
         state_store=None,
         runner=None,
+        durable_outbox=None,
     ) -> None:
         self.config = config
         self.heartbeat_interval = heartbeat_interval
@@ -107,14 +121,32 @@ class EdgeAgent:
         # that drive ``_handle_apply_config`` directly can inject their own.
         self._state_store = state_store
         self._runner = runner
-        self._outbox: "queue.Queue[dict]" = queue.Queue()
+        # Control-plane replies (``config_applied``) that are NOT part of the
+        # seq'd uplink stream — transient, fine to lose on a restart.
+        self._control_outbox: "queue.Queue[dict]" = queue.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._current_ws = None
-        # M3 uplink: a single per-process monotonic sequence shared by every
-        # ``lifecycle`` / ``sample_batch`` frame. Assigned under the lock so
-        # the seq order matches the FIFO outbox order (see _enqueue_uplink).
-        self._uplink_lock = threading.Lock()
-        self._uplink_seq = 0
+        # M5 uplink: ``lifecycle`` / ``sample_batch`` / ``alarm_event`` frames
+        # go through the durable SQLite outbox so they survive an edge
+        # restart and can be backfilled by seq gap after a reconnect. The
+        # monotonic seq counter is persistent (it lives in the outbox),
+        # replacing M3's per-process counter.
+        self._durable_outbox = durable_outbox
+        # Signalled whenever a frame is appended so the uplink loop wakes
+        # without busy-polling SQLite.
+        self._uplink_signal = threading.Event()
+        # Highest seq pushed on the *current* WS session. Reset to the
+        # center's high-water mark on each reconnect so unacked frames are
+        # resent; never moved by an ack (acks prune, they don't un-send).
+        self._uplink_sent_high = 0
+        # ``last_uplink_seq`` the center reported in its register ack — the
+        # backfill resume point for this session.
+        self._center_last_seq = 0
+        # Highest seq that existed in the outbox at reconnect time. Frames
+        # at/below it are replayed history → tagged ``backfill`` on the wire
+        # so the center can stamp ``EdgeNode.last_backfill_at``. Frames above
+        # it are produced live during the session and ship un-tagged.
+        self._backfill_through = 0
         self._sample_hook_registered = False
         self._alarm_hook_registered = False
 
@@ -195,6 +227,10 @@ class EdgeAgent:
         # Successful register means we have a real edge identity — reset
         # the backoff so the next disconnect starts from 1 s again.
         self._backoff.reset()
+        # M5: reconcile the durable outbox against the center's high-water
+        # mark (reported in the register ack). Prune frames the center
+        # already has; the rest is the backfill set the uplink loop drains.
+        await self._sync_outbox_to_center()
         # M3: announce the session is up. The center logs this into its
         # lifecycle event timeline; ``session.offline`` is synthesised
         # center-side on disconnect (a closing socket cannot send a frame).
@@ -206,10 +242,12 @@ class EdgeAgent:
 
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws), name="edge-agent.heartbeat")
         reader_task = asyncio.create_task(self._read_loop(ws), name="edge-agent.reader")
-        outbox_task = asyncio.create_task(self._outbox_loop(ws), name="edge-agent.outbox")
+        control_task = asyncio.create_task(self._control_loop(ws), name="edge-agent.control")
+        uplink_task = asyncio.create_task(self._uplink_loop(ws), name="edge-agent.uplink")
+        session_tasks = (heartbeat_task, reader_task, control_task, uplink_task)
         try:
             done, pending = await asyncio.wait(
-                {heartbeat_task, reader_task, outbox_task},
+                set(session_tasks),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
@@ -218,18 +256,51 @@ class EdgeAgent:
             for t in done:
                 t.result()
         finally:
-            for t in (heartbeat_task, reader_task, outbox_task):
+            for t in session_tasks:
                 if not t.done():
                     t.cancel()
                     with suppress(asyncio.CancelledError):
                         await t
 
+    async def _sync_outbox_to_center(self) -> None:
+        """Reconcile the durable outbox after a (re)connect.
+
+        Prunes frames the center already confirmed and arms the uplink
+        loop to resend everything still pending as the seq-gap backfill.
+        """
+        if self._durable_outbox is None:
+            return
+        loop = asyncio.get_running_loop()
+        pending = await loop.run_in_executor(
+            None, self._durable_outbox.sync_to_center, self._center_last_seq
+        )
+        # Resend from the center's high-water mark: anything still in the
+        # outbox has seq > center_last_seq and gets pushed by _uplink_loop.
+        self._uplink_sent_high = self._center_last_seq
+        # Everything already in the outbox now is backfill history; frames
+        # appended after this point are live and ship un-tagged.
+        self._backfill_through = await loop.run_in_executor(
+            None, self._durable_outbox.seq_high
+        )
+        if pending:
+            logger.info(
+                "edge-agent: reconnect backfill — %d frame(s) pending "
+                "from seq>%d (through seq=%d)",
+                pending, self._center_last_seq, self._backfill_through,
+            )
+        self._uplink_signal.set()
+
     async def _register(self, ws) -> None:
+        # v0.5: advertise our persistent uplink high-water mark so the
+        # center can spot an edge whose local state was wiped (seq
+        # regressed) and reconcile rather than mis-classify the stream.
+        edge_seq = self._durable_outbox.seq_high() if self._durable_outbox else 0
         frame = make_register(
             edge_id=self.config.edge_id,
             token=self.config.edge_token,
             version=__version__,
             labels=self.config.labels,
+            uplink_seq=edge_seq,
         )
         await ws.send(json.dumps(frame))
         # Wait for the center's ack (or error) before flipping to heartbeat.
@@ -239,16 +310,31 @@ class EdgeAgent:
             raise RuntimeError(f"center rejected register: {msg.get('code')} {msg.get('message')}")
         if msg.get("type") != FRAME_ACK:
             raise RuntimeError(f"expected ack to register, got: {msg!r}")
-        logger.info("registered with center as edge=%s proto=%s", self.config.edge_id, PROTOCOL_VERSION)
+        # M5: the register ack carries the center's high-water uplink seq.
+        # A v0.3/v0.4 center that predates M5 omits it — treat as 0 (the
+        # whole outbox is then backfilled, and the center's idempotent seq
+        # dedup drops anything it already had).
+        try:
+            self._center_last_seq = int(msg.get("last_uplink_seq") or 0)
+        except (TypeError, ValueError):
+            self._center_last_seq = 0
+        logger.info(
+            "registered with center as edge=%s proto=%s center_seq=%d",
+            self.config.edge_id, PROTOCOL_VERSION, self._center_last_seq,
+        )
 
     async def _heartbeat_loop(self, ws) -> None:
         while not self._stop.is_set():
             uptime = time.monotonic() - self._started_at
             tasks_running = len(self._runner.running_task_ids()) if self._runner else 0
+            # Report the durable-outbox backlog so /fleet can show an edge
+            # that is sitting on un-shipped uplink frames (积压量).
+            backlog = self._durable_outbox.depth() if self._durable_outbox else 0
             frame = make_heartbeat(
                 edge_id=self.config.edge_id,
                 uptime=uptime,
                 tasks=tasks_running,
+                buffer=backlog,
             )
             await ws.send(json.dumps(frame))
             try:
@@ -265,21 +351,50 @@ class EdgeAgent:
             if mtype == FRAME_APPLY_CONFIG:
                 await self._handle_apply_config(msg)
                 continue
+            if mtype == FRAME_ACK:
+                await self._handle_ack(msg)
+                continue
             logger.debug("recv %s", mtype)
 
-    async def _outbox_loop(self, ws) -> None:
-        """Forward frames produced by background threads onto the WS.
+    async def _handle_ack(self, msg: dict) -> None:
+        """Prune the durable outbox up to the center's confirmed seq.
 
-        ``TaskRunner`` runs in OS threads; its state callback enqueues
-        ``task_state`` frames via :meth:`enqueue_frame`, and this coroutine
-        pulls them off the queue inside the event loop's thread so we
-        never touch ``ws.send`` from outside the loop.
+        Every center ack (register / heartbeat / per-uplink-frame) carries
+        ``last_uplink_seq`` once the peer is M5-aware. Frames at or below it
+        are confirmed delivered, so they are dropped from the outbox — this
+        is what keeps the table small on a long-lived online session.
+        """
+        if self._durable_outbox is None:
+            return
+        raw = msg.get("last_uplink_seq")
+        if raw is None:
+            return
+        try:
+            seq = int(raw)
+        except (TypeError, ValueError):
+            return
+        if seq <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._durable_outbox.ack, seq)
+        except Exception:  # noqa: BLE001
+            logger.exception("edge-agent: outbox ack prune failed (seq=%d)", seq)
+
+    async def _control_loop(self, ws) -> None:
+        """Forward control-plane replies (``config_applied``) onto the WS.
+
+        ``TaskRunner`` / ``_apply_config_blocking`` run in OS threads; they
+        enqueue control frames via :meth:`enqueue_frame`, and this coroutine
+        pulls them off the queue inside the event loop's thread so we never
+        touch ``ws.send`` from outside the loop. Seq'd uplink frames go
+        through :meth:`_uplink_loop` / the durable outbox instead.
         """
         loop = asyncio.get_running_loop()
 
         def _next_frame() -> Optional[dict]:
             try:
-                return self._outbox.get(timeout=0.5)
+                return self._control_outbox.get(timeout=0.5)
             except queue.Empty:
                 return None
 
@@ -288,6 +403,47 @@ class EdgeAgent:
             if frame is None:
                 continue
             await ws.send(json.dumps(frame))
+
+    async def _uplink_loop(self, ws) -> None:
+        """Drain the durable outbox onto the WS — backfill + steady state.
+
+        On a fresh session ``_uplink_sent_high`` is the center's high-water
+        mark, so the first pass resends every still-pending frame (the
+        reconnect backfill). Frames are pushed in seq order, in batches of
+        ``backfill_batch`` with a ``backfill_pause`` between *full* batches
+        so a large backlog cannot flood the center the instant the socket
+        comes back. Acked frames are pruned out-of-band by :meth:`_handle_ack`.
+        """
+        loop = asyncio.get_running_loop()
+        batch_size = self.config.backfill_batch
+
+        def _fetch_batch() -> list:
+            if self._durable_outbox is None:
+                return []
+            return self._durable_outbox.pending(
+                after=self._uplink_sent_high, limit=batch_size
+            )
+
+        while not self._stop.is_set():
+            batch = await loop.run_in_executor(None, _fetch_batch)
+            if not batch:
+                # Nothing to send — wait for an append signal (or 0.5 s
+                # tick so a missed signal can never wedge the loop).
+                await loop.run_in_executor(None, self._uplink_signal.wait, 0.5)
+                self._uplink_signal.clear()
+                continue
+            for seq, frame in batch:
+                # Tag replayed history so the center can stamp
+                # ``last_backfill_at``; live frames (seq above the reconnect
+                # high-water) ship exactly as built.
+                if seq <= self._backfill_through:
+                    frame = {**frame, "backfill": True}
+                await ws.send(json.dumps(frame))
+                self._uplink_sent_high = seq
+            # A full batch means more is likely waiting (backfill flood) —
+            # pause so the center can keep up before the next batch.
+            if len(batch) >= batch_size and self.config.backfill_pause > 0:
+                await self._sleep(self.config.backfill_pause)
 
     # ---- M2: apply_config + task_state ------------------------------------
 
@@ -307,12 +463,24 @@ class EdgeAgent:
         # to run tasks. ensure_setup is idempotent so re-entries are fine.
         try:
             from .django_setup import ensure_setup
+            from .outbox import DurableOutbox
             from .runner import TaskRunner
             from .state import EdgeStateStore
 
             db_path = ensure_setup(sample_window=self.config.uplink_sample_window)
             if self._state_store is None:
                 self._state_store = EdgeStateStore(db_path)
+            if self._durable_outbox is None:
+                # Same SQLite file as the rest of the edge state — the
+                # outbox tables are plain KV-style, separate from the
+                # Django-managed ORM tables.
+                self._durable_outbox = DurableOutbox(
+                    db_path, max_rows=self.config.uplink_buffer_max
+                )
+                logger.info(
+                    "edge-agent: durable uplink outbox ready (depth=%d high_seq=%d)",
+                    self._durable_outbox.depth(), self._durable_outbox.seq_high(),
+                )
             if self._runner is None:
                 self._runner = TaskRunner(on_state=self._emit_task_state)
             self._register_sample_hook()
@@ -411,8 +579,8 @@ class EdgeAgent:
     def _apply_config_blocking(self, frame: dict) -> None:
         """Sync body of apply_config handling — runs in a worker thread.
 
-        Enqueues the ``config_applied`` reply onto the thread-safe outbox;
-        the ``_outbox_loop`` coroutine forwards it on the WS.
+        Enqueues the ``config_applied`` reply onto the thread-safe control
+        outbox; the ``_control_loop`` coroutine forwards it on the WS.
         """
         version = frame.get("version")
         from .state import apply_frame
@@ -506,9 +674,10 @@ class EdgeAgent:
         """Alarm-uplink hook — runs on the AlarmSink writer thread.
 
         ``event`` is an ``acquisition.services.uplink.AlarmEvent``. We ship
-        one ``alarm_event`` frame per fired alarm, carrying a ``monotonic_seq``
-        from the same per-process counter the lifecycle / sample_batch
-        frames use (M3 uplink stream semantics).
+        one ``alarm_event`` frame per alarm transition — ``firing`` and
+        (M5) ``cleared`` — carrying a ``monotonic_seq`` from the same
+        persistent durable-outbox counter the lifecycle / sample_batch
+        frames use (one ordered uplink stream).
         """
         self._enqueue_uplink(lambda seq: make_alarm_event(
             edge_id=self.config.edge_id,
@@ -524,25 +693,30 @@ class EdgeAgent:
         ))
 
     def _enqueue_uplink(self, build_frame: Callable[[int], dict]) -> None:
-        """Assign the next ``monotonic_seq`` and enqueue an uplink frame.
+        """Persist an uplink frame in the durable outbox.
 
-        The seq increment, frame build, and outbox put all happen under
-        ``_uplink_lock`` so the sequence numbers land on the FIFO outbox
-        in strictly increasing order even when several worker threads
-        (task runner + WebSocketSink broadcaster) emit concurrently.
+        :class:`~edge_agent.outbox.DurableOutbox` allocates the next
+        persistent ``monotonic_seq``, builds the frame and writes it to
+        SQLite atomically — so even an edge-agent crash right after this
+        call cannot lose the frame. The uplink loop picks it up from disk.
+
+        Called from several worker threads (task runner + WebSocketSink +
+        AlarmSink); the outbox serialises them internally.
         """
-        with self._uplink_lock:
-            self._uplink_seq += 1
-            try:
-                frame = build_frame(self._uplink_seq)
-            except Exception:  # noqa: BLE001
-                logger.exception("uplink frame build failed (seq=%d)", self._uplink_seq)
-                return
-            self._outbox.put_nowait(frame)
+        if self._durable_outbox is None:
+            logger.warning("uplink frame dropped — durable outbox not ready")
+            return
+        try:
+            self._durable_outbox.append(build_frame)
+        except Exception:  # noqa: BLE001
+            logger.exception("uplink frame persist failed")
+            return
+        # Wake the uplink loop so a freshly-appended frame ships promptly.
+        self._uplink_signal.set()
 
     def enqueue_frame(self, frame: dict) -> None:
-        """Thread-safe queue from background workers to the WS sender."""
-        self._outbox.put_nowait(frame)
+        """Thread-safe queue of a control-plane reply to the WS sender."""
+        self._control_outbox.put_nowait(frame)
 
     # ---- helpers -----------------------------------------------------------
 

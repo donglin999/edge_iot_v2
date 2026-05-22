@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
 
-PROTOCOL_VERSION = "0.4"
+PROTOCOL_VERSION = "0.5"
 
 # --- frame type constants ---------------------------------------------------
 
@@ -73,7 +73,22 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def make_register(*, edge_id: str, token: str, version: str, labels: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def make_register(
+    *,
+    edge_id: str,
+    token: str,
+    version: str,
+    labels: Dict[str, Any] | None = None,
+    uplink_seq: int = 0,
+) -> Dict[str, Any]:
+    """Edge → center: first frame of a session.
+
+    v0.5 adds ``uplink_seq`` — the edge's current persistent uplink
+    high-water mark. The center compares it against its own stored
+    ``last_uplink_seq`` to decide where the edge should resume backfilling
+    from, and to detect an edge whose local buffer was wiped (seq
+    regressed). A v0.4 center ignores the field.
+    """
     return {
         "v": PROTOCOL_VERSION,
         "type": FRAME_REGISTER,
@@ -81,10 +96,26 @@ def make_register(*, edge_id: str, token: str, version: str, labels: Dict[str, A
         "token": token,
         "version": version,
         "labels": labels or {},
+        "uplink_seq": int(uplink_seq),
     }
 
 
-def make_heartbeat(*, edge_id: str, cpu: float = 0.0, mem: float = 0.0, uptime: float = 0.0, tasks: int = 0) -> Dict[str, Any]:
+def make_heartbeat(
+    *,
+    edge_id: str,
+    cpu: float = 0.0,
+    mem: float = 0.0,
+    uptime: float = 0.0,
+    tasks: int = 0,
+    buffer: int = 0,
+) -> Dict[str, Any]:
+    """Edge → center: ~1 Hz liveness ping.
+
+    v0.5 adds ``buffer`` — the number of uplink frames currently held in
+    the edge's durable buffer (its backlog积压量). The center mirrors it
+    onto ``EdgeNode.buffer_backlog`` so /fleet can show an edge that is
+    sitting on un-shipped data.
+    """
     return {
         "v": PROTOCOL_VERSION,
         "type": FRAME_HEARTBEAT,
@@ -93,6 +124,7 @@ def make_heartbeat(*, edge_id: str, cpu: float = 0.0, mem: float = 0.0, uptime: 
         "mem": mem,
         "uptime": uptime,
         "tasks": tasks,
+        "buffer": int(buffer),
     }
 
 

@@ -14,6 +14,7 @@ import pytest
 
 from edge_agent.agent import EdgeAgent
 from edge_agent.config import EdgeConfig
+from edge_agent.outbox import DurableOutbox
 from edge_agent.protocol import PROTOCOL_VERSION, make_alarm_event
 from edge_agent.state import parse_apply_config, persist_to_orm
 
@@ -159,8 +160,10 @@ def test_persist_to_orm_culls_removed_alarm_rules(django_edge):
 
 
 class TestAgentAlarmUplink:
-    def test_on_alarm_event_enqueues_frame_with_seq(self):
-        agent = EdgeAgent(_cfg())
+    def test_on_alarm_event_enqueues_frame_with_seq(self, tmp_path):
+        agent = EdgeAgent(
+            _cfg(), durable_outbox=DurableOutbox(str(tmp_path / "o.db"))
+        )
         event = SimpleNamespace(
             rule_id=5, point_code="holding_0", device_code="plc-1",
             value=137.0, severity="warning", status="firing",
@@ -169,8 +172,8 @@ class TestAgentAlarmUplink:
         agent._on_alarm_event(event)
         agent._on_alarm_event(event)
 
-        f1 = agent._outbox.get_nowait()
-        f2 = agent._outbox.get_nowait()
+        rows = agent._durable_outbox.pending()
+        f1, f2 = rows[0][1], rows[1][1]
         assert f1["type"] == "alarm_event"
         assert f1["rule_id"] == 5
         assert f1["point_code"] == "holding_0"

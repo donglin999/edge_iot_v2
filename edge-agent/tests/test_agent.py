@@ -16,6 +16,7 @@ import pytest
 from edge_agent.agent import EdgeAgent
 from edge_agent.backoff import ExponentialBackoff
 from edge_agent.config import EdgeConfig
+from edge_agent.outbox import DurableOutbox
 from edge_agent.protocol import FRAME_ACK, PROTOCOL_VERSION
 
 
@@ -72,7 +73,7 @@ def _cfg(**overrides: Any) -> EdgeConfig:
 
 
 @pytest.mark.asyncio
-async def test_register_then_heartbeat_sends_expected_frames():
+async def test_register_then_heartbeat_sends_expected_frames(tmp_path):
     fake = FakeWebSocket(incoming=[
         {"v": PROTOCOL_VERSION, "type": FRAME_ACK, "ref": "register"},
         # then a bunch of heartbeat acks
@@ -84,7 +85,10 @@ async def test_register_then_heartbeat_sends_expected_frames():
         assert url == "ws://test/ws/fleet/"
         return fake
 
-    agent = EdgeAgent(_cfg(), heartbeat_interval=0.05, connect_factory=factory)
+    agent = EdgeAgent(
+        _cfg(), heartbeat_interval=0.05, connect_factory=factory,
+        durable_outbox=DurableOutbox(str(tmp_path / "outbox.db")),
+    )
 
     task = asyncio.create_task(agent.run())
     # Let the agent send register + at least 2 heartbeats.
@@ -109,7 +113,7 @@ async def test_register_then_heartbeat_sends_expected_frames():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_uses_backoff_and_resets_on_success():
+async def test_reconnect_uses_backoff_and_resets_on_success(tmp_path):
     """Failed connects should bump the backoff; a successful register resets it.
 
     This is the spec'd guarantee from docs/distributed/protocol.md:
@@ -136,7 +140,10 @@ async def test_reconnect_uses_backoff_and_resets_on_success():
     sleeps: list[float] = []
     backoff = ExponentialBackoff(initial=0.01, factor=2.0, cap=0.16)
 
-    agent = EdgeAgent(_cfg(), heartbeat_interval=10, connect_factory=factory, backoff=backoff)
+    agent = EdgeAgent(
+        _cfg(), heartbeat_interval=10, connect_factory=factory, backoff=backoff,
+        durable_outbox=DurableOutbox(str(tmp_path / "outbox.db")),
+    )
     # Patch the sleep helper so we can assert the schedule without
     # actually waiting seconds in the test.
     orig_sleep = agent._sleep
