@@ -175,6 +175,21 @@ WS_BROADCAST_INTERVAL_S = env.float("WS_BROADCAST_INTERVAL_S", default=1.0)
 CENTER_EDGE_SAMPLE_TO_INFLUX = env.bool("CENTER_EDGE_SAMPLE_TO_INFLUX", default=True)
 CENTER_EDGE_SAMPLE_RETENTION_DAYS = env.int("CENTER_EDGE_SAMPLE_RETENTION_DAYS", default=7)
 
+# M6 history-proxy — center calls each edge's GET /history/points with a
+# Bearer token. ``EDGE_HISTORY_PROXY_DEFAULT_TOKEN`` is the shared-secret
+# fallback used by the smoke compose; production deployments override
+# per-edge via ``EDGE_HISTORY_PROXY_TOKENS={"edge-1":"...","edge-2":"..."}``
+# (JSON in env). The per-edge URL is normally discovered from the edge's
+# register-time labels (``history_url``); ``EDGE_HISTORY_PROXY_URLS``
+# overrides that when the edge cannot advertise its externally reachable
+# URL itself (NAT, double-network, etc.).
+EDGE_HISTORY_PROXY_DEFAULT_TOKEN = env.str(
+    "EDGE_HISTORY_PROXY_DEFAULT_TOKEN", default="",
+)
+EDGE_HISTORY_PROXY_TOKENS = env.json("EDGE_HISTORY_PROXY_TOKENS", default={})
+EDGE_HISTORY_PROXY_URLS = env.json("EDGE_HISTORY_PROXY_URLS", default={})
+EDGE_HISTORY_PROXY_TIMEOUT_S = env.float("EDGE_HISTORY_PROXY_TIMEOUT_S", default=10.0)
+
 # Kafka Settings (Optional)
 KAFKA_ENABLED = env.bool("KAFKA_ENABLED", default=False)
 KAFKA_BOOTSTRAP_SERVERS = env.str("KAFKA_BOOTSTRAP_SERVERS", default="localhost:9092")

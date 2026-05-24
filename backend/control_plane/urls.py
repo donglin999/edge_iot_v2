@@ -12,4 +12,6 @@ urlpatterns = [
     path("api/config/", include("configuration.urls")),
     path("api/acquisition/", include("acquisition.urls")),
     path("api/fleet/", include("fleet.urls")),
+    # M6: history回查代理 — center pulls samples from edges on demand.
+    path("api/history/", include("history_proxy.urls")),
 ]

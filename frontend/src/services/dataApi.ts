@@ -107,7 +107,102 @@ export interface SessionDataPointsResponse {
 }
 
 /**
- * Fetch point history data for visualization
+ * M6 history-proxy response shape (XIU-83).
+ *
+ * The center fans out one HTTP call per edge and merges the results;
+ * `sources[edge_id]` exposes the per-edge payload so the UI can show
+ * "数据来源: edge X", and `errors[edge_id]` carries explicit per-edge
+ * failures (offline, timeout, unreachable) so the Drawer can render a
+ * clear error instead of an empty chart.
+ *
+ * `data` is the merged stream with `edge_id` stamped on every row.
+ */
+export interface HistoryPointsSource {
+  edge_id: string | null;
+  point_ids?: string[];
+  count: number;
+  truncated?: boolean;
+  elapsed_ms?: number;
+  data: HistoryPointSample[];
+}
+
+export interface HistoryPointSample {
+  point_code: string;
+  timestamp: string;
+  value: number | string | boolean | null;
+  quality: string;
+  edge_id?: string | null;
+}
+
+export interface HistoryPointsError {
+  edge_id: string | null;
+  status: number;
+  code: string;
+  message: string;
+}
+
+export interface HistoryPointsResponse {
+  task_ids: number[];
+  point_ids: string[];
+  start: string;
+  end: string;
+  agg: string;
+  limit: number;
+  count: number;
+  queried_at: string;
+  sources: Record<string, HistoryPointsSource>;
+  errors: Record<string, HistoryPointsError>;
+  data: HistoryPointSample[];
+}
+
+export interface FetchHistoryPointsOptions {
+  taskIds: number[];
+  pointIds: string[];
+  start?: string;
+  end?: string;
+  agg?: 'raw' | '1s' | '10s';
+  limit?: number;
+}
+
+/**
+ * Fetch history samples for one or more points via the M6 proxy.
+ *
+ * Backed by `GET /api/history/points`. The center resolves each task to
+ * its owning edge, calls the edge's read-only `/history/points`, and
+ * returns merged results. Edge-offline shows up as a 503 (no successful
+ * source) or as a per-source entry in `errors` (partial success).
+ */
+export async function fetchHistoryPoints(
+  options: FetchHistoryPointsOptions,
+  signal?: AbortSignal
+): Promise<HistoryPointsResponse> {
+  const params = new URLSearchParams();
+  params.set('task_id', options.taskIds.join(','));
+  params.set('point_ids', options.pointIds.join(','));
+  if (options.start) params.set('start', options.start);
+  if (options.end) params.set('end', options.end);
+  if (options.agg) params.set('agg', options.agg);
+  if (options.limit !== undefined) params.set('limit', String(options.limit));
+
+  const response = await fetchWithAbort(
+    `/api/history/points?${params.toString()}`,
+    signal
+  );
+
+  // 503 from the proxy = every targeted edge failed; we still want the
+  // body so callers can render the per-edge error reason.
+  if (!response.ok && response.status !== 503) {
+    throw new Error(`获取历史数据失败: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+/**
+ * Fetch point history data for visualization (legacy single-host route).
+ *
+ * Retained for callers that don't have a `task_id` handy (e.g. CSV
+ * export from the realtime panel). New code should prefer
+ * `fetchHistoryPoints` so the request is dispatched to the right edge.
  */
 export async function fetchPointHistory(
   pointCode: string,
