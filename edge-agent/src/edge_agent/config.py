@@ -49,6 +49,19 @@ class EdgeConfig:
     # frames at 1 Hz) with headroom; the chaos test lowers it to exercise
     # the overflow path.
     uplink_buffer_max: int = 10000
+    # M6 read-only history HTTP server (XIU-83). The edge exposes
+    # ``GET /history/points`` so the center proxy can pull samples for the
+    # ``/data`` page on demand — fleet mode has no center-side raw store.
+    # ``history_url`` is the externally reachable base URL the center
+    # uses to reach this server; it is mirrored into the edge's ``labels``
+    # dict on register so the center can resolve it without an out-of-band
+    # config file. Defaults to ``http://<EDGE_ID>:<history_port>`` which
+    # works in docker-compose where service names are DNS-resolvable.
+    history_enabled: bool = True
+    history_host: str = "0.0.0.0"
+    history_port: int = 18086
+    history_max_points: int = 50000
+    history_url: str = ""
 
     @classmethod
     def from_env(cls, env: Dict[str, str] | None = None) -> "EdgeConfig":
@@ -112,6 +125,47 @@ class EdgeConfig:
         else:
             buffer_max = 10000
 
+        # M6 history-proxy HTTP server.
+        history_enabled = _parse_bool(env.get("EDGE_HISTORY_ENABLED", ""), True)
+        history_host = env.get("EDGE_HISTORY_HOST") or "0.0.0.0"
+        port_raw = env.get("EDGE_HISTORY_PORT", "")
+        if port_raw:
+            try:
+                history_port = int(port_raw)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_HISTORY_PORT must be an integer: {exc}"
+                ) from exc
+            if not (1 <= history_port <= 65535):
+                raise ConfigError(
+                    f"EDGE_HISTORY_PORT must be 1..65535: got {history_port}"
+                )
+        else:
+            history_port = 18086
+        max_raw = env.get("EDGE_HISTORY_MAX_POINTS", "")
+        if max_raw:
+            try:
+                history_max_points = max(1, int(max_raw))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_HISTORY_MAX_POINTS must be an integer: {exc}"
+                ) from exc
+        else:
+            history_max_points = 50000
+        # Operator-supplied URL the center should call. Defaults are filled
+        # in below so a misconfigured edge still advertises *something* the
+        # center can try.
+        history_url = (env.get("EDGE_HISTORY_URL") or "").strip()
+        if not history_url:
+            history_url = f"http://{env['EDGE_ID']}:{history_port}"
+
+        # Mirror history_url into labels so the center can read it off
+        # ``EdgeNode.labels`` without an out-of-band lookup. Operator-supplied
+        # labels win (an operator who explicitly set ``history_url`` in
+        # labels wants exactly that value).
+        if history_enabled and "history_url" not in labels:
+            labels = {**labels, "history_url": history_url}
+
         return cls(
             edge_id=env["EDGE_ID"],
             edge_token=env["EDGE_TOKEN"],
@@ -123,4 +177,9 @@ class EdgeConfig:
             backfill_batch=batch,
             backfill_pause=pause,
             uplink_buffer_max=buffer_max,
+            history_enabled=history_enabled,
+            history_host=history_host,
+            history_port=history_port,
+            history_max_points=history_max_points,
+            history_url=history_url,
         )

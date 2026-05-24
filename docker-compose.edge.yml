@@ -62,6 +62,12 @@ services:
       context: .
       dockerfile: edge-agent/Dockerfile
     container_name: edge-agent
+    # M6: expose the read-only history HTTP port so the center can pull
+    # samples for the /data page on demand. Bind to a host port that can
+    # be overridden via ${EDGE_HISTORY_HOST_PORT} so multiple edges on a
+    # single host don't collide. Default mirrors the in-container port.
+    ports:
+      - "${EDGE_HISTORY_HOST_PORT:-18086}:18086"
     networks:
       - edge-network
     # Mount the host's backend so the agent can `import backend.acquisition`
@@ -92,6 +98,14 @@ services:
       - INFLUXDB_TOKEN=my-super-secret-auth-token
       - INFLUXDB_ORG=edge-iot
       - INFLUXDB_BUCKET=iot-data
+      # --- M6 history-proxy HTTP server --------------------------------
+      # Default port 18086; override per-edge via EDGE_HISTORY_HOST_PORT
+      # (compose) + EDGE_HISTORY_URL (env) so the center can reach this
+      # edge without falling back to docker service-name DNS.
+      - EDGE_HISTORY_ENABLED=${EDGE_HISTORY_ENABLED:-true}
+      - EDGE_HISTORY_PORT=18086
+      - EDGE_HISTORY_MAX_POINTS=${EDGE_HISTORY_MAX_POINTS:-50000}
+      - EDGE_HISTORY_URL=${EDGE_HISTORY_URL:-}
       - TZ=Asia/Shanghai
     depends_on:
       influxdb:

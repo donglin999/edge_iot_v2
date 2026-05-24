@@ -149,6 +149,11 @@ class EdgeAgent:
         self._backfill_through = 0
         self._sample_hook_registered = False
         self._alarm_hook_registered = False
+        # M6: read-only history HTTP server (XIU-83). Started by ``run()``
+        # *after* Django bootstrap so the InfluxDB storage import succeeds.
+        # Stays up across center reconnects — a WS drop must not take
+        # history queries down with it.
+        self._history_server = None
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -172,6 +177,10 @@ class EdgeAgent:
         # Replay the most recent cached apply_config so power-cycled edges
         # resume acquisition immediately, without waiting for the center.
         await loop.run_in_executor(None, self._replay_cached_config)
+        # M6: bring the history HTTP server up alongside the WS reconnect
+        # loop. Failure to bind is logged but NOT fatal — control-plane
+        # must stay up so the center can still dispatch config.
+        await self._start_history_server()
 
         try:
             while not self._stop.is_set():
@@ -218,6 +227,36 @@ class EdgeAgent:
             if self._runner is not None:
                 with suppress(Exception):
                     await loop.run_in_executor(None, self._runner.stop_all)
+            # Tear down the history HTTP server last so an in-flight query
+            # from the center can finish.
+            if self._history_server is not None:
+                with suppress(Exception):
+                    await self._history_server.stop()
+                self._history_server = None
+
+    async def _start_history_server(self) -> None:
+        """Bring up the M6 read-only history HTTP server.
+
+        Constructed lazily so unit tests that drive the WS loop directly
+        don't pay the bind cost. Errors are logged and swallowed — the
+        agent must stay reachable on the control plane even if the HTTP
+        endpoint cannot bind (port collision, missing CAP_NET_BIND, etc.).
+        """
+        if not self.config.history_enabled:
+            logger.info("edge-agent: history HTTP disabled by config")
+            return
+        try:
+            from .history_server import HistoryServer
+
+            self._history_server = HistoryServer(self.config)
+            await self._history_server.start()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "edge-agent: history HTTP failed to bind on %s:%d — "
+                "control-plane will stay up but /history queries are disabled",
+                self.config.history_host, self.config.history_port,
+            )
+            self._history_server = None
 
     # ---- session -----------------------------------------------------------
 

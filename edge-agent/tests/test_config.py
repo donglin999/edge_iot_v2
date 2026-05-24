@@ -17,7 +17,10 @@ def test_from_env_happy_path():
     assert cfg.edge_id == "e1"
     assert cfg.edge_token == "tk"
     assert cfg.center_url == "ws://c/ws/fleet/"
-    assert cfg.labels == {"site": "sh"}
+    # M6: history_url is auto-merged into labels so the center can dial
+    # the edge's history HTTP endpoint without an out-of-band config.
+    assert cfg.labels["site"] == "sh"
+    assert cfg.labels["history_url"] == "http://e1:18086"
     assert cfg.log_level == "DEBUG"
 
 
@@ -45,4 +48,5 @@ def test_labels_default_empty():
     cfg = EdgeConfig.from_env({
         "EDGE_ID": "e1", "EDGE_TOKEN": "t", "CENTER_URL": "ws://c/",
     })
-    assert cfg.labels == {}
+    # M6 auto-injects history_url; otherwise no labels.
+    assert cfg.labels == {"history_url": "http://e1:18086"}
