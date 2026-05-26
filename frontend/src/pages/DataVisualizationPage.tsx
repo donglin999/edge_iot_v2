@@ -38,12 +38,14 @@ import 'dayjs/locale/zh-cn';
 
 import { AcqTask, fetchTasks } from '../services/acquisitionApi';
 import {
+  HistoryPointsError,
   PointLatestValue,
+  fetchHistoryPoints,
   fetchPointHistory,
   fetchPointsLatestValues,
 } from '../services/dataApi';
 import { isAbortError } from '../services/http';
-import PointChart from '../components/PointChart';
+import PointChart, { PointChartMeta } from '../components/PointChart';
 import VirtualPointGrid from '../components/VirtualPointGrid';
 import './DataVisualizationPage.css';
 
@@ -138,6 +140,10 @@ const DataVisualizationPage: React.FC = () => {
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [exporting, setExporting] = useState(false);
   const [now, setNow] = useState(Date.now());
+  // Source / per-edge error metadata reported by <PointChart>. Drives
+  // the "数据来源: edge-x" tag and the partial-failure warning.
+  const [historyDataSource, setHistoryDataSource] = useState<string | null>(null);
+  const [historyEdgeErrors, setHistoryEdgeErrors] = useState<Record<string, HistoryPointsError>>({});
 
   // Use a ref so changing pollInterval doesn't kick off duplicate timers
   // mid-flight. The polling effect re-runs only on filter or interval change.
@@ -242,17 +248,33 @@ const DataVisualizationPage: React.FC = () => {
       });
   }, [fetchLatest, applyLatest]);
 
+  // Reset source / per-edge error state on any filter change so the
+  // tag above the chart doesn't stick to a stale edge while a new fetch
+  // is in flight.
+  const resetHistoryMeta = useCallback(() => {
+    setHistoryDataSource(null);
+    setHistoryEdgeErrors({});
+  }, []);
+
   // Cascading-reset helpers.
   const onTaskChange = (value: number | null) => {
     setFilter({ taskId: value ?? null, deviceId: null, pointCode: null });
+    resetHistoryMeta();
   };
   const onDeviceChange = (value: number | null) => {
     setFilter((prev) => ({ ...prev, deviceId: value ?? null, pointCode: null }));
+    resetHistoryMeta();
   };
   const onPointChange = (value: string | null) => {
     setFilter((prev) => ({ ...prev, pointCode: value ?? null }));
     setHistoryRefreshKey((n) => n + 1);
+    resetHistoryMeta();
   };
+
+  const handleHistoryMetaChange = useCallback((meta: PointChartMeta) => {
+    setHistoryDataSource(meta.dataSource);
+    setHistoryEdgeErrors(meta.errors);
+  }, []);
 
   // Cascading options derived from latestValues + tasks.
   const taskOptions = useMemo(
@@ -308,13 +330,43 @@ const DataVisualizationPage: React.FC = () => {
     try {
       const start = new Date(Date.now() - RANGE_TO_MS[historyRange]).toISOString();
       const end = new Date().toISOString();
-      const res = await fetchPointHistory(filter.pointCode, start, end, 10000);
+      // CSV column shape stays identical across both fetch paths so the
+      // legacy single-host export and the M6 proxy export are
+      // interchangeable. We tag every row with its source edge when the
+      // proxy provides it; legacy rows leave that column blank.
+      type CsvRow = {
+        timestamp: string;
+        value: number | string | boolean | null;
+        quality: string;
+        edge_id?: string | null;
+      };
+      let rowsRaw: CsvRow[] = [];
+      let hasEdgeColumn = false;
+      if (filter.taskId !== null) {
+        const res = await fetchHistoryPoints({
+          taskIds: [filter.taskId],
+          pointIds: [filter.pointCode],
+          start,
+          end,
+          limit: 10000,
+        });
+        rowsRaw = res.data;
+        hasEdgeColumn = true;
+      } else {
+        const res = await fetchPointHistory(filter.pointCode, start, end, 10000);
+        rowsRaw = res.data;
+      }
       const headers = ['时间', '数值', '质量'];
-      const rows = res.data.map((dp) => [
-        new Date(dp.timestamp).toLocaleString('zh-CN'),
-        String(dp.value ?? ''),
-        dp.quality,
-      ]);
+      if (hasEdgeColumn) headers.push('数据源 edge');
+      const rows = rowsRaw.map((dp) => {
+        const base = [
+          new Date(dp.timestamp).toLocaleString('zh-CN'),
+          String(dp.value ?? ''),
+          dp.quality,
+        ];
+        if (hasEdgeColumn) base.push(dp.edge_id ?? '');
+        return base;
+      });
       const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
       const blob = new Blob([`﻿${csv}`], { type: 'text/csv;charset=utf-8;' });
       const link = document.createElement('a');
@@ -571,13 +623,48 @@ const DataVisualizationPage: React.FC = () => {
                 />
               </Col>
             </Row>
+            {/*
+              Source tag is only meaningful in fleet mode (M6 proxy);
+              single-host fallback leaves dataSource null and we keep
+              the header clean per spec.
+            */}
+            {historyDataSource && (
+              <Space size={8} wrap>
+                <Tag color="geekblue">数据来源: {historyDataSource}</Tag>
+              </Space>
+            )}
+            {/*
+              Some — but not all — edges failed. Surface them as a
+              warning above the chart; the successful sources still
+              render. The "every edge failed" case (data empty, errors
+              present) is rendered inside <PointChart> as an error
+              Alert in place of the chart.
+            */}
+            {historyDataSource && Object.keys(historyEdgeErrors).length > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                message="部分数据源不可用"
+                description={
+                  <ul style={{ margin: 0, paddingLeft: 18 }}>
+                    {Object.entries(historyEdgeErrors).map(([edgeName, err]) => (
+                      <li key={edgeName}>
+                        edge {edgeName}: {err.message || err.code}
+                      </li>
+                    ))}
+                  </ul>
+                }
+              />
+            )}
             <PointChart
               pointCode={selectedPoint.point_code}
+              taskId={filter.taskId}
               startTime={historyTimeRange.start}
               endTime={historyTimeRange.end}
               unit={selectedPoint.unit}
               refreshKey={historyRefreshKey}
               height={340}
+              onMetaChange={handleHistoryMetaChange}
             />
           </Space>
         )}
