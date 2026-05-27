@@ -1,4 +1,8 @@
-# Distributed control-plane protocol — v0.5 (M5)
+# Distributed control-plane protocol — v0.5 (STABLE)
+
+**Status: STABLE** — frozen at M7 (XIU-96). No further breaking changes
+planned; future evolution will be additive-only (new optional fields /
+new frame types) under the same v0.5 envelope or a v0.6+ bump.
 
 Wire format for the WebSocket channel between each **edge-agent** and the
 **center** (`fleet/` Django app). One persistent WS connection per edge.
@@ -10,6 +14,23 @@ Wire format for the WebSocket channel between each **edge-agent** and the
 Every frame carries `"v": "0.5"`. The center also accepts `"v": "0.1"`
 through `"v": "0.4"` during the upgrade window so a stale agent can still
 register; older agents simply never see the newer frame types / fields.
+
+## Frame catalogue (v0.5, stable)
+
+| direction | type | first seen | required fields | notes |
+|---|---|---|---|---|
+| edge → center | `register` | v0.1 | `edge_id`, `token`, `version` | v0.5 adds optional `uplink_seq`. First frame on the WS. |
+| edge → center | `heartbeat` | v0.1 | — | ~1 Hz liveness. v0.5 adds optional `buffer` (outbox depth). |
+| edge → center | `task_state` | v0.2 | `task_id`, `state` | v0.2 lifecycle. v0.3+ edges emit richer `lifecycle` instead; center accepts both. |
+| edge → center | `config_applied` | v0.2 | `version`, `accepted`, `summary` | Result of an `apply_config`. |
+| edge → center | `lifecycle` | v0.3 | `task_id`, `state`, `monotonic_seq` | Per-task lifecycle transitions; carries uplink seq. |
+| edge → center | `sample_batch` | v0.3 | `task_id`, `point_id`, `samples[]`, `monotonic_seq` | 1Hz / N-Hz aggregate batch from the edge pipeline. v0.5 may add `backfill: true`. |
+| edge → center | `alarm_event` | v0.4 | `rule_id` or `rule_name`, `point_code`, `value`, `status`, `monotonic_seq` | `status ∈ {firing, cleared}`. v0.5 lights up `cleared`. |
+| center → edge | `ack` | v0.1 | `ref_type`, `ref_seq` or `ref_msg_id` | Always sent in reply to an edge frame. v0.5 adds `last_uplink_seq`. |
+| center → edge | `error` | v0.1 | `code`, `message` | Fatal; center closes the WS. |
+| center → edge | `apply_config` | v0.2 | `version`, `tasks[]`, `devices[]`, `points[]` | Full snapshot. v0.4 adds optional `alarm_rules[]`. |
+
+The wire schemas of each frame are documented in detail below.
 
 ## Common envelope
 

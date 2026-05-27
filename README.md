@@ -275,6 +275,33 @@ curl http://localhost:8086/health
 - CORS配置是否正确
 - 浏览器控制台错误信息
 
+## 分布式形态简介
+
+除单机形态外，本仓库 `distributed/main` 分支提供一套 **多工控机 (edge) +
+中心 (center)** 的分布式形态：每条产线/工控机本地跑 edge-agent + 本地
+InfluxDB + 本地告警判定，原始样本不出工控机；中心 (center) 跑 Django +
+前端 + history-proxy，只承担控制面、配置下发、告警汇总和按需历史回查。
+edge 通过单条 WS 上报心跳/lifecycle/1Hz 聚合/告警事件，断线期间在 edge
+本地 outbox 持久化、重连后按 monotonic_seq 回补。
+
+详细架构、协议、部署、运维：[docs/distributed/README.md](docs/distributed/README.md)
+
+### 单机形态 vs 分布式形态
+
+| 维度 | 单机 (master) | 分布式 (distributed/main) |
+|------|---------------|---------------------------|
+| 部署节点数 | 1 台 | 1 center + N edge |
+| 采集进程 | center 上 Celery worker | 每台 edge 上 edge-agent |
+| 时序写入 | center InfluxDB | **每台 edge 本地 InfluxDB**（center 不存全量） |
+| 控制面 | HTTP REST | HTTP REST + WS (`/ws/fleet/`) |
+| 配置下发 | 直接读 SQLite | center → edge `apply_config` WS 帧 |
+| 告警判定 | center 进程内 | 每台 edge 进程内（按 `device_code` 隔离） |
+| 历史查询 | center → 本地 InfluxDB | center history-proxy → 对应 edge `:18086` |
+| 断网容忍 | 单点 | edge 离线期间继续采，重连后 backfill 无 gap |
+| 适用场景 | 单机房 / 小规模 / POC | 多产线 / 多机房 / 现场恶劣网络 |
+| 协议版本 | n/a | v0.5 (STABLE) |
+| 烟测 / 验收 | `docs/QUICKSTART.md` | `docs/distributed/m{2..7}-*.md` |
+
 ## 项目结构
 
 ```
