@@ -32,6 +32,14 @@ class FleetConfig(AppConfig):
         from . import presence
         presence.install()
 
+        # Phase 2 P5.1 (XIU-107): bind the data-plane handlers
+        # (lifecycle / sample_batch / alarm_event) on the same router.
+        # Without this an inbound MQTT data frame finds no type handler
+        # and ``uplink_router.dispatch`` log-and-drops it — see the P5
+        # acceptance report in docs/distributed/m7-mqtt-acceptance.md.
+        from . import uplink_handlers
+        uplink_handlers.install()
+
         self._maybe_start_mqtt_subscriber()
 
     # ---- MQTT subscriber (XIU-100 Phase 2 P1) -----------------------------
