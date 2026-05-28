@@ -345,3 +345,22 @@ ACQUISITION_CONNECTION_TIMEOUT = env.float("ACQUISITION_CONNECTION_TIMEOUT", def
 
 # Maximum number of consecutive reconnection attempts before giving up
 ACQUISITION_MAX_RECONNECT_ATTEMPTS = env.int("ACQUISITION_MAX_RECONNECT_ATTEMPTS", default=3)
+
+
+# ========================================
+# Fleet MQTT subscriber (XIU-100 Phase 2 P1)
+# ========================================
+#
+# Center side of the WebSocket → MQTT migration. When enabled, daphne's
+# ASGI lifespan hook starts an asyncio task that connects to the broker,
+# subscribes to ``edge/+/uplink/#`` + ``edge/+/lwt`` at QoS 1 and feeds
+# every message into :class:`fleet.uplink_router.UplinkRouter`. Defaults
+# to off so existing deployments (monolith / pre-Phase-2 center) keep
+# importing the settings without a broker reachable; the Phase-2 center
+# compose overrides it to on.
+FLEET_MQTT_ENABLED = env.bool("FLEET_MQTT_ENABLED", default=False)
+FLEET_MQTT_HOST = env.str("FLEET_MQTT_HOST", default="center-mosquitto")
+FLEET_MQTT_PORT = env.int("FLEET_MQTT_PORT", default=1883)
+FLEET_MQTT_CLIENT_ID = env.str("FLEET_MQTT_CLIENT_ID", default="center-fleet-subscriber")
+FLEET_MQTT_USERNAME = env.str("FLEET_MQTT_USERNAME", default="")
+FLEET_MQTT_PASSWORD = env.str("FLEET_MQTT_PASSWORD", default="")

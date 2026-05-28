@@ -19,6 +19,10 @@ modbus-tk==1.1.3
 numpy==1.24.4
 openpyxl==3.1.5
 paho-mqtt==2.1.0
+# XIU-100 Phase 2 P1 — asyncio MQTT client for the fleet uplink subscriber
+# (center side). paho-mqtt above is kept for the acquisition-protocol MQTT
+# driver, which already uses the threaded paho client.
+aiomqtt==2.3.0
 pandas==2.0.3
 py==1.11.0
 pyserial==3.5
