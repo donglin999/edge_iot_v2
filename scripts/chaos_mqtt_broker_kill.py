@@ -20,8 +20,9 @@ There are two modes:
 
 * **live** — drives a real local mosquitto broker. The script publishes
   a stream of frames with strictly increasing seq numbers, sends
-  ``docker compose stop center-mosquitto`` (configurable command),
-  waits the chosen outage length, ``docker compose start center-mosquitto``,
+  ``docker compose stop mosquitto`` (configurable command — note this
+  is the compose *service key*, not the container_name), waits the
+  chosen outage length, ``docker compose start mosquitto``,
   then validates the broker re-emits every published frame in order
   via a subscriber it owns. This is the M5/P4 smoke that the issue
   acceptance criterion ("kill mosquitto 5 minutes, recover in 60s, no
@@ -345,30 +346,47 @@ async def scenario_live(
         f"broker={broker_host}:{broker_port} service={broker_service})"
     )
 
+    # Cap the transport's reconnect backoff so a single publish during the
+    # outage doesn't burn the entire outage window inside one _open_session
+    # call. Production default is 1s→30s exponential, which inside this
+    # chaos harness means one stuck publish swallows the whole outage_target
+    # loop and we under-produce frames (XIU-109).
+    import edge_agent.transport.mqtt_client as mqc
+    mqc._RECONNECT_BACKOFF_INITIAL = 0.5
+    mqc._RECONNECT_BACKOFF_MAX = 1.0
+
     edge_id = f"edge-chaos-{os.getpid()}"
     received: List[int] = []
     stop_subscriber = asyncio.Event()
 
     async def _subscribe() -> None:
-        try:
-            async with _aio.Client(hostname=broker_host, port=broker_port,
-                                    identifier=f"chaos-sub-{edge_id}") as sub:
-                await sub.subscribe(f"edge/{edge_id}/uplink/#", qos=1)
-                async for msg in sub.messages:
-                    try:
-                        body = json.loads(msg.payload.decode("utf-8"))
-                    except Exception:
-                        continue
-                    seq = int(body.get("monotonic_seq") or 0)
-                    if seq > 0:
-                        received.append(seq)
-                    if stop_subscriber.is_set():
-                        return
-        except _aio.MqttError:
-            # The subscriber may briefly drop alongside the broker; we
-            # don't restart it — the test still passes because the
-            # broker re-emits retained QoS 1 messages once it's back.
-            return
+        # Auto-reconnect on broker death: mosquitto.conf has
+        # ``persistence false`` and aiomqtt.Client defaults to a clean
+        # session, so a broker restart loses our subscription queue and
+        # we have to re-subscribe. Without this loop the subscriber dies
+        # on the first ``docker stop`` MqttError and never sees the
+        # backfill (XIU-109).
+        while not stop_subscriber.is_set():
+            try:
+                async with _aio.Client(
+                    hostname=broker_host, port=broker_port,
+                    identifier=f"chaos-sub-{edge_id}",
+                ) as sub:
+                    await sub.subscribe(f"edge/{edge_id}/uplink/#", qos=1)
+                    async for msg in sub.messages:
+                        try:
+                            body = json.loads(msg.payload.decode("utf-8"))
+                        except Exception:
+                            continue
+                        seq = int(body.get("monotonic_seq") or 0)
+                        if seq > 0:
+                            received.append(seq)
+                        if stop_subscriber.is_set():
+                            return
+            except _aio.MqttError:
+                # Broker is down (or just bouncing). Wait briefly then
+                # try again — give the broker time to come back up.
+                await asyncio.sleep(0.5)
 
     sub_task = asyncio.create_task(_subscribe())
 
@@ -412,16 +430,15 @@ async def scenario_live(
         frame_idx = pre_outage
         # Convert produce_rate to a per-iteration sleep.
         period = 1.0 / max(produce_rate, 0.1)
+        # During outage we only PRODUCE — we don't attempt publishes
+        # from this loop. ``MqttTransport._open_session`` blocks in a
+        # ``while True:`` reconnect loop until the broker is back, and
+        # the broker is only restarted AFTER this loop exits, so any
+        # awaited publish here would deadlock the loop (XIU-109). The
+        # post-recovery drain loop below covers the publish path.
         while time.monotonic() < outage_target:
             _produce(outbox, 1)
             frame_idx += 1
-            # Drain attempts will fail — that's the point.
-            with contextlib.suppress(Exception):
-                row = outbox.pending(after=0, limit=1)
-                if row:
-                    seq, frame = row[0]
-                    await transport.publish(frame)
-                    outbox.ack(seq)
             await asyncio.sleep(period)
         backlog_during_outage = outbox.depth()
 
@@ -431,6 +448,14 @@ async def scenario_live(
             stop_subscriber.set()
             sub_task.cancel()
             return _check("docker compose start", False, out)
+
+        # Let mosquitto bind + the subscriber re-subscribe before we
+        # start the drain. Without this gap the publisher races ahead
+        # of the subscriber and the first few backfill seqs vanish
+        # because no one was listening yet (mosquitto persistence is
+        # off — see mosquitto.conf — so a message published to no
+        # subscribers is just dropped after PUBACK).
+        await asyncio.sleep(2.0)
 
         # Drain the outbox once the broker is back — the transport's
         # next publish will reconnect. Time-box to the issue's 60 s.
@@ -458,6 +483,11 @@ async def scenario_live(
         with contextlib.suppress(asyncio.CancelledError):
             await sub_task
 
+        # Snapshot anything that needs the on-disk outbox BEFORE the
+        # TemporaryDirectory cleanup drops the sqlite file out from
+        # under us (XIU-109).
+        final_outbox_depth = outbox.depth()
+
     # ---- assertions -------------------------------------------------------
     expected = frame_idx
     seen = sorted(set(received))
@@ -472,11 +502,14 @@ async def scenario_live(
                  len(seen) >= expected,
                  f"seen={len(seen)} expected>={expected}")
     if seen:
+        expected_range = list(range(seen[0], seen[-1] + 1))
+        missing = sorted(set(expected_range) - set(seen))
         ok &= _check("seq stream has no gap",
-                     seen == list(range(seen[0], seen[-1] + 1)),
-                     f"first={seen[0]} last={seen[-1]} unique={len(seen)}")
+                     seen == expected_range,
+                     f"first={seen[0]} last={seen[-1]} unique={len(seen)}"
+                     + (f" missing={missing[:10]}" if missing else ""))
     ok &= _check("outbox fully drained after recovery",
-                 outbox.depth() == 0, f"depth={outbox.depth()}")
+                 final_outbox_depth == 0, f"depth={final_outbox_depth}")
     return ok
 
 
@@ -501,8 +534,10 @@ def main() -> int:
                         help="drive a real local broker via docker compose")
     parser.add_argument("--compose-file", default="docker-compose.center.yml",
                         help="docker compose file (live mode)")
-    parser.add_argument("--broker-service", default="center-mosquitto",
-                        help="docker compose service name for the broker (live mode)")
+    parser.add_argument("--broker-service", default="mosquitto",
+                        help="docker compose service key for the broker (live mode). "
+                             "This is the key under `services:` in docker-compose.center.yml, "
+                             "NOT the container_name (which is `center-mosquitto`).")
     parser.add_argument("--broker-host", default="127.0.0.1",
                         help="broker host the subscriber + publisher reach (live mode)")
     parser.add_argument("--broker-port", type=int, default=1883,
