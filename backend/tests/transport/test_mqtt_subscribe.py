@@ -1,4 +1,4 @@
-"""MQTT center subscriber tests — XIU-98 Phase 2 P1.
+"""MQTT center subscriber tests — XIU-100 Phase 2 P1.
 
 The real subscriber is asyncio-driven against an `aiomqtt.Client`. We
 inject a fake client through ``run_subscriber(..., client_factory=...)``

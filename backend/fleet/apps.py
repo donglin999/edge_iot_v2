@@ -25,7 +25,7 @@ class FleetConfig(AppConfig):
 
         self._maybe_start_mqtt_subscriber()
 
-    # ---- MQTT subscriber (XIU-98 Phase 2 P1) ------------------------------
+    # ---- MQTT subscriber (XIU-100 Phase 2 P1) -----------------------------
 
     @classmethod
     def _maybe_start_mqtt_subscriber(cls) -> None:

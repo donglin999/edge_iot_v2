@@ -348,7 +348,7 @@ ACQUISITION_MAX_RECONNECT_ATTEMPTS = env.int("ACQUISITION_MAX_RECONNECT_ATTEMPTS
 
 
 # ========================================
-# Fleet MQTT subscriber (XIU-98 Phase 2 P1)
+# Fleet MQTT subscriber (XIU-100 Phase 2 P1)
 # ========================================
 #
 # Center side of the WebSocket → MQTT migration. When enabled, daphne's

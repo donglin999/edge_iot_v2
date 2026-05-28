@@ -60,7 +60,7 @@ _protocol_router = ProtocolTypeRouter({
 })
 
 
-# Phase 2 P1 (XIU-98): the fleet MQTT subscriber binds its lifecycle to
+# Phase 2 P1 (XIU-100): the fleet MQTT subscriber binds its lifecycle to
 # the daphne process via the ASGI ``lifespan`` scope. ``ProtocolTypeRouter``
 # raises on unknown scope types, so we intercept ``lifespan`` here and
 # delegate to ``fleet.mqtt_transport.lifespan_handler``. All other scopes

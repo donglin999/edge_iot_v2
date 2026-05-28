@@ -1,8 +1,8 @@
-"""Single dispatch surface for inbound edge-uplink frames (XIU-98 Phase 2).
+"""Single dispatch surface for inbound edge-uplink frames (XIU-100 Phase 2).
 
 The fleet protocol historically arrives over one transport — a per-edge
 WebSocket served by :class:`fleet.consumers.FleetConsumer`. Phase 2 of the
-migration adds a second transport (MQTT, XIU-98) and the down-stream
+migration adds a second transport (MQTT, XIU-100) and the down-stream
 delivery is unchanged regardless of which transport carried the bytes.
 
 To keep the two transports honest, both call into a single

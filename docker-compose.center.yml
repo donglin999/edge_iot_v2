@@ -28,7 +28,7 @@ services:
       retries: 3
 
   mosquitto:
-    # Phase 2 P1 (XIU-98): center MQTT broker for the edge ↔ center uplink
+    # Phase 2 P1 (XIU-100): center MQTT broker for the edge ↔ center uplink
     # migration off WebSocket. Anonymous on 1883 for local dev — TLS + ACL
     # are bolted on in later Phase-2 milestones.
     image: eclipse-mosquitto:2
@@ -74,7 +74,7 @@ services:
       - INFLUXDB_TOKEN=unused-on-center
       - INFLUXDB_ORG=edge-iot
       - INFLUXDB_BUCKET=iot-data
-      # Phase 2 P1 (XIU-98): center MQTT subscriber connects to this broker
+      # Phase 2 P1 (XIU-100): center MQTT subscriber connects to this broker
       # at daphne startup. Disable with FLEET_MQTT_ENABLED=false to fall
       # back to WS-only ingest during the grey-rollout window.
       - FLEET_MQTT_ENABLED=true

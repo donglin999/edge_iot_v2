@@ -1,4 +1,4 @@
-"""Center MQTT subscriber — Phase 2 P1 (XIU-98).
+"""Center MQTT subscriber — Phase 2 P1 (XIU-100).
 
 A long-lived asyncio task that connects to the center broker (Mosquitto),
 subscribes to the edge uplink topic tree at QoS 1, parses each message as
