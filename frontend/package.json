@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "e2e": "playwright test --project=chromium",
+    "e2e:list": "playwright test --list",
+    "e2e:install": "playwright install chromium"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",
@@ -22,6 +25,8 @@
     "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^25.9.1",
     "@types/react": "^18.3.26",
     "@types/react-dom": "^18.3.7",
     "@types/react-window": "^1.8.8",
