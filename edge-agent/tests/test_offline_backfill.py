@@ -17,6 +17,7 @@ import pytest
 from edge_agent.agent import EdgeAgent
 from edge_agent.config import EdgeConfig
 from edge_agent.outbox import DurableOutbox
+from edge_agent.transport import WsTransport
 
 
 def _cfg(**overrides) -> EdgeConfig:
@@ -98,7 +99,10 @@ async def test_uplink_loop_backfills_then_ships_live_untagged(tmp_path):
     assert agent._backfill_through == 3
 
     ws = CollectWS()
-    loop_task = asyncio.create_task(agent._uplink_loop(ws))
+    # Phase 2 P3 (XIU-102): _uplink_loop now takes a Transport. Wrap the
+    # WS double in the same WsTransport the agent builds per-session in
+    # ``_run_session`` so this test still exercises the WS egress path.
+    loop_task = asyncio.create_task(agent._uplink_loop(WsTransport(ws)))
     # Let the backfill drain.
     await asyncio.sleep(0.2)
     # Now a live frame is produced mid-session.

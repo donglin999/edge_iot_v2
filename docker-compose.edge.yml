@@ -106,6 +106,14 @@ services:
       - EDGE_HISTORY_PORT=18086
       - EDGE_HISTORY_MAX_POINTS=${EDGE_HISTORY_MAX_POINTS:-50000}
       - EDGE_HISTORY_URL=${EDGE_HISTORY_URL:-}
+      # --- Phase 2 P3 (XIU-102): MQTT uplink ---------------------------
+      # Default to the MQTT bus once the center has Mosquitto stood up
+      # (Phase 2 P1 / XIU-100). Set EDGE_TRANSPORT=ws to fall back to the
+      # legacy WS uplink during A/B / debugging. EDGE_MQTT_BROKER points
+      # at the center broker; the host segment is whatever DNS name /
+      # address the edge can reach the center's mosquitto on.
+      - EDGE_TRANSPORT=${EDGE_TRANSPORT:-mqtt}
+      - EDGE_MQTT_BROKER=${EDGE_MQTT_BROKER:-mqtt://mosquitto:1883}
       - TZ=Asia/Shanghai
     depends_on:
       influxdb:

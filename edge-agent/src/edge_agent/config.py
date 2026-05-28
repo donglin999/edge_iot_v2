@@ -62,6 +62,15 @@ class EdgeConfig:
     history_port: int = 18086
     history_max_points: int = 50000
     history_url: str = ""
+    # Phase 2 P3 (XIU-102) — pick which transport carries the seq'd uplink
+    # stream (lifecycle / sample_batch / alarm_event). The WS connection is
+    # retained in either mode for register / heartbeat / apply_config /
+    # config_applied; the migration off WS for those control-plane frames
+    # is later Phase-2 / Phase-3 work. ``mqtt`` is the default — Phase 2 is
+    # actively rolling MQTT out — but operators can pin back to ``ws`` to
+    # mirror the M5 stack for A/B / debugging.
+    transport: str = "mqtt"
+    mqtt_broker: str = "mqtt://mosquitto:1883"
 
     @classmethod
     def from_env(cls, env: Dict[str, str] | None = None) -> "EdgeConfig":
@@ -166,6 +175,16 @@ class EdgeConfig:
         if history_enabled and "history_url" not in labels:
             labels = {**labels, "history_url": history_url}
 
+        # Phase 2 P3: EDGE_TRANSPORT picks the uplink transport — ``mqtt``
+        # (default) publishes seq'd uplink frames over MQTT QoS 1; ``ws``
+        # keeps the legacy M5 behaviour of riding the WS channel.
+        transport = (env.get("EDGE_TRANSPORT") or "mqtt").strip().lower()
+        if transport not in ("mqtt", "ws"):
+            raise ConfigError(
+                f"EDGE_TRANSPORT must be 'mqtt' or 'ws': got {transport!r}"
+            )
+        mqtt_broker = (env.get("EDGE_MQTT_BROKER") or "mqtt://mosquitto:1883").strip()
+
         return cls(
             edge_id=env["EDGE_ID"],
             edge_token=env["EDGE_TOKEN"],
@@ -182,4 +201,6 @@ class EdgeConfig:
             history_port=history_port,
             history_max_points=history_max_points,
             history_url=history_url,
+            transport=transport,
+            mqtt_broker=mqtt_broker,
         )
