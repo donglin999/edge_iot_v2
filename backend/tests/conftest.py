@@ -37,6 +37,30 @@ def django_db_modify_db_settings():
     return settings.DATABASES["default"]
 
 
+@pytest.fixture(autouse=True)
+def _default_fleet_transport_ws(request):
+    """Pin ``FLEET_TRANSPORT=ws`` for legacy fleet tests (XIU-101 Phase 2 P2).
+
+    Production default flipped to ``mqtt`` in XIU-101, but the existing M2/M4
+    WebSocket-assertion tests were written against the WS dispatch path and
+    have no MQTT broker available. Tests that exercise the new dispatcher
+    set the transport explicitly via monkeypatch, so they override this
+    fixture; the rest get the historically-correct WS behavior without an
+    accidental paho connect storm against ``center-mosquitto``.
+    """
+    # Tests under tests/transport/test_mqtt_downlink.py manage the transport
+    # mode themselves, so do not override for that module.
+    if "test_mqtt_downlink" in request.node.nodeid:
+        yield
+        return
+    original = getattr(settings, "FLEET_TRANSPORT", "mqtt")
+    settings.FLEET_TRANSPORT = "ws"
+    try:
+        yield
+    finally:
+        settings.FLEET_TRANSPORT = original
+
+
 @pytest.fixture(scope="session", autouse=True)
 def celery_eager_env():
     """Configure Celery to execute tasks synchronously for all tests."""
