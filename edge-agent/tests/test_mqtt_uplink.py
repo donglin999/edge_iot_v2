@@ -191,6 +191,16 @@ class TestMqttTransportPublish:
         )
         return transport, client
 
+    @staticmethod
+    def _uplink_calls(client):
+        """Filter publish_calls to the seq'd uplink topic tree.
+
+        Phase 2 P4 (XIU-103) adds two ``edge/<id>/lwt`` retained publishes
+        per session (online on connect, offline on close). These tests
+        assert on the *uplink* shape only, so we strip the LWT calls.
+        """
+        return [c for c in client.publish_calls if "/uplink/" in c.topic]
+
     @pytest.mark.asyncio
     async def test_send_state_publishes_lifecycle_topic(self):
         transport, client = self._make()
@@ -200,8 +210,9 @@ class TestMqttTransportPublish:
                  "ts": "2026-05-28T00:00:00Z"}
         await transport.send_state(frame)
         await transport.close()
-        assert len(client.publish_calls) == 1
-        call = client.publish_calls[0]
+        uplink = self._uplink_calls(client)
+        assert len(uplink) == 1
+        call = uplink[0]
         assert call.topic == "edge/edge-1/uplink/lifecycle"
         assert call.qos == 1
         assert json.loads(call.payload.decode()) == frame
@@ -219,9 +230,10 @@ class TestMqttTransportPublish:
                           "timestamp": "2026-05-28T00:00:00.500Z"}],
         }
         await transport.send_sample(frame)
-        assert client.publish_calls[0].topic == "edge/edge-1/uplink/sample_batch"
-        assert client.publish_calls[0].qos == 1
-        assert json.loads(client.publish_calls[0].payload.decode()) == frame
+        uplink = self._uplink_calls(client)
+        assert uplink[0].topic == "edge/edge-1/uplink/sample_batch"
+        assert uplink[0].qos == 1
+        assert json.loads(uplink[0].payload.decode()) == frame
 
     @pytest.mark.asyncio
     async def test_send_alarm_publishes_alarm_event_topic(self):
@@ -233,8 +245,9 @@ class TestMqttTransportPublish:
             "message": "boom", "fired_at": "2026-05-28T00:00:01Z",
         }
         await transport.send_alarm(frame)
-        assert client.publish_calls[0].topic == "edge/edge-1/uplink/alarm_event"
-        assert json.loads(client.publish_calls[0].payload.decode()) == frame
+        uplink = self._uplink_calls(client)
+        assert uplink[0].topic == "edge/edge-1/uplink/alarm_event"
+        assert json.loads(uplink[0].payload.decode()) == frame
 
     @pytest.mark.asyncio
     async def test_generic_publish_dispatches_by_type(self):
@@ -246,7 +259,7 @@ class TestMqttTransportPublish:
         ]
         for f in frames:
             await transport.publish(f)
-        topics = [c.topic for c in client.publish_calls]
+        topics = [c.topic for c in self._uplink_calls(client)]
         assert topics == [
             "edge/edge-1/uplink/lifecycle",
             "edge/edge-1/uplink/sample_batch",
@@ -269,12 +282,20 @@ class TestMqttTransportPublish:
 
     @pytest.mark.asyncio
     async def test_publish_resets_session_on_mqtt_error(self):
-        """A failing publish clears the session so the next one reconnects."""
+        """A failing publish clears the session so the next one reconnects.
+
+        P4 added an online-LWT publish at session-open time, so the
+        ``publish_errors`` slot for the user's ``send_state`` is the
+        SECOND entry (index 1 — the first publish is online LWT and
+        must succeed for the session to come up).
+        """
 
         class _FakeMqttError(Exception):
             pass
 
-        broken = _FakeAiomqttClient(publish_errors=[_FakeMqttError("drop")])
+        broken = _FakeAiomqttClient(
+            publish_errors=[None, _FakeMqttError("drop")],
+        )
         healthy = _FakeAiomqttClient()
         clients = iter([broken, healthy])
         transport = MqttTransport(
@@ -287,9 +308,13 @@ class TestMqttTransportPublish:
         with pytest.raises(_FakeMqttError):
             await transport.send_state({"type": "lifecycle", "monotonic_seq": 1})
         assert transport._client is None
-        # Next publish reuses a fresh session and succeeds.
+        # Next publish reuses a fresh session and succeeds — uplink call
+        # lands on the healthy client (with its own preceding LWT online).
         await transport.send_state({"type": "lifecycle", "monotonic_seq": 2})
-        assert len(healthy.publish_calls) == 1
+        uplink_on_healthy = [
+            c for c in healthy.publish_calls if "/uplink/" in c.topic
+        ]
+        assert len(uplink_on_healthy) == 1
 
 
 # ---------------------------------------------------------------------------

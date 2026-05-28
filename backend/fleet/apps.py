@@ -23,6 +23,15 @@ class FleetConfig(AppConfig):
         # Connect the M4 alarm-rule → edge re-sync signal handlers.
         from . import signals  # noqa: F401
 
+        # Phase 2 P4 (XIU-103): bind the LWT → EdgeNode.status handler
+        # before the subscriber thread connects so a retained ``online``
+        # payload landing on the very first session is folded into the
+        # DB instead of log-and-drop'd. The router itself is a process
+        # singleton, so registering once at app-ready is enough; the
+        # binding survives subscriber restarts.
+        from . import presence
+        presence.install()
+
         self._maybe_start_mqtt_subscriber()
 
     # ---- MQTT subscriber (XIU-100 Phase 2 P1) -----------------------------

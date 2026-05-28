@@ -99,9 +99,16 @@ async def test_fresh_edge_register_ack_is_zero(_inmemory_channel_layer):
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_mirrors_buffer_backlog(_inmemory_channel_layer):
-    """``heartbeat.buffer`` lands on ``EdgeNode.buffer_backlog`` so /fleet
-    can show an edge sitting on un-shipped frames."""
+async def test_heartbeat_no_longer_mirrors_buffer_backlog(_inmemory_channel_layer):
+    """Phase 2 P4 (XIU-103) retired the WS-heartbeat-driven DB writes.
+
+    The pre-P4 handler folded ``heartbeat.buffer`` into
+    ``EdgeNode.buffer_backlog``; presence + backlog telemetry have to
+    come over MQTT now (status from the retained LWT, backlog from a
+    follow-up P5 topic). The consumer still acks the heartbeat for
+    rolling-upgrade compat, but no DB write happens. The pre-P4 body
+    is preserved in :func:`fleet._legacy.legacy_handle_heartbeat`.
+    """
     node, token = await sync_to_async(EdgeNode.issue)(name="edge-m5-hb")
     comm = WebsocketCommunicator(fleet_application, "/ws/fleet/")
     await comm.connect()
@@ -113,16 +120,18 @@ async def test_heartbeat_mirrors_buffer_backlog(_inmemory_channel_layer):
     })
     ack = await comm.receive_json_from()
     assert ack["type"] == FRAME_ACK
-    assert "last_uplink_seq" in ack
+    assert "last_uplink_seq" in ack  # seq ridealong still served
 
     await sync_to_async(node.refresh_from_db)()
-    assert node.buffer_backlog == 137
+    # The heartbeat no longer touches ``buffer_backlog`` — it stays at
+    # whatever the previous source updated it to (0 on a fresh edge).
+    assert node.buffer_backlog == 0
     await comm.disconnect()
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_without_buffer_field_keeps_zero(_inmemory_channel_layer):
-    """A pre-M5 heartbeat omits ``buffer`` — backlog stays 0, no crash."""
+    """A heartbeat without ``buffer`` is acked cleanly — backlog stays 0."""
     node, token = await sync_to_async(EdgeNode.issue)(name="edge-m5-hb0")
     comm = WebsocketCommunicator(fleet_application, "/ws/fleet/")
     await comm.connect()

@@ -1,4 +1,4 @@
-"""aiomqtt-backed uplink transport (Phase 2 P3 — XIU-102).
+"""aiomqtt-backed uplink transport (Phase 2 P3 — XIU-102, P4 — XIU-103).
 
 Publishes the seq'd uplink frames (lifecycle / sample_batch / alarm_event)
 to the center MQTT broker stood up by Phase 2 P1 (XIU-100). Topic layout
@@ -8,6 +8,7 @@ mirrors the center subscriber's expectations
 * ``edge/<edge_id>/uplink/lifecycle``
 * ``edge/<edge_id>/uplink/sample_batch``
 * ``edge/<edge_id>/uplink/alarm_event``
+* ``edge/<edge_id>/lwt``               (P4 — last-will + retained online)
 
 All publishes go at QoS 1. The center subscriber wildcards on
 ``edge/+/uplink/#`` at the same QoS so the per-message PUBACK / PUBREL
@@ -15,6 +16,18 @@ flow is in place end-to-end. Combined with the existing client-side
 ``monotonic_seq`` dedup on the center, that gives us the
 "at-least-once + dedup = exactly-once" semantics called out in the issue
 ("QoS 1 + seq 客户端去重").
+
+Last-will + online presence (P4 — XIU-103)
+------------------------------------------
+The aiomqtt session is configured with ``will=Will(edge/<id>/lwt, ...,
+retain=True)`` so the broker publishes an ``{"state": "offline"}`` frame
+on any ungraceful disconnect (TCP RST, edge power-cycle, keepalive
+timeout). Whenever a session opens successfully the transport publishes
+an ``{"state": "online"}`` retained frame on the same topic — so the
+last retained payload on the broker always reflects the edge's current
+presence. The center's :mod:`fleet.mqtt_transport` subscriber catches
+both forms and updates :class:`fleet.models.EdgeNode.status` accordingly.
+This replaces the WS heartbeat path (M1/M2 :class:`FleetConsumer`).
 
 Connection lifecycle
 --------------------
@@ -31,16 +44,19 @@ Outbox prune semantics
 :meth:`aiomqtt.Client.publish` at QoS 1 returns *after* the broker
 PUBACK, so a successful return is end-to-end delivery confirmation
 between the edge and the broker. The transport exposes
-``confirms_on_publish = True``; the uplink loop will then prune the
-just-publised outbox row on its own. The center-side ack-over-WS path is
-unused in MQTT mode (P4 will revisit this when last-will + outbox
-reconnect over MQTT land).
+``confirms_on_publish = True``; the uplink loop prunes the
+just-published outbox row on its own. During a broker outage publishes
+block / raise :class:`MqttError`, the rows stay in the durable outbox,
+and aiomqtt's reconnect drains them at QoS 1 once the broker is back —
+the seq counter is monotonic and the broker dedup'es by packet id so
+the chaos test sees no gap in the recovered stream (P4 verification).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -58,6 +74,42 @@ _PUBLISH_QOS = 1
 # blip cleans itself up in one or two iterations.
 _RECONNECT_BACKOFF_INITIAL = 1.0
 _RECONNECT_BACKOFF_MAX = 30.0
+
+# Phase 2 P4 (XIU-103) — last-will + online presence on edge/<id>/lwt.
+# A retained payload on the LWT topic means the *latest* value on the
+# broker is always the edge's current presence state: an "offline" left
+# behind by the broker on ungraceful disconnect, or an "online" pushed
+# by the edge on (re)connect. Both directions go at QoS 1 retained=True.
+LWT_STATE_ONLINE = "online"
+LWT_STATE_OFFLINE = "offline"
+
+
+def lwt_topic(edge_id: str) -> str:
+    """Stable accessor for the LWT topic — used by tests + the will builder."""
+    return f"edge/{edge_id}/lwt"
+
+
+def _lwt_payload(edge_id: str, state: str) -> bytes:
+    """Build the JSON payload the broker stamps on edge/<id>/lwt.
+
+    The schema is intentionally tiny so the center subscriber can fold
+    it into ``EdgeNode.status`` without a separate parsing layer:
+
+    * ``state`` — ``"online"`` (live retained from the edge) or
+      ``"offline"`` (broker-published on disconnect via the WILL).
+    * ``edge_id`` — convenience echo so a downstream inspector tooling
+      doesn't have to re-parse the topic.
+    * ``ts`` — wall-clock at the moment the payload was constructed,
+      ISO-8601. For ``offline`` this is the moment the connecting client
+      built the WILL (i.e. session start); the actual disconnect time is
+      recorded by the center handler.
+    """
+    body = {
+        "state": state,
+        "edge_id": edge_id,
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
 # Allow dependency injection from tests. Production code leaves it ``None``
@@ -140,11 +192,38 @@ class MqttTransport(Transport):
             await self._open_session()
 
     async def close(self) -> None:
+        """Tear the broker session down cleanly.
+
+        Publishes a final ``{state: offline}`` retained payload on
+        ``edge/<id>/lwt`` *before* disconnecting so the broker's last
+        retained value reflects a graceful shutdown (P4 — XIU-103).
+        The session WILL is for *ungraceful* disconnects; on a planned
+        stop we want the broker to see the right state immediately.
+        """
         async with self._lock:
             if self._client is None:
                 return
             client = self._client
             self._client = None
+            errors = self._mqtt_error_type()
+            try:
+                await client.publish(
+                    lwt_topic(self._edge_id),
+                    payload=_lwt_payload(self._edge_id, LWT_STATE_OFFLINE),
+                    qos=_PUBLISH_QOS,
+                    retain=True,
+                )
+            except errors as exc:
+                # Best-effort: the broker may already be gone, in which
+                # case the WILL will fire when the TCP socket reaps.
+                logger.info(
+                    "mqtt_transport: offline LWT publish on close failed "
+                    "(%s) — relying on broker WILL", exc,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "mqtt_transport: offline LWT publish raised unexpectedly"
+                )
             try:
                 await client.__aexit__(None, None, None)
             except Exception:  # noqa: BLE001
@@ -155,7 +234,16 @@ class MqttTransport(Transport):
     # ---- internals --------------------------------------------------------
 
     def _build_client(self):
-        """Construct an aiomqtt.Client from the broker URL / overrides."""
+        """Construct an aiomqtt.Client from the broker URL / overrides.
+
+        Every production session carries the LWT (XIU-103 P4): the
+        broker auto-publishes ``edge/<id>/lwt`` ``{state: offline}``
+        retained on any ungraceful disconnect (TCP RST, edge crash,
+        keepalive timeout). The matching ``online`` retained payload is
+        published by :meth:`_open_session` immediately after the session
+        comes up, so the broker's last-retained value always reflects
+        the edge's true presence.
+        """
         if self._client_factory is not None:
             return self._client_factory()
         # Local import so a host without aiomqtt installed can still
@@ -168,6 +256,12 @@ class MqttTransport(Transport):
             "port": kw["port"],
             "identifier": self._client_id,
             "keepalive": self._keepalive,
+            "will": aiomqtt.Will(
+                topic=lwt_topic(self._edge_id),
+                payload=_lwt_payload(self._edge_id, LWT_STATE_OFFLINE),
+                qos=_PUBLISH_QOS,
+                retain=True,
+            ),
         }
         if kw.get("username"):
             client_kwargs["username"] = kw["username"]
@@ -200,7 +294,14 @@ class MqttTransport(Transport):
         """Open one aiomqtt session, with exponential reconnect.
 
         Internal — caller already holds ``self._lock``. Returns once
-        ``self._client`` references an active session.
+        ``self._client`` references an active session AND the
+        ``edge/<id>/lwt`` ``{state: online}`` retained announcement has
+        been published (P4 — XIU-103). The online publish is part of
+        the connect path on purpose: a session that came up but cannot
+        send a tiny LWT replacement payload is degraded enough that we
+        prefer to tear it back down and let the next reconnect retry,
+        rather than leave the broker holding a stale ``offline``
+        retained payload while the edge is actually up.
         """
         backoff = _RECONNECT_BACKOFF_INITIAL
         errors = self._mqtt_error_type()
@@ -216,9 +317,28 @@ class MqttTransport(Transport):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RECONNECT_BACKOFF_MAX)
                 continue
+            try:
+                await client.publish(
+                    lwt_topic(self._edge_id),
+                    payload=_lwt_payload(self._edge_id, LWT_STATE_ONLINE),
+                    qos=_PUBLISH_QOS,
+                    retain=True,
+                )
+            except errors as exc:
+                logger.warning(
+                    "mqtt_transport: online LWT publish failed (%s) — "
+                    "dropping session and retrying", exc,
+                )
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, _RECONNECT_BACKOFF_MAX)
+                continue
             self._client = client
             logger.info(
-                "mqtt_transport: connected to %s as %s",
+                "mqtt_transport: connected to %s as %s (lwt=online)",
                 self._broker_url, self._client_id,
             )
             return

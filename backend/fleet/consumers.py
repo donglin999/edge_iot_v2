@@ -56,7 +56,6 @@ from .protocol import (
     FRAME_SAMPLE_BATCH,
     FRAME_TASK_STATE,
     LIFECYCLE_EVENTS,
-    LIFECYCLE_SESSION_OFFLINE,
     LIFECYCLE_TASK_PREFIX,
     PROTOCOL_VERSION,
     TASK_STATES,
@@ -166,13 +165,11 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                 await self.channel_layer.group_discard(self._group_name, self.channel_name)
             except Exception:  # noqa: BLE001
                 logger.exception("fleet: group_discard failed for %s", self.edge_name)
-        # M3: a closing socket cannot send a final lifecycle frame, so the
-        # center synthesises the ``session.offline`` event itself.
-        if self.edge_id is not None:
-            try:
-                await self._record_session_offline(self.edge_id)
-            except Exception:  # noqa: BLE001
-                logger.exception("fleet: session.offline record failed for %s", self.edge_name)
+        # Phase 2 P4 (XIU-103): the ``session.offline`` lifecycle row is
+        # now synthesised by the LWT handler in :mod:`fleet.presence`
+        # off the broker's retained WILL payload, so the WS disconnect
+        # path no longer writes one. The original synthesis lives in
+        # :mod:`fleet._legacy.legacy_record_session_offline` for revert.
         logger.info("fleet: ws disconnected edge=%s code=%s", self.edge_name, code)
 
     async def receive(self, text_data=None, bytes_data=None, **kwargs):
@@ -264,16 +261,25 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         )
 
     async def _handle_heartbeat(self, frame: dict) -> None:
+        """Acknowledge a WS heartbeat without touching presence (P4 — XIU-103).
+
+        Presence (``status`` / ``last_seen``) is now driven by the
+        retained ``edge/<id>/lwt`` MQTT topic — see
+        :mod:`fleet.presence`. We keep the ack here so a rolling
+        upgrade leaves edges that still send WS heartbeats happy (they
+        only need the ack to keep the WS keepalive their side); the
+        last_uplink_seq ridealong continues so an edge that has not
+        yet been switched to MQTT-PUBACK pruning can still prune its
+        durable outbox during a quiet uplink window.
+
+        The pre-P4 body — which also stamped ``last_seen``,
+        ``status=online`` and mirrored ``buffer_backlog`` — lives in
+        :func:`fleet._legacy.legacy_handle_heartbeat` for revert.
+        """
         if self.edge_id is None:
             await self._fail(ERROR_BAD_FRAME, "heartbeat before register", CLOSE_BAD_FRAME)
             return
-        # M5 (v0.5): mirror the edge's durable-outbox depth so /fleet can
-        # surface an edge sitting on un-shipped uplink frames.
-        try:
-            backlog = int(frame.get("buffer") or 0)
-        except (TypeError, ValueError):
-            backlog = 0
-        seq = await self._touch(self.edge_id, backlog)
+        seq = await self._read_last_uplink_seq(self.edge_id)
         await self.send_json(make_ack(ref=FRAME_HEARTBEAT, last_uplink_seq=seq))
 
     async def _handle_config_applied(self, frame: dict) -> None:
@@ -463,18 +469,16 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         return node
 
     @database_sync_to_async
-    def _touch(self, pk: int, buffer_backlog: int = 0) -> int:
-        """Refresh ``last_seen`` and return the edge's high-water uplink seq.
+    def _read_last_uplink_seq(self, pk: int) -> int:
+        """Return the edge's current ``last_uplink_seq`` (P4 — XIU-103).
 
-        The seq rides the heartbeat ack so the edge can keep pruning its
-        durable outbox even during a quiet window with no uplink traffic.
-        ``buffer_backlog`` (M5) mirrors the edge's durable-outbox depth.
+        Replaces the old ``_touch`` which also updated ``last_seen`` /
+        ``status`` / ``buffer_backlog``; those moved off the WS heartbeat
+        path onto the MQTT LWT (status / last_seen) and will move to a
+        dedicated MQTT telemetry topic in P5 (buffer_backlog). The seq
+        is still served here so the heartbeat ack can carry it and an
+        edge in WS-only mode can keep pruning its durable outbox.
         """
-        EdgeNode.objects.filter(pk=pk).update(
-            last_seen=timezone.now(),
-            status="online",
-            buffer_backlog=max(0, int(buffer_backlog)),
-        )
         return (
             EdgeNode.objects.filter(pk=pk)
             .values_list("last_uplink_seq", flat=True)
@@ -811,18 +815,11 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         except Exception:  # noqa: BLE001
             logger.exception("fleet: edge sample InfluxDB mirror failed")
 
-    @database_sync_to_async
-    def _record_session_offline(self, edge_pk: int) -> None:
-        """Synthesise a ``session.offline`` lifecycle row on WS disconnect."""
-        try:
-            EdgeLifecycleEvent.objects.create(
-                edge_id=edge_pk,
-                event=LIFECYCLE_SESSION_OFFLINE,
-                monotonic_seq=0,
-                received_at=timezone.now(),
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("fleet: failed to record session.offline edge=%s", edge_pk)
+    # Phase 2 P4 (XIU-103): the ``_record_session_offline`` synthesis used
+    # to run from :meth:`disconnect` so a closed WS socket still produced a
+    # ``session.offline`` row. The retained MQTT LWT topic now drives that,
+    # via :mod:`fleet.presence`; the original is in
+    # :func:`fleet._legacy.legacy_record_session_offline` for revert.
 
     async def _fail(self, code: str, message: str, close_code: int) -> None:
         try:
