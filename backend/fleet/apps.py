@@ -25,18 +25,20 @@ class FleetConfig(AppConfig):
 
         self._maybe_start_mqtt_subscriber()
 
-    # ---- MQTT subscriber (XIU-100 Phase 2 P1) -----------------------------
+    # ---- MQTT subscriber (XIU-98 Phase 2 P1) ------------------------------
 
     @classmethod
     def _maybe_start_mqtt_subscriber(cls) -> None:
-        """Spawn the asyncio MQTT subscriber in a daemon thread.
+        """Spawn the asyncio MQTT subscriber in a daemon thread under daphne.
 
-        Daphne 4.1.2 does not drive ASGI lifespan, so an ``application``-level
-        wrapper would never see ``lifespan.startup``. Starting the subscriber
-        from :meth:`ready` instead works for every ASGI worker — and the
-        ``daphne``-in-argv guard keeps the connection out of one-shot
-        commands (``manage.py migrate`` / ``check`` / shell) and the celery
-        workers that share the same Django settings.
+        Daphne 4.1.2 does not drive the ASGI ``lifespan`` scope, so the
+        ``lifespan_handler`` registered in :mod:`control_plane.asgi` never
+        fires under daphne. Starting the subscriber from :meth:`ready`
+        works around that: the ``daphne``-in-argv guard keeps the
+        connection out of one-shot commands (``manage.py migrate`` /
+        ``check`` / ``shell``) and the celery workers that share the same
+        settings, while the lifespan handler covers servers that DO drive
+        lifespan (uvicorn etc.) — the two paths are mutually exclusive.
         """
         from django.conf import settings
 
