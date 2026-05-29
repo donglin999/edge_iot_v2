@@ -29,18 +29,12 @@ from asgiref.sync import async_to_sync
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from channels.layers import get_channel_layer
-from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from .models import (
-    EdgeLifecycleEvent,
     EdgeNode,
-    EdgeSample,
     EdgeTaskStatus,
-    UPLINK_SEQ_DUPLICATE,
-    UPLINK_SEQ_GAP,
-    classify_uplink_seq,
 )
 from .protocol import (
     ACCEPTED_PROTOCOL_VERSIONS,
@@ -56,12 +50,16 @@ from .protocol import (
     FRAME_SAMPLE_BATCH,
     FRAME_TASK_STATE,
     LIFECYCLE_EVENTS,
-    LIFECYCLE_SESSION_OFFLINE,
     LIFECYCLE_TASK_PREFIX,
     PROTOCOL_VERSION,
     TASK_STATES,
     make_ack,
     make_error,
+)
+from .uplink_handlers import (
+    record_alarm_event,
+    record_lifecycle,
+    record_sample_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,13 +164,11 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
                 await self.channel_layer.group_discard(self._group_name, self.channel_name)
             except Exception:  # noqa: BLE001
                 logger.exception("fleet: group_discard failed for %s", self.edge_name)
-        # M3: a closing socket cannot send a final lifecycle frame, so the
-        # center synthesises the ``session.offline`` event itself.
-        if self.edge_id is not None:
-            try:
-                await self._record_session_offline(self.edge_id)
-            except Exception:  # noqa: BLE001
-                logger.exception("fleet: session.offline record failed for %s", self.edge_name)
+        # Phase 2 P4 (XIU-103): the ``session.offline`` lifecycle row is
+        # now synthesised by the LWT handler in :mod:`fleet.presence`
+        # off the broker's retained WILL payload, so the WS disconnect
+        # path no longer writes one. The original synthesis lives in
+        # :mod:`fleet._legacy.legacy_record_session_offline` for revert.
         logger.info("fleet: ws disconnected edge=%s code=%s", self.edge_name, code)
 
     async def receive(self, text_data=None, bytes_data=None, **kwargs):
@@ -264,16 +260,25 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         )
 
     async def _handle_heartbeat(self, frame: dict) -> None:
+        """Acknowledge a WS heartbeat without touching presence (P4 — XIU-103).
+
+        Presence (``status`` / ``last_seen``) is now driven by the
+        retained ``edge/<id>/lwt`` MQTT topic — see
+        :mod:`fleet.presence`. We keep the ack here so a rolling
+        upgrade leaves edges that still send WS heartbeats happy (they
+        only need the ack to keep the WS keepalive their side); the
+        last_uplink_seq ridealong continues so an edge that has not
+        yet been switched to MQTT-PUBACK pruning can still prune its
+        durable outbox during a quiet uplink window.
+
+        The pre-P4 body — which also stamped ``last_seen``,
+        ``status=online`` and mirrored ``buffer_backlog`` — lives in
+        :func:`fleet._legacy.legacy_handle_heartbeat` for revert.
+        """
         if self.edge_id is None:
             await self._fail(ERROR_BAD_FRAME, "heartbeat before register", CLOSE_BAD_FRAME)
             return
-        # M5 (v0.5): mirror the edge's durable-outbox depth so /fleet can
-        # surface an edge sitting on un-shipped uplink frames.
-        try:
-            backlog = int(frame.get("buffer") or 0)
-        except (TypeError, ValueError):
-            backlog = 0
-        seq = await self._touch(self.edge_id, backlog)
+        seq = await self._read_last_uplink_seq(self.edge_id)
         await self.send_json(make_ack(ref=FRAME_HEARTBEAT, last_uplink_seq=seq))
 
     async def _handle_config_applied(self, frame: dict) -> None:
@@ -338,7 +343,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             task_code = str(frame.get("task_code") or "")
         error = frame.get("error") or ""
         edge_ts = _parse_ts(frame.get("ts"))
-        ack_seq = await self._record_lifecycle(
+        ack_seq = await record_lifecycle(
             self.edge_id, seq, event, task_id, task_code, error, edge_ts
         )
         await self._note_backfill(frame)
@@ -368,7 +373,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
             return
         task_code = str(frame.get("task_code") or "")
         window_end = _parse_ts(frame.get("window_end"))
-        ack_seq = await self._record_sample_batch(
+        ack_seq = await record_sample_batch(
             self.edge_id, seq, task_id, task_code, samples, window_end
         )
         await self._note_backfill(frame)
@@ -400,7 +405,7 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         if status not in ALARM_STATES:
             await self._fail(ERROR_BAD_FRAME, f"alarm_event bad status: {status!r}", CLOSE_BAD_FRAME)
             return
-        ack_seq = await self._record_alarm_event(
+        ack_seq = await record_alarm_event(
             self.edge_id,
             seq,
             rule_id,
@@ -463,18 +468,16 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         return node
 
     @database_sync_to_async
-    def _touch(self, pk: int, buffer_backlog: int = 0) -> int:
-        """Refresh ``last_seen`` and return the edge's high-water uplink seq.
+    def _read_last_uplink_seq(self, pk: int) -> int:
+        """Return the edge's current ``last_uplink_seq`` (P4 — XIU-103).
 
-        The seq rides the heartbeat ack so the edge can keep pruning its
-        durable outbox even during a quiet window with no uplink traffic.
-        ``buffer_backlog`` (M5) mirrors the edge's durable-outbox depth.
+        Replaces the old ``_touch`` which also updated ``last_seen`` /
+        ``status`` / ``buffer_backlog``; those moved off the WS heartbeat
+        path onto the MQTT LWT (status / last_seen) and will move to a
+        dedicated MQTT telemetry topic in P5 (buffer_backlog). The seq
+        is still served here so the heartbeat ack can carry it and an
+        edge in WS-only mode can keep pruning its durable outbox.
         """
-        EdgeNode.objects.filter(pk=pk).update(
-            last_seen=timezone.now(),
-            status="online",
-            buffer_backlog=max(0, int(buffer_backlog)),
-        )
         return (
             EdgeNode.objects.filter(pk=pk)
             .values_list("last_uplink_seq", flat=True)
@@ -528,301 +531,24 @@ class FleetConsumer(AsyncJsonWebsocketConsumer):
         # without this its status changes would never reach the live feed.
         broadcast_task_status(edge_pk, task_id)
 
-    # ---- M3 uplink: lifecycle + sample_batch ------------------------------
-
-    def _classify_and_log_seq(self, edge: EdgeNode, seq: int, kind: str) -> str:
-        """Classify an inbound uplink seq and log a gap transition."""
-        verdict = classify_uplink_seq(edge.last_uplink_seq, seq)
-        if verdict == UPLINK_SEQ_GAP:
-            logger.warning(
-                "fleet: %s uplink seq gap edge=%s last=%s got=%s "
-                "(frames lost — M5 backfill)",
-                kind, edge.name, edge.last_uplink_seq, seq,
-            )
-        return verdict
-
-    @database_sync_to_async
-    def _record_lifecycle(
-        self,
-        edge_pk: int,
-        seq: int,
-        event: str,
-        task_id,
-        task_code: str,
-        error: str,
-        edge_ts,
-    ) -> int:
-        """Persist a ``lifecycle`` frame: event-log row + EdgeTaskStatus fold.
-
-        Returns the edge's post-state ``last_uplink_seq`` — it rides the
-        ack so the edge can prune its durable outbox (M5).
-        """
-        from configuration.models import AcqTask
-        from django.db import transaction
-
-        now = timezone.now()
-        with transaction.atomic():
-            edge = EdgeNode.objects.select_for_update().get(pk=edge_pk)
-            verdict = self._classify_and_log_seq(edge, seq, "lifecycle")
-            if verdict == UPLINK_SEQ_DUPLICATE:
-                # Stale replay — applying it could regress the current
-                # state, so drop it and leave last_uplink_seq untouched.
-                logger.debug(
-                    "fleet: lifecycle duplicate seq=%s edge=%s — dropping",
-                    seq, edge.name,
-                )
-                return edge.last_uplink_seq
-
-            resolved_task_id = None
-            if task_id is not None and AcqTask.objects.filter(pk=task_id).exists():
-                resolved_task_id = task_id
-
-            EdgeLifecycleEvent.objects.create(
-                edge=edge,
-                task_id=resolved_task_id,
-                event=event,
-                monotonic_seq=seq,
-                error=error,
-                edge_ts=edge_ts,
-                received_at=now,
-            )
-            edge.last_uplink_seq = seq
-            edge.save(update_fields=["last_uplink_seq", "updated_at"])
-
-            # task.* events also fold into the current-state EdgeTaskStatus
-            # row so the existing /acquisition projection keeps working.
-            is_task_event = (
-                event.startswith(LIFECYCLE_TASK_PREFIX) and resolved_task_id is not None
-            )
-            if is_task_event:
-                state = event[len(LIFECYCLE_TASK_PREFIX):]
-                EdgeTaskStatus.objects.update_or_create(
-                    edge_id=edge_pk,
-                    task_id=resolved_task_id,
-                    defaults={
-                        "state": state,
-                        "error": error,
-                        "last_reported_at": now,
-                    },
-                )
-        # After commit: push the new status to browser /acquisition clients
-        # so the operator's edge badge changes in real time (no polling).
-        if is_task_event:
-            broadcast_task_status(edge_pk, resolved_task_id)
-        logger.info(
-            "fleet: lifecycle edge=%s event=%s seq=%s%s",
-            edge_pk, event, seq, f" task={task_code}" if task_code else "",
-        )
-        return seq
-
-    @database_sync_to_async
-    def _record_sample_batch(
-        self,
-        edge_pk: int,
-        seq: int,
-        task_id: int,
-        task_code: str,
-        samples: list,
-        window_end,
-    ) -> int:
-        """Persist a ``sample_batch`` into the EdgeSample aggregation cache.
-
-        Returns the edge's post-state ``last_uplink_seq`` for the M5 ack.
-        """
-        from configuration.models import AcqTask
-        from django.db import transaction
-
-        with transaction.atomic():
-            edge = EdgeNode.objects.select_for_update().get(pk=edge_pk)
-            verdict = self._classify_and_log_seq(edge, seq, "sample_batch")
-            if verdict == UPLINK_SEQ_DUPLICATE:
-                logger.debug(
-                    "fleet: sample_batch duplicate seq=%s edge=%s — dropping",
-                    seq, edge.name,
-                )
-                return edge.last_uplink_seq
-
-            resolved_task_id = (
-                task_id if AcqTask.objects.filter(pk=task_id).exists() else None
-            )
-            written = 0
-            if resolved_task_id is None:
-                logger.info(
-                    "fleet: sample_batch for unknown task_id=%s edge=%s — "
-                    "samples dropped, seq still advanced",
-                    task_id, edge.name,
-                )
-            else:
-                for sample in samples:
-                    if not isinstance(sample, dict):
-                        continue
-                    code = sample.get("point_code")
-                    if not code:
-                        continue
-                    EdgeSample.objects.update_or_create(
-                        edge=edge,
-                        task_id=resolved_task_id,
-                        point_code=str(code)[:128],
-                        defaults={
-                            "value": sample.get("value"),
-                            "quality": str(sample.get("quality") or "good")[:16],
-                            "sample_ts": _parse_ts(sample.get("timestamp")),
-                            "monotonic_seq": seq,
-                            "window_end": window_end,
-                        },
-                    )
-                    written += 1
-
-            # The frame was processed regardless of whether the samples
-            # landed — advance the stream position so seq stays monotonic.
-            edge.last_uplink_seq = seq
-            edge.save(update_fields=["last_uplink_seq", "updated_at"])
-
-        if written:
-            self._mirror_samples_to_influx(edge_pk, task_code, samples, window_end)
-        logger.info(
-            "fleet: sample_batch edge=%s task=%s seq=%s samples=%d cached=%d",
-            edge_pk, task_code or task_id, seq, len(samples), written,
-        )
-        return seq
-
-    @database_sync_to_async
-    def _record_alarm_event(
-        self,
-        edge_pk: int,
-        seq: int,
-        rule_id: int,
-        point_code: str,
-        device_code: str,
-        value,
-        message: str,
-        status: str,
-    ) -> int:
-        """Persist an inbound ``alarm_event`` into the center alarm table.
-
-        Reuses ``acquisition.Alarm`` with the ``edge`` FK set so the center
-        ``/alarms`` page can show which edge gateway triggered the alarm.
-
-        ``status == "firing"`` opens an idempotent alarm row; ``"cleared"``
-        (M5) closes the matching open row. Returns the edge's post-state
-        ``last_uplink_seq`` for the M5 ack.
-        """
-        from acquisition.models import Alarm, AlarmRule
-        from django.db import transaction
-
-        with transaction.atomic():
-            edge = EdgeNode.objects.select_for_update().get(pk=edge_pk)
-            verdict = self._classify_and_log_seq(edge, seq, "alarm_event")
-            if verdict == UPLINK_SEQ_DUPLICATE:
-                logger.debug(
-                    "fleet: alarm_event duplicate seq=%s edge=%s — dropping",
-                    seq, edge.name,
-                )
-                return edge.last_uplink_seq
-
-            rule = AlarmRule.objects.filter(pk=rule_id).first()
-            alarm_pk = 0
-            if rule is None:
-                # Rule deleted center-side between the edge firing and us
-                # receiving — drop the alarm but still advance the stream.
-                logger.info(
-                    "fleet: alarm_event for unknown rule_id=%s edge=%s — "
-                    "dropped, seq still advanced",
-                    rule_id, edge.name,
-                )
-            elif status == "firing":
-                # Idempotent: one open (rule, edge, point) alarm at a time.
-                # A redelivered frame or an edge restart re-firing the same
-                # condition must not pile up duplicate rows.
-                existing = Alarm.objects.filter(
-                    rule=rule,
-                    edge=edge,
-                    point_code=point_code,
-                    device_code=device_code,
-                    status=Alarm.STATUS_FIRING,
-                ).first()
-                if existing is None:
-                    alarm = Alarm.objects.create(
-                        rule=rule,
-                        edge=edge,
-                        session=None,
-                        point_code=point_code,
-                        device_code=device_code,
-                        value=value,
-                        message=message,
-                        status=Alarm.STATUS_FIRING,
-                    )
-                    alarm_pk = alarm.pk
-                else:
-                    alarm_pk = existing.pk
-                    logger.debug(
-                        "fleet: alarm_event already open edge=%s rule=%s point=%s",
-                        edge.name, rule_id, point_code,
-                    )
-            elif status == "cleared":
-                # M5 clear-transition: close the matching open alarm row.
-                # Idempotent — a redelivered ``cleared`` frame, or one for
-                # an alarm that never fired center-side, simply closes
-                # nothing. ``.update()`` over the (rule, edge, point) key
-                # handles the (rare) case of more than one open row.
-                closed = (
-                    Alarm.objects.filter(
-                        rule=rule,
-                        edge=edge,
-                        point_code=point_code,
-                        device_code=device_code,
-                        status=Alarm.STATUS_FIRING,
-                    ).update(
-                        status=Alarm.STATUS_CLEARED,
-                        value=value,
-                        cleared_at=timezone.now(),
-                        updated_at=timezone.now(),
-                    )
-                )
-                logger.info(
-                    "fleet: alarm_event cleared edge=%s rule=%s point=%s — "
-                    "closed %d open alarm(s)",
-                    edge.name, rule_id, point_code, closed,
-                )
-
-            edge.last_uplink_seq = seq
-            edge.save(update_fields=["last_uplink_seq", "updated_at"])
-
-        logger.info(
-            "fleet: alarm_event edge=%s rule=%s point=%s value=%s seq=%s status=%s alarm=%s",
-            edge_pk, rule_id, point_code, value, seq, status, alarm_pk or "-",
-        )
-        return seq
-
-    @staticmethod
-    def _mirror_samples_to_influx(edge_pk, task_code, samples, window_end) -> None:
-        """Best-effort short-retention InfluxDB mirror of an edge sample batch.
-
-        Gated by ``CENTER_EDGE_SAMPLE_TO_INFLUX`` (default on). Any failure
-        — InfluxDB down, not configured — is swallowed: the EdgeSample
-        cache is the source of truth, the InfluxDB copy is a convenience.
-        """
-        if not getattr(settings, "CENTER_EDGE_SAMPLE_TO_INFLUX", True):
-            return
-        try:
-            from .services import mirror_edge_samples
-
-            mirror_edge_samples(edge_pk, task_code, samples, window_end)
-        except Exception:  # noqa: BLE001
-            logger.exception("fleet: edge sample InfluxDB mirror failed")
-
-    @database_sync_to_async
-    def _record_session_offline(self, edge_pk: int) -> None:
-        """Synthesise a ``session.offline`` lifecycle row on WS disconnect."""
-        try:
-            EdgeLifecycleEvent.objects.create(
-                edge_id=edge_pk,
-                event=LIFECYCLE_SESSION_OFFLINE,
-                monotonic_seq=0,
-                received_at=timezone.now(),
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("fleet: failed to record session.offline edge=%s", edge_pk)
+    # ---- M3/M4 uplink: lifecycle + sample_batch + alarm_event -------------
+    #
+    # The DB-recording portion of these frame types lives in
+    # :mod:`fleet.uplink_handlers` (P5.1 — XIU-107). Both transports —
+    # this WS consumer and the MQTT subscriber via
+    # :data:`fleet.uplink_router.default_router` — converge on the same
+    # ``record_lifecycle`` / ``record_sample_batch`` / ``record_alarm_event``
+    # coroutines so an edge frame fans out to the same EdgeSample,
+    # EdgeTaskStatus, Alarm and InfluxDB writes regardless of the wire it
+    # rode in on. The WS path keeps its socket-close + ack-frame
+    # semantics here in ``_handle_*``; the recording side effects are
+    # shared.
+    #
+    # Phase 2 P4 (XIU-103): the ``_record_session_offline`` synthesis used
+    # to run from :meth:`disconnect` so a closed WS socket still produced a
+    # ``session.offline`` row. The retained MQTT LWT topic now drives that,
+    # via :mod:`fleet.presence`; the original is in
+    # :func:`fleet._legacy.legacy_record_session_offline` for revert.
 
     async def _fail(self, code: str, message: str, close_code: int) -> None:
         try:

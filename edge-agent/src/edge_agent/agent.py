@@ -43,6 +43,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from . import __version__
 from .backoff import ExponentialBackoff
 from .config import EdgeConfig
+from .transport import Transport, WsTransport
 from .protocol import (
     CONFIG_APPLIED_ERROR,
     CONFIG_APPLIED_OK,
@@ -109,6 +110,7 @@ class EdgeAgent:
         state_store=None,
         runner=None,
         durable_outbox=None,
+        uplink_transport: Optional[Transport] = None,
     ) -> None:
         self.config = config
         self.heartbeat_interval = heartbeat_interval
@@ -154,6 +156,13 @@ class EdgeAgent:
         # Stays up across center reconnects — a WS drop must not take
         # history queries down with it.
         self._history_server = None
+        # Phase 2 P3 (XIU-102): pluggable uplink transport for the seq'd
+        # outbox stream. When ``None`` we fall back to a per-session
+        # :class:`WsTransport` (legacy M5 behaviour); an injected MQTT
+        # transport is opened once at startup and shared across WS
+        # reconnects — broker liveness is independent of the WS session.
+        self._uplink_transport: Optional[Transport] = uplink_transport
+        self._owns_transport = uplink_transport is None
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -181,6 +190,19 @@ class EdgeAgent:
         # loop. Failure to bind is logged but NOT fatal — control-plane
         # must stay up so the center can still dispatch config.
         await self._start_history_server()
+
+        # Phase 2 P3: open an injected uplink transport once, so the MQTT
+        # session is independent of the WS reconnect loop. A WS-only edge
+        # has ``self._uplink_transport is None``; the per-session
+        # ``WsTransport`` is built inside ``_run_session``.
+        if self._uplink_transport is not None:
+            try:
+                await self._uplink_transport.connect()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "edge-agent: uplink transport connect failed — control-plane "
+                    "will stay up but uplink will keep retrying"
+                )
 
         try:
             while not self._stop.is_set():
@@ -233,6 +255,11 @@ class EdgeAgent:
                 with suppress(Exception):
                     await self._history_server.stop()
                 self._history_server = None
+            # Phase 2 P3: close the standalone uplink transport (if any).
+            # Per-session WsTransport instances are GC'd with their socket.
+            if self._uplink_transport is not None and self._owns_transport:
+                with suppress(Exception):
+                    await self._uplink_transport.close()
 
     async def _start_history_server(self) -> None:
         """Bring up the M6 read-only history HTTP server.
@@ -279,10 +306,17 @@ class EdgeAgent:
             event=LIFECYCLE_SESSION_ONLINE,
         ))
 
+        # Phase 2 P3: uplink runs over an injected transport (MQTT) when
+        # one is configured; otherwise wrap the current WS session in a
+        # ``WsTransport`` so the legacy egress path stays identical to M5.
+        uplink_transport = self._uplink_transport or WsTransport(ws)
+
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws), name="edge-agent.heartbeat")
         reader_task = asyncio.create_task(self._read_loop(ws), name="edge-agent.reader")
         control_task = asyncio.create_task(self._control_loop(ws), name="edge-agent.control")
-        uplink_task = asyncio.create_task(self._uplink_loop(ws), name="edge-agent.uplink")
+        uplink_task = asyncio.create_task(
+            self._uplink_loop(uplink_transport), name="edge-agent.uplink",
+        )
         session_tasks = (heartbeat_task, reader_task, control_task, uplink_task)
         try:
             done, pending = await asyncio.wait(
@@ -443,18 +477,29 @@ class EdgeAgent:
                 continue
             await ws.send(json.dumps(frame))
 
-    async def _uplink_loop(self, ws) -> None:
-        """Drain the durable outbox onto the WS — backfill + steady state.
+    async def _uplink_loop(self, transport: Transport) -> None:
+        """Drain the durable outbox over ``transport`` — backfill + steady state.
 
         On a fresh session ``_uplink_sent_high`` is the center's high-water
         mark, so the first pass resends every still-pending frame (the
         reconnect backfill). Frames are pushed in seq order, in batches of
         ``backfill_batch`` with a ``backfill_pause`` between *full* batches
-        so a large backlog cannot flood the center the instant the socket
-        comes back. Acked frames are pruned out-of-band by :meth:`_handle_ack`.
+        so a large backlog cannot flood the center the instant the channel
+        comes back.
+
+        Outbox pruning splits by transport (Phase 2 P3 — XIU-102):
+
+        * WS (``confirms_on_publish=False``) — the center sends
+          ``ack {last_uplink_seq}`` back over the WS and ``_handle_ack``
+          prunes asynchronously, same as M5.
+        * MQTT QoS 1 (``confirms_on_publish=True``) — broker PUBACK at
+          publish-return is the delivery signal, so the loop prunes the
+          just-published row immediately. (P4 will revisit on outbox /
+          last-will work.)
         """
         loop = asyncio.get_running_loop()
         batch_size = self.config.backfill_batch
+        confirms = bool(getattr(transport, "confirms_on_publish", False))
 
         def _fetch_batch() -> list:
             if self._durable_outbox is None:
@@ -477,8 +522,15 @@ class EdgeAgent:
                 # high-water) ship exactly as built.
                 if seq <= self._backfill_through:
                     frame = {**frame, "backfill": True}
-                await ws.send(json.dumps(frame))
+                await transport.publish(frame)
                 self._uplink_sent_high = seq
+                if confirms and self._durable_outbox is not None:
+                    # MQTT QoS 1: PUBACK is delivery — prune the row out
+                    # of the durable outbox so a long-running mqtt mode
+                    # session doesn't pile up acked rows.
+                    await loop.run_in_executor(
+                        None, self._durable_outbox.ack, seq,
+                    )
             # A full batch means more is likely waiting (backfill flood) —
             # pause so the center can keep up before the next batch.
             if len(batch) >= batch_size and self.config.backfill_pause > 0:

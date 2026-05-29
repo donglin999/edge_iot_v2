@@ -220,14 +220,36 @@ def reconcile_assignments(edge: EdgeNode) -> Tuple[int, List[EdgeAssignment]]:
     return new_version, assignments
 
 
-def dispatch_apply_config(edge: EdgeNode, frame: Dict[str, Any]) -> bool:
-    """Push an ``apply_config`` frame to the edge's open WS session.
+FLEET_TRANSPORT_MQTT = "mqtt"
+FLEET_TRANSPORT_WS = "ws"
+FLEET_TRANSPORT_BOTH = "both"
+_VALID_FLEET_TRANSPORTS = frozenset(
+    {FLEET_TRANSPORT_MQTT, FLEET_TRANSPORT_WS, FLEET_TRANSPORT_BOTH}
+)
 
-    Returns ``True`` if the channel-layer accepted the message; the frame
-    delivery is still best-effort (the edge may not be connected). The
-    edge converges on reconnect because the center re-pushes the latest
-    snapshot.
+
+def _resolve_transport(transport: str | None = None) -> str:
+    """Return the active downlink transport (``mqtt|ws|both``).
+
+    Explicit ``transport=`` overrides ``settings.FLEET_TRANSPORT``. An
+    unrecognised setting value falls back to the safer ``both`` so we
+    keep delivering during a misconfiguration rather than silently
+    dropping config pushes.
     """
+    from django.conf import settings
+
+    mode = str(transport or getattr(settings, "FLEET_TRANSPORT", FLEET_TRANSPORT_MQTT))
+    mode = mode.lower()
+    if mode not in _VALID_FLEET_TRANSPORTS:
+        logger.warning(
+            "fleet: unknown FLEET_TRANSPORT=%r — falling back to 'both'", mode
+        )
+        return FLEET_TRANSPORT_BOTH
+    return mode
+
+
+def _dispatch_apply_config_via_ws(edge: EdgeNode, frame: Dict[str, Any]) -> bool:
+    """Original M2 WS path: push to the edge's Channels group."""
     layer = get_channel_layer()
     if layer is None:
         return False
@@ -235,8 +257,45 @@ def dispatch_apply_config(edge: EdgeNode, frame: Dict[str, Any]) -> bool:
     try:
         async_to_sync(layer.group_send)(group, {"type": "fleet.send", "frame": frame})
     except Exception:  # noqa: BLE001
+        logger.exception("fleet: ws dispatch raised edge=%s", edge.name)
         return False
     return True
+
+
+def _dispatch_apply_config_via_mqtt(edge: EdgeNode, frame: Dict[str, Any]) -> bool:
+    """Phase 2 P2 path: publish ``edge/<edge.name>/cmd/apply_config`` (QoS 1)."""
+    from .mqtt_transport import publish_command
+
+    return publish_command(edge.name, "apply_config", frame, qos=1)
+
+
+def dispatch_apply_config(
+    edge: EdgeNode,
+    frame: Dict[str, Any],
+    *,
+    transport: str | None = None,
+) -> bool:
+    """Push an ``apply_config`` frame to one edge.
+
+    The transport is selected by ``settings.FLEET_TRANSPORT`` (overridable
+    via the keyword for tests):
+
+    * ``mqtt`` (default) — publish over MQTT only.
+    * ``ws``             — keep the original Channels-group push.
+    * ``both``           — publish via BOTH; the edge dedupes by ``version``.
+
+    Returns ``True`` iff at least one selected transport accepted the
+    frame. Delivery is still best-effort end-to-end: an offline edge will
+    not see the snapshot until reconnect, regardless of transport.
+    """
+    mode = _resolve_transport(transport)
+    delivered_ws = False
+    delivered_mqtt = False
+    if mode in (FLEET_TRANSPORT_WS, FLEET_TRANSPORT_BOTH):
+        delivered_ws = _dispatch_apply_config_via_ws(edge, frame)
+    if mode in (FLEET_TRANSPORT_MQTT, FLEET_TRANSPORT_BOTH):
+        delivered_mqtt = _dispatch_apply_config_via_mqtt(edge, frame)
+    return delivered_ws or delivered_mqtt
 
 
 def sync_assignments(edge: EdgeNode) -> Dict[str, Any]:

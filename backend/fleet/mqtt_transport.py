@@ -1,15 +1,24 @@
-"""Center MQTT subscriber — Phase 2 P1 (XIU-100).
+"""Center MQTT transport — Phase 2 (XIU-100 P1 + XIU-101 P2).
 
-A long-lived asyncio task that connects to the center broker (Mosquitto),
-subscribes to the edge uplink topic tree at QoS 1, parses each message as
-a JSON frame and forwards it to :class:`fleet.uplink_router.UplinkRouter`.
+This module owns both directions of the center ↔ broker plumbing:
 
-Topic tree (see plan §9.3):
+* **Uplink subscriber** (P1, XIU-100): a long-lived asyncio task driven by
+  the daphne ASGI lifespan that connects to the broker, subscribes to the
+  edge uplink topic tree at QoS 1, parses each frame as JSON and forwards
+  it to :class:`fleet.uplink_router.UplinkRouter`.
+* **Downlink publisher** (P2, XIU-101): a process-wide paho-mqtt client
+  that publishes center → edge commands on ``edge/<edge_id>/cmd/<type>``.
+  ``publish_command()`` is the sync entry point — it lazy-connects the
+  publisher on first call so the existing sync DRF/signal call sites can
+  use it without an asyncio bridge.
 
-* ``edge/<edge_id>/uplink/<frame_type>``  — uplink frames from the edge
+Topic tree (plan §9.3 / §9.4):
+
+* ``edge/<edge_id>/uplink/<frame_type>``  — edge → center uplink frames
 * ``edge/<edge_id>/lwt``                  — broker-published last-will
+* ``edge/<edge_id>/cmd/<cmd_type>``       — center → edge commands
 
-The transport handles connection lifecycle:
+Subscriber lifecycle:
 
 * connect → subscribe to both wildcards → enter the per-message async loop
 * on ``aiomqtt.MqttError`` (network drop, broker restart) → exponential
@@ -18,18 +27,18 @@ The transport handles connection lifecycle:
 * on ``asyncio.CancelledError`` (lifespan shutdown) → close the underlying
   client and return cleanly
 
-Phase 2 P1 scope deliberately ignores downlink — see
-``docs/distributed/protocol.md`` / plan §9.4. The MQTT client publishes
-nothing; the WS path remains the sole downlink in the rolling-upgrade
-window.
+The downlink direction is gated by the ``FLEET_TRANSPORT`` setting
+(``mqtt|ws|both``, default ``mqtt``) at the dispatcher in ``services.py``;
+the publisher itself is mode-agnostic.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from .uplink_router import UplinkRouter, default_router
 
@@ -306,6 +315,10 @@ async def _on_startup() -> None:
 
 async def _on_shutdown() -> None:
     await default_manager.stop()
+    # Tear the publisher down on the same lifespan shutdown so the paho
+    # network thread does not outlive daphne. Wrapped in a thread-pool call
+    # because ``loop_stop()`` joins the paho thread synchronously.
+    await asyncio.get_running_loop().run_in_executor(None, default_publisher.stop)
 
 
 async def lifespan_handler(scope, receive, send) -> None:
@@ -346,3 +359,162 @@ async def lifespan_handler(scope, receive, send) -> None:
             return
         else:
             logger.debug("mqtt_transport: ignoring lifespan event %r", kind)
+
+
+# ---------------------------------------------------------------------------
+# Downlink publisher — XIU-101 Phase 2 P2
+# ---------------------------------------------------------------------------
+#
+# The sync callers (``fleet.services.dispatch_apply_config`` invoked from a
+# DRF view / a ``transaction.on_commit`` signal handler) need a plain blocking
+# entry point to publish ``apply_config`` (and, when added, ``restart_task``
+# etc.) over MQTT. paho-mqtt's threaded client is the most natural fit — it
+# owns its own network thread once ``loop_start()`` is called, and
+# ``Client.publish()`` is thread-safe and returns immediately. Lazy-connecting
+# on first publish keeps process startup decoupled from broker reachability,
+# matching the soft-fail policy the subscriber side already follows.
+
+
+# topic format for every center → edge command publish — kept module-level so
+# tests can assert against it without hard-coding the f-string.
+CMD_TOPIC_TEMPLATE = "edge/{edge_id}/cmd/{cmd_type}"
+
+
+class _PublisherManager:
+    """Process-wide paho-mqtt client used for center → edge command publish.
+
+    Lazy: the first ``publish()`` call establishes the connection and starts
+    paho's background network thread; subsequent calls reuse it. ``stop()``
+    is invoked from the ASGI lifespan shutdown so the network thread does
+    not outlive daphne. The class deliberately swallows connect / publish
+    errors and returns ``False`` instead of raising — a broken broker must
+    not propagate out of a config sync and 500 the DRF view; the WS path
+    (when ``FLEET_TRANSPORT=both``) or the edge's reconnect re-fetch keeps
+    convergence going.
+    """
+
+    def __init__(self) -> None:
+        self._client = None  # type: Optional[Any]
+        self._connected: bool = False
+        self._lock = threading.Lock()
+
+    def _config_from_settings(self) -> dict:
+        from django.conf import settings  # local to tolerate missing app config
+
+        return {
+            "host": str(getattr(settings, "FLEET_MQTT_HOST", "center-mosquitto")),
+            "port": int(getattr(settings, "FLEET_MQTT_PORT", 1883)),
+            "client_id": str(
+                getattr(settings, "FLEET_MQTT_PUBLISHER_CLIENT_ID", "")
+                or "center-fleet-publisher"
+            ),
+            "username": (str(getattr(settings, "FLEET_MQTT_USERNAME", "")) or None),
+            "password": (str(getattr(settings, "FLEET_MQTT_PASSWORD", "")) or None),
+        }
+
+    def _ensure_connected(self) -> bool:
+        if self._connected and self._client is not None:
+            return True
+        with self._lock:
+            if self._connected and self._client is not None:
+                return True
+            try:
+                import paho.mqtt.client as mqtt
+            except ImportError:
+                logger.error(
+                    "mqtt_publisher: paho-mqtt not installed — downlink disabled"
+                )
+                return False
+            cfg = self._config_from_settings()
+            try:
+                client = mqtt.Client(client_id=cfg["client_id"], clean_session=True)
+                if cfg["username"]:
+                    client.username_pw_set(cfg["username"], cfg["password"] or "")
+                client.connect(cfg["host"], cfg["port"], keepalive=60)
+                client.loop_start()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "mqtt_publisher: connect failed broker=%s:%d", cfg["host"], cfg["port"]
+                )
+                return False
+            self._client = client
+            self._connected = True
+            logger.info(
+                "mqtt_publisher: connected broker=%s:%d client_id=%s",
+                cfg["host"], cfg["port"], cfg["client_id"],
+            )
+            return True
+
+    def publish(self, topic: str, payload: bytes, qos: int = 1) -> bool:
+        """Publish one message. Returns ``True`` iff paho accepted it."""
+        if not self._ensure_connected():
+            return False
+        try:
+            info = self._client.publish(topic, payload=payload, qos=qos)
+        except Exception:  # noqa: BLE001
+            logger.exception("mqtt_publisher: publish raised topic=%s", topic)
+            return False
+        # paho returns an MQTTMessageInfo whose ``rc`` is MQTT_ERR_SUCCESS (0)
+        # on accept. We do NOT wait for PUBACK — the network thread retries
+        # at QoS 1 and the edge dedupes ``apply_config`` by ``version``.
+        rc = getattr(info, "rc", 0)
+        if rc != 0:
+            logger.warning(
+                "mqtt_publisher: paho rejected publish topic=%s rc=%s", topic, rc
+            )
+            return False
+        return True
+
+    def stop(self) -> None:
+        with self._lock:
+            client, self._client = self._client, None
+            self._connected = False
+        if client is None:
+            return
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:  # noqa: BLE001
+            logger.exception("mqtt_publisher: shutdown raised")
+        logger.info("mqtt_publisher: stopped")
+
+
+# Singleton owned by the ASGI process; tests inject a fake via the
+# ``publisher=`` kwarg on :func:`publish_command` or by monkey-patching this.
+default_publisher = _PublisherManager()
+
+
+def publish_command(
+    edge_id: str,
+    cmd_type: str,
+    payload: Any,
+    qos: int = 1,
+    *,
+    publisher: Optional[_PublisherManager] = None,
+) -> bool:
+    """Publish one center → edge command frame over MQTT.
+
+    Topic format: ``edge/{edge_id}/cmd/{cmd_type}``. Payload is JSON-encoded
+    via :func:`json.dumps` (utf-8 bytes on the wire). Returns ``True`` iff
+    paho accepted the publish — best-effort at QoS 1, the broker handles
+    retransmission to the edge.
+
+    ``publisher`` is an injection seam for tests.
+    """
+    pub = publisher if publisher is not None else default_publisher
+    topic = CMD_TOPIC_TEMPLATE.format(edge_id=edge_id, cmd_type=cmd_type)
+    try:
+        data = json.dumps(payload).encode("utf-8")
+    except (TypeError, ValueError):
+        logger.exception(
+            "mqtt_publisher: payload not JSON-serialisable edge=%s cmd=%s",
+            edge_id, cmd_type,
+        )
+        return False
+    ok = pub.publish(topic, data, qos=qos)
+    if ok:
+        logger.info(
+            "mqtt_publisher: published topic=%s qos=%d bytes=%d",
+            topic, qos, len(data),
+        )
+    return ok

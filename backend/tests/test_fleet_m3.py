@@ -341,7 +341,15 @@ async def test_sample_batch_updates_existing_row_in_place(_inmemory_channel_laye
 
 
 @pytest.mark.asyncio
-async def test_session_offline_synthesised_on_disconnect(_inmemory_channel_layer):
+async def test_ws_disconnect_no_longer_synthesises_session_offline(_inmemory_channel_layer):
+    """Phase 2 P4 (XIU-103) retired the WS-disconnect-driven synthesis.
+
+    Presence is now driven by the broker's retained LWT topic — see
+    :mod:`fleet.presence`. A plain WS disconnect must NOT write a
+    spurious ``session.offline`` row anymore; the broker will publish
+    the offline LWT and the presence handler covers it from there. The
+    pre-P4 synthesis lives in :func:`fleet._legacy.legacy_record_session_offline`.
+    """
     node, token = await sync_to_async(EdgeNode.issue)(name="edge-m3-off")
 
     comm = WebsocketCommunicator(fleet_application, "/ws/fleet/")
@@ -354,7 +362,7 @@ async def test_session_offline_synthesised_on_disconnect(_inmemory_channel_layer
             edge=node, event=LIFECYCLE_SESSION_OFFLINE
         ).count
     )()
-    assert count == 1
+    assert count == 0
 
 
 @pytest.mark.asyncio

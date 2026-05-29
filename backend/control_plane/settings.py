@@ -364,3 +364,26 @@ FLEET_MQTT_PORT = env.int("FLEET_MQTT_PORT", default=1883)
 FLEET_MQTT_CLIENT_ID = env.str("FLEET_MQTT_CLIENT_ID", default="center-fleet-subscriber")
 FLEET_MQTT_USERNAME = env.str("FLEET_MQTT_USERNAME", default="")
 FLEET_MQTT_PASSWORD = env.str("FLEET_MQTT_PASSWORD", default="")
+
+
+# ========================================
+# Fleet downlink transport switch (XIU-101 Phase 2 P2)
+# ========================================
+#
+# Selects how center → edge commands (``apply_config`` today, ``restart_task``
+# etc. later) are delivered:
+#
+#   ``mqtt`` (default) — publish to ``edge/<edge_id>/cmd/<cmd_type>`` via the
+#                        paho-mqtt publisher in ``fleet.mqtt_transport``.
+#   ``ws``             — keep the original Channels-group push to the edge's
+#                        open ``/ws/fleet/`` socket.
+#   ``both``           — publish via BOTH transports for the rolling-upgrade
+#                        window. The edge dedupes ``apply_config`` by its
+#                        ``version`` field, so a second copy is idempotent.
+#
+# A separate paho client_id is used for the publisher so a Mosquitto session
+# log can tell publish traffic apart from the subscriber.
+FLEET_TRANSPORT = env.str("FLEET_TRANSPORT", default="mqtt").lower()
+FLEET_MQTT_PUBLISHER_CLIENT_ID = env.str(
+    "FLEET_MQTT_PUBLISHER_CLIENT_ID", default="center-fleet-publisher"
+)
