@@ -27,6 +27,30 @@ services:
       timeout: 3s
       retries: 3
 
+  mosquitto:
+    # Phase 2 P1 (XIU-100): center MQTT broker for the edge ↔ center uplink
+    # migration off WebSocket. Anonymous on 1883 for local dev — TLS + ACL
+    # are bolted on in later Phase-2 milestones.
+    image: eclipse-mosquitto:2
+    container_name: center-mosquitto
+    ports:
+      - "1883:1883"
+    networks:
+      - center-network
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      # The broker is "healthy" as soon as a subscriber can receive one
+      # message on the always-published $SYS tree within 3 s.
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/#' -C 1 -W 3 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   django:
     build:
       context: ./backend
@@ -50,9 +74,17 @@ services:
       - INFLUXDB_TOKEN=unused-on-center
       - INFLUXDB_ORG=edge-iot
       - INFLUXDB_BUCKET=iot-data
+      # Phase 2 P1 (XIU-100): center MQTT subscriber connects to this broker
+      # at daphne startup. Disable with FLEET_MQTT_ENABLED=false to fall
+      # back to WS-only ingest during the grey-rollout window.
+      - FLEET_MQTT_ENABLED=true
+      - FLEET_MQTT_HOST=center-mosquitto
+      - FLEET_MQTT_PORT=1883
       - TZ=Asia/Shanghai
     depends_on:
       redis:
+        condition: service_healthy
+      mosquitto:
         condition: service_healthy
     restart: unless-stopped
     command: sh -c "python manage.py migrate && daphne -b 0.0.0.0 -p 8000 control_plane.asgi:application"
