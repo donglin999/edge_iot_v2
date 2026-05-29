@@ -77,13 +77,44 @@ test.describe('/alarms — MQTT alarm_event surfaces in the list', () => {
     test.skip(!a || a.status !== 'online', `edge ${EDGE_A} is not online — bring it up first`);
 
     const rule = await ensureAlarmRule(ctx, EDGE_A);
+
+    // The center collapses repeated firing events into the open row, so
+    // we need to clear any existing open alarm for (rule, edge, point)
+    // before publishing — otherwise the next firing is a no-op and the
+    // row count never grows.
+    const clearFrame = {
+      v: '0.6',
+      type: 'alarm_event',
+      edge_id: EDGE_A,
+      monotonic_seq: Math.floor(Date.now() / 1000) - 2,
+      rule_id: rule.id,
+      point_code: rule.point_code || 'e2e_point',
+      device_code: rule.device_code || 'e2e_device',
+      value: 0,
+      severity: rule.severity,
+      status: 'cleared',
+      message: 'XIU-108 e2e pre-clear',
+      fired_at: new Date(Date.now() - 1000).toISOString(),
+    };
+    const clearTopic = `edge/${EDGE_A}/uplink/alarm_event`;
+    {
+      const brokerName = (await findContainerByPrefix(BROKER_CONTAINER)) ?? BROKER_CONTAINER;
+      const pre = await dockerExec(
+        brokerName,
+        ['mosquitto_pub', '-h', '127.0.0.1', '-p', '1883', '-q', '1', '-t', clearTopic, '-m', JSON.stringify(clearFrame)],
+        info,
+      );
+      expect(pre.code, `pre-clear mosquitto_pub failed: ${pre.stderr}`).toBe(0);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
     const baselineRows = await listAlarms(ctx);
     const baselineCount = baselineRows.length;
 
     // Render the UI before publishing so the table is mounted when the
     // new row arrives on the next 5 s poll.
     await page.goto('/alarms');
-    await expect(page.getByRole('heading', { name: /告警中心|Alarms/ })).toBeVisible();
+    await expect(page.getByRole('heading', { level: 1, name: /告警中心|Alarms/ })).toBeVisible();
     const table = page.locator('.ant-table-tbody').first();
     await expect(table).toBeVisible();
 
@@ -129,9 +160,17 @@ test.describe('/alarms — MQTT alarm_event surfaces in the list', () => {
     }
     expect(grown, `alarm row count did not grow within 60 s (baseline=${baselineCount})`).toBe(true);
 
-    // UI assertion — the message we sent should appear in the list
-    // (page polls /api/acquisition/alarms/ every 5 s).
-    await expect(page.getByText(frame.message)).toBeVisible({ timeout: 20_000 });
+    // UI assertion — the page polls /api/acquisition/alarms/ every 15 s.
+    // The table doesn't render the message text, so assert on a row
+    // containing the source edge tag + the rule name. Click 刷新 to
+    // skip the poll wait.
+    const refreshBtn = page.getByRole('button', { name: /刷新|Refresh/ });
+    await refreshBtn.click().catch(() => {});
+    const tableRow = page
+      .locator('.ant-table-row', { has: page.locator(`text=${EDGE_A}`) })
+      .filter({ hasText: rule.name })
+      .first();
+    await expect(tableRow).toBeVisible({ timeout: 25_000 });
     await page.screenshot({
       path: 'e2e/.artifacts/screenshots/alarms-01-mqtt-row.png',
       fullPage: true,

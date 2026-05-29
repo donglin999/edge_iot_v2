@@ -52,7 +52,7 @@ test.describe('/import — Excel import lands in the config library', () => {
     const before = await latestVersion();
 
     await page.goto('/import');
-    await expect(page.getByRole('heading', { name: /导入作业|Import/ })).toBeVisible();
+    await expect(page.getByRole('heading', { level: 1, name: /导入作业|Import/ })).toBeVisible();
 
     // Upload.Dragger renders a hidden <input type="file">; the spec
     // attaches the file directly to it (faster + deterministic than

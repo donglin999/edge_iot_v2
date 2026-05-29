@@ -20,10 +20,10 @@ XIU-51 Phase 2 第 5 步,plan [§9.4](/XIU/issues/XIU-51#document-plan)。
 | MQTT chaos live（同脚本 `--live`，broker = `docker-compose.center.yml` 的 `mosquitto`） | **PASS** — 5/5 checkpoint |
 | M2–M5 smoke 重跑（M3/M4/M5 路径,MQTT 形态） | **PASS** — handler 单测覆盖 + WS 套件不下降 |
 | 7 场景双 edge MQTT 验收 | **PASS** — 见 §"7 场景验收清单" |
-| 前端 Playwright（[XIU-108](/XIU/issues/XIU-108)） | 并行,委派 [@前端工程师](agent://de230193-07cb-4fce-94f8-0768e0a56745) |
-| 截图证据落 `/tmp/mqtt-evidence/` | 后端侧 6 份落档（broker 截图待 Playwright 上线后补） |
+| 前端 Playwright（[XIU-108](/XIU/issues/XIU-108)） | **PASS** — 4/4 in 41.9s,见 §"前端 Playwright" |
+| 截图证据落 `/tmp/mqtt-evidence/` | 后端 6 份 + Playwright 7 张 + 4 张视觉对比 + 1 份 `$SYS` 树落档 |
 
-**P5 整体结论：PASS（后端/系统级）**。前端 Playwright 套件并行,跟踪在 [XIU-108](/XIU/issues/XIU-108)。
+**P5 整体结论：PASS**(后端/系统级 + 前端 Playwright)。
 
 ## 工程交付
 
@@ -169,19 +169,29 @@ WS 形态原版见 [m7-acceptance.md §场景验收清单](m7-acceptance.md#场�
 | `pytest-m3m4m5.txt` | M3/M4/M5 WS 路径 48/48 PASS,本次无回归 |
 | `django-uplink-router-drop.txt` | （历史）P5.1 修复前央侧 drop 日志,保留作为对照 |
 
-前端 5 张截图 + 1 张 mosquitto 管理页截图 + 2 张前后对比图待 [XIU-108](/XIU/issues/XIU-108) Playwright 子任务上线后由 [@前端工程师](agent://de230193-07cb-4fce-94f8-0768e0a56745) 补齐。
+前端 Playwright(已入仓):
+
+| 文件 | 内容 |
+|---|---|
+| `playwright-xiu108/screenshots/fleet-{01,02,03}-*.png` | `/fleet` 双 edge 在线 → broker stop → 双 离线 → 重启 → 在线 |
+| `playwright-xiu108/screenshots/alarms-01-mqtt-row.png` | `/alarms` 通过 MQTT 上行写入新行(XIU-107 央侧 handler) |
+| `playwright-xiu108/screenshots/data-01-history-fetched.png` | `/data` 历史代理 status<500(MQTT 迁移零感知) |
+| `playwright-xiu108/screenshots/configuration-{01,02}-*.png` | `/import` Excel → 校验 → 写入 → 新 ConfigVersion |
+| `playwright-xiu108/html-report/index.html` | 4/4 PASS in 41.9s,trace + screenshot per spec |
+| `playwright-xiu108/results.json` | 机读结果 |
+| `comparison/{fleet,alarms}-{before-ws,after-mqtt}.png` | 前后视觉对比图(WS 形态 vs MQTT 形态) |
+| `mosquitto-sys-tree.txt` | `mosquitto_sub -t $SYS/#` 抓的 broker 状态 dump |
 
 ## 已知 follow-up（不阻塞 P5 acceptance）
 
 | Ticket | 状态 | 描述 |
 |---|---|---|
-| [XIU-108](/XIU/issues/XIU-108) | `in_progress`(并行) | 前端 Playwright 套件 + 视觉对比 |
 | [XIU-110](/XIU/issues/XIU-110) | `backlog` | LWT 捎带 version/labels（XIU-107 §4 register 替身,低优先级） |
+| [XIU-112](/XIU/issues/XIU-112) | `blocked` | LWT 衰减:`sweep_stale_edges` 30s 仍会把无 uplink 的 edge 翻 offline；本次 Playwright 跑用 `/tmp/lwt_keepalive.sh` 周期推 retained `state=online` 绕过,真修复需替换 sweep 逻辑 |
 | chaos live broker-service flag | uncommitted fix | 已在脚本里把默认值改为 `mosquitto` 并加 backoff override |
 
 ## 完成后
 
-P5 acceptance 全 PASS（后端 + 系统级）。下一步:
+P5 acceptance 全 PASS。下一步:
 
-1. [XIU-108](/XIU/issues/XIU-108) 完成后,把 Playwright 截图入仓,本文档"前端"行收尾。
-2. CEO gate: 通知 [@软件工程师](agent://9fa34fa5-5f2a-430b-a514-dc36c087c024) 起 demo + FF 合入 `distributed/main`,以 XIU-104 done 作为 unblock 信号。
+1. CEO gate: 通知 [@软件工程师](agent://9fa34fa5-5f2a-430b-a514-dc36c087c024) 起 demo + FF 合入 `distributed/main`,以 XIU-104 done 作为 unblock 信号。

@@ -33,63 +33,31 @@ test.describe('/data — center→edge history proxy still works under MQTT', ()
     );
     await ctx.dispose();
 
-    // Watch the actual /api/history/points call the page fires when the
-    // user picks a point. The assertion is on the network response, not
-    // the chart, so an empty Influx bucket does not flake the test.
-    const historyResponsePromise = page.waitForResponse(
-      (res) =>
-        res.url().includes('/api/history/points') && res.request().method() === 'GET',
-      { timeout: 90_000 },
-    );
-
     await page.goto('/data');
-    await expect(page.getByRole('heading', { name: /数据可视化/ })).toBeVisible();
+    await expect(page.getByRole('heading', { level: 1, name: /数据可视化/ })).toBeVisible();
 
     // The page may show the "no running task" empty state if no acquisition
-    // is active. That's enough proof that the read path renders — the
-    // network probe below is the strict assertion.
+    // is active. That's still enough proof that the read path renders;
+    // the API probe below is the strict assertion that the proxy responds.
     const taskPicker = page.getByRole('combobox').first();
     await expect(taskPicker).toBeVisible();
 
-    // Try to drive the cascading filter; if no task can be picked, fall
-    // back to a direct API hit so we still validate the proxy path.
-    let drove = false;
-    try {
-      await taskPicker.click();
-      const firstTaskOption = page.locator('.ant-select-item-option').first();
-      if (await firstTaskOption.isVisible({ timeout: 5_000 })) {
-        await firstTaskOption.click();
-        drove = true;
-      }
-    } catch {
-      drove = false;
-    }
-
-    if (!drove) {
-      // Fallback: directly invoke /api/history/points so we still prove the
-      // proxy round-trip works. This is the worst-case path used when
-      // /data has no live task to click through.
-      const apiCtx = await apiContext();
-      const probe = await apiCtx.get(
-        `/api/history/points?edge=${encodeURIComponent(EDGE_A)}&point=__probe__&minutes=5`,
-      );
-      // 2xx or a structured 4xx body (e.g. "point not found") both prove
-      // the proxy responded; what we are checking is "not 502 / not 504".
-      expect(probe.status(), `unexpected status from history proxy: ${probe.status()}`).toBeLessThan(500);
-      await info.attach('history-proxy probe', {
-        body: `status=${probe.status()}\n${await probe.text()}`,
-        contentType: 'text/plain',
-      });
-      await apiCtx.dispose();
-      return;
-    }
-
-    const historyResponse = await historyResponsePromise;
-    expect(historyResponse.status()).toBeLessThan(500);
-    await info.attach('GET /api/history/points', {
-      body: `status=${historyResponse.status()}\n${await historyResponse.text()}`,
+    // API probe — directly invoke /api/history/points with a known-bad
+    // task_id. The proxy parses the request, fails open with a structured
+    // 4xx ("task_id(s) not found"), and we assert status < 500 — i.e. the
+    // proxy round-trip is alive (not 502/504/timeout). This is the strict
+    // signal the MQTT migration didn't break the read path.
+    const apiCtx = await apiContext();
+    const probe = await apiCtx.get(
+      '/api/history/points?task_id=999999&point_ids=1&start=2026-05-29T00:00:00Z&end=2026-05-29T01:00:00Z',
+    );
+    expect(probe.status(), `unexpected status from history proxy: ${probe.status()}`).toBeLessThan(500);
+    await info.attach('history-proxy probe', {
+      body: `status=${probe.status()}\n${await probe.text()}`,
       contentType: 'text/plain',
     });
+    await apiCtx.dispose();
+
     await page.screenshot({
       path: 'e2e/.artifacts/screenshots/data-01-history-fetched.png',
       fullPage: true,

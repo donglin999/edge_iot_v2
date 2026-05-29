@@ -54,7 +54,7 @@ test.describe('/fleet — dual-edge MQTT online/offline', () => {
 
     // --- step 1: UI shows both as 在线 --------------------------------------
     await page.goto('/fleet');
-    await expect(page.getByRole('heading', { name: /边缘节点|Fleet/i })).toBeVisible();
+    await expect(page.getByRole('heading', { level: 1, name: /边缘节点|Fleet/i })).toBeVisible();
     const rowA = page.getByRole('row', { name: new RegExp(EDGE_A) });
     const rowB = page.getByRole('row', { name: new RegExp(EDGE_B) });
     await expect(rowA).toBeVisible();
