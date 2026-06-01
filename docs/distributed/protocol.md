@@ -1,14 +1,21 @@
-# Distributed control-plane protocol — v0.5 (STABLE)
+# Distributed control-plane protocol — v0.6
 
-**Status: STABLE** — frozen at M7 (XIU-96). No further breaking changes
-planned; future evolution will be additive-only (new optional fields /
-new frame types) under the same v0.5 envelope or a v0.6+ bump.
+**Status: STABLE** — M7 (XIU-96) froze v0.5; v0.6 (XIU-112) is an
+additive/clarifying bump that makes the **retained `edge/<id>/lwt` MQTT
+topic the single source of truth for edge presence** (see
+[Presence — `lwt` single source of truth](#presence--lwt-single-source-of-truth-v06-xiu-112)).
+No wire frame changed shape. Future evolution stays additive-only.
 
-Wire format for the WebSocket channel between each **edge-agent** and the
-**center** (`fleet/` Django app). One persistent WS connection per edge.
+Wire format for the channel between each **edge-agent** and the
+**center** (`fleet/` Django app). Phase 1 ran one persistent WebSocket per
+edge; Phase 2 (XIU-51) migrated the transport to **MQTT** (Mosquitto). The
+frame catalogue below is transport-agnostic — the same JSON objects ride
+either channel — except presence, which is MQTT-native (below).
 
-- Transport: WebSocket text frames, JSON-encoded object per frame.
-- Endpoint: `ws[s]://<center>/ws/fleet/`
+- Transport: JSON-encoded object per frame (WS text frame, or MQTT publish
+  payload on the per-edge topics).
+- Endpoint (WS, legacy): `ws[s]://<center>/ws/fleet/`
+- Presence (MQTT): retained `edge/<id>/lwt`, last-will configured per edge.
 - Authentication: activation token, presented in the first `register` frame.
 
 Every frame carries `"v": "0.5"`. The center also accepts `"v": "0.1"`
@@ -68,6 +75,44 @@ existing field's meaning. The M1/M2/M3 public contract is preserved:
   The edge now emits an `alarm_event` on a clear transition as well as a
   fire; the center closes the matching open `Alarm`. No existing field
   changes meaning.
+- **v0.6** adds **no new frame types and changes no field shape**. It
+  re-specifies *how the center derives edge presence*: the retained
+  `edge/<id>/lwt` topic becomes the **single source of truth** for
+  `online`/`offline` and the legacy `last_seen` heartbeat-timeout decay is
+  removed (XIU-112). See the section below.
+
+## Presence — `lwt` single source of truth (v0.6, XIU-112)
+
+`EdgeNode.status` (`online` / `offline` / `pending`) is derived **solely**
+from the broker's retained `edge/<id>/lwt` topic:
+
+- On every successful connect the edge publishes `edge/<id>/lwt` with
+  `retained=true`, payload `{"state": "online", "ts": ...}`.
+- The edge registers an MQTT **last-will** on the same topic with payload
+  `{"state": "offline", "ts": ...}`. The broker auto-publishes it on any
+  ungraceful disconnect (TCP RST, edge crash, keepalive timeout).
+- The center subscribes `edge/+/lwt` and folds each message into
+  `EdgeNode.status` in `fleet.presence.apply_lwt`: `online → ONLINE`
+  (also refreshes `last_seen`), `offline → OFFLINE` (also writes one
+  synthesised `session.offline` lifecycle row).
+
+**No time-based decay.** Before v0.6 the center additionally swept any
+`ONLINE` edge whose `last_seen` was older than `OFFLINE_AFTER` (30 s) back
+to `OFFLINE` — inherited from the Phase 1 WS heartbeat model. That was
+**removed**: an idle edge (no acquisition task dispatched) legitimately
+sends no uplink and never refreshes `last_seen`, yet stays connected via
+MQTT keepalive with its retained lwt still `online`. The old decay
+therefore mis-flagged healthy idle edges offline (operator alarm noise,
+flaky dual-edge acceptance, and a 60 s Playwright `fleet.spec.ts`
+preflight timeout). The broker's keepalive + last-will already detect a
+genuinely dead edge and publish `offline` within the keepalive window.
+
+`last_seen` is retained as a **diagnostic** field only (last observed
+uplink/lwt timestamp); it no longer participates in the status verdict.
+`EdgeNode.is_stale()` now reports `status not in {online, pending}` with no
+time dependency. Center implementation: `fleet/presence.py` (write path),
+`fleet/models.py::EdgeNode.is_stale`, `fleet/views.py` (list no longer
+sweeps); the `fleet.services.sweep_stale_edges` helper was deleted.
 
 | frame            | direction        | version | purpose                                       |
 |------------------|------------------|---------|-----------------------------------------------|

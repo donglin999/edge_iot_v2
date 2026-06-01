@@ -68,6 +68,46 @@ async def test_online_flips_status_and_refreshes_last_seen():
 
 
 @pytest.mark.asyncio
+async def test_online_then_idle_stays_online_then_will_flips_offline():
+    """XIU-112 core regression: lwt=online survives a long idle, then the
+    broker last-will flips it offline.
+
+    Models the CEO's XIU-51 demo path end to end through ``apply_lwt``:
+      1. edge connects → retained lwt ``online`` → status ONLINE.
+      2. edge sits idle (no uplink) and ``last_seen`` ages well past the
+         retired 30s window → status MUST remain ONLINE (no time decay).
+      3. broker kills the connection → last-will retained ``offline`` →
+         status OFFLINE.
+    """
+    from datetime import timedelta
+
+    from asgiref.sync import sync_to_async
+
+    edge, _ = await sync_to_async(EdgeNode.issue)(name="idle-then-will")
+
+    # 1. connect → online
+    await presence.apply_lwt("idle-then-will", {"type": "lwt", "state": "online"})
+    refreshed = await sync_to_async(EdgeNode.objects.get)(name="idle-then-will")
+    assert refreshed.status == EdgeStatus.ONLINE
+
+    # 2. age last_seen far past the old 30s decay window; status unchanged.
+    await sync_to_async(
+        lambda: EdgeNode.objects.filter(pk=edge.pk).update(
+            last_seen=timezone.now() - timedelta(minutes=10),
+        )
+    )()
+    refreshed = await sync_to_async(EdgeNode.objects.get)(pk=edge.pk)
+    assert refreshed.status == EdgeStatus.ONLINE
+    assert refreshed.is_stale() is False  # no last_seen decay anymore
+
+    # 3. broker last-will → offline
+    await presence.apply_lwt("idle-then-will", {"type": "lwt", "state": "offline"})
+    refreshed = await sync_to_async(EdgeNode.objects.get)(pk=edge.pk)
+    assert refreshed.status == EdgeStatus.OFFLINE
+    assert refreshed.is_stale() is True
+
+
+@pytest.mark.asyncio
 async def test_offline_flips_status_and_records_session_offline():
     from asgiref.sync import sync_to_async
 

@@ -11,14 +11,13 @@ from django.conf import settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from fleet.models import OFFLINE_AFTER, EdgeNode, EdgeStatus
+from fleet.models import EdgeNode, EdgeStatus
 from fleet.protocol import (
     PROTOCOL_VERSION,
     make_heartbeat,
     make_register,
 )
 from fleet.routing import websocket_urlpatterns
-from fleet.services import sweep_stale_edges
 
 
 pytestmark = pytest.mark.django_db
@@ -76,61 +75,90 @@ class TestEdgeNodeModel:
         assert node.version == "0.1.0"
         assert node.last_seen is not None
 
-    def test_is_stale_only_after_offline_window(self):
+    def test_is_stale_tracks_status_not_last_seen(self):
+        """XIU-112: is_stale() is lwt/status-driven, with NO last_seen decay.
+
+        An ONLINE edge is never stale regardless of how old last_seen is —
+        an idle edge sends no uplink but stays connected via MQTT keepalive
+        and its retained lwt is still ``online``. Only an OFFLINE status
+        (set by the broker's last-will via apply_lwt) makes it stale.
+        """
         node, _ = EdgeNode.issue(name="edge-3")
-        node.last_seen = timezone.now()
+        # PENDING (never connected) is not "stale" — it has no presence yet.
         assert node.is_stale() is False
 
-        node.last_seen = timezone.now() - OFFLINE_AFTER - timedelta(seconds=1)
+        # ONLINE with a very old last_seen must STILL be non-stale.
+        node.mark_online()
+        node.last_seen = timezone.now() - timedelta(hours=2)
+        assert node.is_stale() is False
+
+        # Only an explicit OFFLINE (lwt last-will) is stale.
+        node.status = EdgeStatus.OFFLINE
         assert node.is_stale() is True
 
 
 # ---------------------------------------------------------------------------
-# Sweep service / REST API
+# Presence (lwt single source of truth — XIU-112) / REST API
 # ---------------------------------------------------------------------------
 
 
-class TestSweepAndAPI:
-    def test_sweep_marks_stale_online_edges_offline(self):
-        fresh, _ = EdgeNode.issue(name="fresh")
-        fresh.mark_online()
-        stale, _ = EdgeNode.issue(name="stale")
-        stale.mark_online()
-        # Backdate `stale.last_seen` past the cutoff.
-        EdgeNode.objects.filter(pk=stale.pk).update(
-            last_seen=timezone.now() - OFFLINE_AFTER - timedelta(seconds=5),
-        )
+class TestPresenceAndAPI:
+    """XIU-112: status is driven solely by the broker's retained lwt topic.
 
-        flipped = sweep_stale_edges()
+    There is no longer a ``last_seen`` time-decay sweep — an ONLINE edge
+    stays online no matter how stale ``last_seen`` is, and the list
+    endpoint never silently flips it to offline. Offline is only ever set
+    by the broker's last-will via :func:`fleet.presence.apply_lwt`.
+    """
 
-        assert flipped == 1
-        fresh.refresh_from_db()
-        stale.refresh_from_db()
-        assert fresh.status == EdgeStatus.ONLINE
-        assert stale.status == EdgeStatus.OFFLINE
+    def test_idle_online_edge_does_not_decay_to_offline(self):
+        """lwt=online then long idle (no uplink) → status stays ONLINE.
 
-    def test_list_endpoint_sweeps_and_returns_edges(self):
-        node, _ = EdgeNode.issue(name="alpha")
+        Reproduces the CEO's XIU-51 demo bug: pre-fix, an edge with a
+        ``last_seen`` older than 30s was swept to offline on the next
+        list() even though its retained lwt was still ``online``.
+        """
+        node, _ = EdgeNode.issue(name="idle-edge")
         node.mark_online()
+        # Backdate last_seen far past the old 30s window — must NOT matter.
         EdgeNode.objects.filter(pk=node.pk).update(
-            last_seen=timezone.now() - OFFLINE_AFTER - timedelta(seconds=5),
+            last_seen=timezone.now() - timedelta(minutes=10),
         )
 
         client = APIClient()
         resp = client.get("/api/fleet/edges/")
-
         assert resp.status_code == 200
-        # DRF returns paginated or list shape depending on global pagination;
-        # normalize for either.
+
         data = resp.json()
         if isinstance(data, dict) and "results" in data:
             data = data["results"]
-        # Filter to the edge this test created rather than asserting a
-        # global count — the file-based test DB is shared across test
-        # modules, so other suites' edges may also be present.
-        alpha = [e for e in data if e["name"] == "alpha"]
-        assert len(alpha) == 1
-        assert alpha[0]["status"] == "offline"
+        # Filter to this test's edge — the file-based test DB is shared
+        # across modules so other suites' edges may also be present.
+        rows = [e for e in data if e["name"] == "idle-edge"]
+        assert len(rows) == 1
+        assert rows[0]["status"] == "online"
+
+    def test_offline_edge_listed_as_offline(self):
+        """An edge the broker last-will marked offline is reported offline.
+
+        The list endpoint reflects whatever ``status`` presence wrote — it
+        no longer computes offline itself.
+        """
+        node, _ = EdgeNode.issue(name="downed-edge")
+        node.mark_online()
+        # Simulate the broker last-will path having set OFFLINE.
+        EdgeNode.objects.filter(pk=node.pk).update(status=EdgeStatus.OFFLINE)
+
+        client = APIClient()
+        resp = client.get("/api/fleet/edges/")
+        assert resp.status_code == 200
+
+        data = resp.json()
+        if isinstance(data, dict) and "results" in data:
+            data = data["results"]
+        rows = [e for e in data if e["name"] == "downed-edge"]
+        assert len(rows) == 1
+        assert rows[0]["status"] == "offline"
 
     def test_create_endpoint_returns_one_shot_token(self):
         client = APIClient()

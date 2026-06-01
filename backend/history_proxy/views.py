@@ -346,8 +346,8 @@ def _query_edge(
     Raises :class:`_EdgeProxyError` on any failure so the caller can
     map it into the per-edge ``errors`` slot of the response.
     """
-    # M1: an edge that hasn't heartbeat'd within OFFLINE_AFTER is offline.
-    # Don't waste the 10s timeout discovering it the hard way.
+    # XIU-112: presence is lwt-driven (EdgeNode.is_stale() == status is
+    # offline). Don't waste the 10s timeout proxying to a known-down edge.
     if edge.is_stale():
         last_seen = edge.last_seen.isoformat() if edge.last_seen else None
         raise _EdgeProxyError(

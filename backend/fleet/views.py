@@ -25,7 +25,7 @@ from .serializers import (
     EdgeSampleSerializer,
     EdgeTaskStatusSerializer,
 )
-from .services import sweep_stale_edges, sync_assignments
+from .services import sync_assignments
 
 
 class EdgeNodeViewSet(
@@ -37,9 +37,15 @@ class EdgeNodeViewSet(
     queryset = EdgeNode.objects.all()
     serializer_class = EdgeNodeSerializer
 
-    @extend_schema(summary="列出已注册 edge 节点", description="返回前会扫一次 last_seen,超时节点标 offline")
+    @extend_schema(
+        summary="列出已注册 edge 节点",
+        description=(
+            "status 由 broker 的 retained edge/<id>/lwt 主题单一判据决定"
+            "(XIU-112):online 由 edge 连接时发布,offline 由 broker last-will "
+            "发布。不再按 last_seen 超时衰减,idle 无上行的 edge 保持 online。"
+        ),
+    )
     def list(self, request, *args, **kwargs):
-        sweep_stale_edges()
         return super().list(request, *args, **kwargs)
 
     @extend_schema(
