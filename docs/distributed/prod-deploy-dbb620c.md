@@ -66,23 +66,59 @@ swap、杀僵尸 build，master 容器按 restart policy 自启）。
 - 资源：mem used ≈ **55%**（952/1720 MiB），available 586 MiB，无 swap，
   center-django 远在 480m cap 之下。每步复验 master `:80` 始终 200。
 
-## 3. 待办 — 2 个 prod edge（reduced-config，防二次 wedge）
+## 3. 2026-06-01 — 2 个 prod edge 上线（reduced-config，零 influx）
 
-edge-agent 镜像**未 staged**（off-box 恢复只 build 了 django），且每 edge 自带
-`influxdb:2.7`（内存大户）。2× 完整 edge 栈会顶爆余量。按 CEO 预授权 reduced-config：
+edge-agent 镜像 off-box build（`linux/amd64`）→ `docker save | gzip`
+（`/tmp/edge-agent-amd64-dbb620c.tar.gz`，123 MB）→ scp → `docker load`，
+**prod 零 build**。
 
-1. 本地 off-box build `edge-iot-distributed-edge-agent:dbb620c`（`linux/amd64`）→
-   `docker save | gzip` → scp → `docker load`（prod 不 build）。
-2. **单 influx 共享**两个 edge-agent（override `INFLUXDB_HOST` 指同一实例），
-   而非 2× influx。
-3. 先起 1 个 edge，盯 `docker stats` + master `:80`，稳了再起第 2 个；
-   任一步 master 退化即 abort + 回滚 edge。
+**关键决策 — 不起 influx**：fresh center 无 acq task → edge 不写样本 → influx
+非必需。每 influx ~150–250 MB，省下来正好避开二次 wedge（部署后 mem ≈ 70%）。
+edge-agent 实测无 influx 也干净启动(`INFLUXDB_HOST` 指 host.docker.internal，
+连不上但因无写入不报错)。
+
+**compose**：`/opt/edge_iot_distributed/docker-compose.edge.reduced.yml`
+（project `edge_iot_dist_edges`）。要点：
+
+- `image: edge-iot-distributed-edge-agent:dbb620c`（load 的，无 build）
+- `mem_limit: 300m`/容器（限爆炸半径）
+- `extra_hosts: ["host.docker.internal:host-gateway"]` → edge 容器经
+  `host.docker.internal:1884` 连 center-mosquitto、`:8002` 连 center
+  （走 host 已发布端口,无需跨 compose 网络）
+- `EDGE_ID` = edge **name**（`prod-edge-a`/`-b`,见 `consumers.py:208`
+  `name = frame.get("edge_id")`),`EDGE_TOKEN` = 注册返回的 `activation_token`
+- `EDGE_TRANSPORT=mqtt`,history 端口 18088/18089(host)→18086(容器)
+
+**注册**：`POST :8002/api/fleet/edges/ {"name":"prod-edge-a",...}` → id=1 + token；
+prod-edge-b → id=2 + token。先起 edge-a,验稳(mem/master),再起 edge-b。
+
+**结果**：
+- 两 edge MQTT lwt online,`docker exec center-mosquitto mosquitto_sub -t edge/+/lwt`
+  看到 `edge/prod-edge-a/lwt {"state":"online"}` + `edge/prod-edge-b/lwt {...online}`
+- 日志均 `registered with center as edge=prod-edge-{a,b} proto=0.5`
+- mem：edge-a 92 MB / edge-b 77 MB / center-django 128 MB;系统 used ≈ **70%**
+  （available 338 MB + 394 MB 可回收 cache,无 swap,master 全程 200）
+
+### ⚠️ XIU-112 注意（给 QA）
+deployed `views.py:42` `list()` 调 `sweep_stale_edges()` —— **dbb620c 未含
+XIU-112 修复**。idle edge 无 uplink → `last_seen` 老化 → `GET /api/fleet/edges/`
+**显示 offline**(即使 MQTT lwt=online)。这是中心侧已知 bug([XIU-112]),非部署
+失败。真值以 broker lwt 为准。QA `/data` 页若显示 edge offline,先确认是否
+XIU-112 老化所致(可临时缩短 sweep 窗或给 edge 发一次 uplink)。
 
 ### 验收清单（XIU-119）
-- [x] master 体系仍 healthy（`:80` → 200）
+- [x] master 体系仍 healthy（`:80` → 200,全程复验）
 - [x] distributed center API 可达（`:8002/api/fleet/edges/` → 200）
-- [ ] 2 个 prod edge online via MQTT（`mosquitto_sub` 看 lwt online）
-- [x] 资源占用 < 70% mem
+- [x] 2 个 prod edge online via MQTT（`mosquitto_sub` 看到双 lwt online）
+- [~] 资源占用 ≈ 70% mem（边界值;338 MB avail + 394 MB cache,稳定无 swap;
+      正因如此**没起 influx**,也不应再加服务）
 - [x] 部署日志落仓（本文件）
+
+### 运维 / teardown
+- 起 edges：`cd /opt/edge_iot_distributed && docker compose -f docker-compose.edge.reduced.yml up -d`
+- 停 edges：`docker compose -f docker-compose.edge.reduced.yml down`
+- center 栈：project `edge_iot_distributed`,`docker-compose.center.yml` +
+  `/tmp/center-django-prod.yml`（django-only override）
+- **绝不在本 VM `--build`**;镜像永远 off-box load。
 
 prod root 凭据见 board 评论（不入仓）。
