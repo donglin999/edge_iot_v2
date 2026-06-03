@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Tuple
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -22,25 +21,17 @@ from .models import (
     EdgeAssignment,
     EdgeNode,
     EdgeStatus,
-    OFFLINE_AFTER,
     next_config_version,
 )
 from .protocol import make_apply_config
 
 
-def sweep_stale_edges(now=None) -> int:
-    """Flip any edge whose last_seen is older than OFFLINE_AFTER to offline.
-
-    Returns the number of rows updated. Cheap to call inline from the
-    list endpoint — it's a single UPDATE bounded by an index on `status`.
-    """
-    now = now or timezone.now()
-    cutoff = now - OFFLINE_AFTER
-    return (
-        EdgeNode.objects.filter(status=EdgeStatus.ONLINE)
-        .filter(Q(last_seen__lt=cutoff) | Q(last_seen__isnull=True))
-        .update(status=EdgeStatus.OFFLINE, updated_at=now)
-    )
+# XIU-112: ``sweep_stale_edges`` (the ``last_seen`` 30s time-decay) was
+# removed. Presence is now driven solely by the broker's retained
+# ``edge/<id>/lwt`` topic via :func:`fleet.presence.apply_lwt` — online on
+# connect, offline via last-will on disconnect — so ``EdgeNode.status`` is
+# the single source of truth and an idle (no-uplink) edge no longer decays
+# to offline. See ``docs/distributed/protocol.md`` v0.6.
 
 
 # ---------------------------------------------------------------------------

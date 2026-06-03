@@ -67,7 +67,7 @@ def _make_offline_edge(name: str) -> EdgeNode:
         name=name,
         token_hash=EdgeNode.hash_token("dummy"),
         status=EdgeStatus.OFFLINE,
-        # Last heartbeat well outside OFFLINE_AFTER (30 s).
+        # XIU-112: is_stale() is now status-driven; last_seen is diagnostic.
         last_seen=timezone.now() - timedelta(minutes=10),
         labels={"history_url": f"http://{name}:18086"},
     )

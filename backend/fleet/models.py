@@ -10,17 +10,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from datetime import timedelta
 from typing import Tuple
 
 from django.db import models
 from django.utils import timezone
-
-
-# How long after the last heartbeat we consider an edge "offline".
-# M1 spec: 30 s. Keep as a class-level constant so tests can monkeypatch
-# without poking settings.
-OFFLINE_AFTER = timedelta(seconds=30)
 
 
 class EdgeStatus(models.TextChoices):
@@ -125,10 +118,20 @@ class EdgeNode(models.Model):
         self.save(update_fields=["last_seen", "status", "updated_at"])
 
     def is_stale(self, *, now=None) -> bool:
-        if self.last_seen is None:
-            return self.status != EdgeStatus.PENDING
-        now = now or timezone.now()
-        return (now - self.last_seen) > OFFLINE_AFTER
+        """Whether the edge is currently considered offline.
+
+        XIU-112: presence is now driven solely by the broker's retained
+        ``edge/<id>/lwt`` topic — the edge publishes ``online`` on connect
+        and the broker's last-will publishes ``offline`` on any ungraceful
+        disconnect (see :mod:`fleet.presence`). ``status`` therefore IS the
+        single source of truth; we no longer decay an online edge after a
+        ``last_seen`` timeout, because an idle edge (no task dispatched)
+        legitimately sends no uplink yet stays connected via MQTT keepalive.
+
+        ``now`` is accepted for backward-compatible call signatures but is
+        unused — the verdict has no time dependency anymore.
+        """
+        return self.status not in (EdgeStatus.ONLINE, EdgeStatus.PENDING)
 
 
 class AssignmentDesiredState(models.TextChoices):
