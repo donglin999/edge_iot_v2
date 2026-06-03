@@ -29,7 +29,7 @@ mkdir -p "$ROOT/center" "$ROOT/edge"
 
 save_kit () { # $1=outdir ; rest=images
   local out="$1"; shift
-  docker save "$@" -o "$out/images.tar"
+  docker save --platform "$PLATFORM" "$@" -o "$out/images.tar"
   ( cd "$out" && shasum -a 256 images.tar > images.tar.sha256 )
   : > "$out/manifest.txt"
   for img in "$@"; do
@@ -40,17 +40,20 @@ save_kit () { # $1=outdir ; rest=images
   echo "tar size: $(du -h "$out/images.tar" | cut -f1)" >> "$out/manifest.txt"
 }
 
+echo "==> build host amd64 wheelhouse (fast — avoids ~13 kB/s in-container DL)"
+bash scripts/offline/build-wheelhouse.sh
+
 echo "==> pull amd64 base images"
 for img in redis:7-alpine eclipse-mosquitto:2 influxdb:2.7 python:3.10-slim; do
   docker pull --platform "$PLATFORM" "$img"
 done
 
-echo "==> buildx amd64 application images"
-docker buildx build --platform "$PLATFORM" -f backend/Dockerfile \
-  -t edge-iot/backend:offline-amd64 --load backend
-docker buildx build --platform "$PLATFORM" -f deploy/offline/Dockerfile.web \
+echo "==> buildx amd64 application images (deps from wheelhouse, no in-container DL)"
+docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" -f deploy/offline/Dockerfile.backend \
+  -t edge-iot/backend:offline-amd64 --load .
+docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" -f deploy/offline/Dockerfile.web \
   -t edge-iot/web:offline-amd64 --load .
-docker buildx build --platform "$PLATFORM" -f deploy/offline/Dockerfile.edge-agent \
+docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" -f deploy/offline/Dockerfile.edge-agent \
   -t edge-iot/edge-agent:offline-amd64 --load .
 
 echo "==> CENTER kit"

@@ -1,11 +1,12 @@
 # Offline edge-agent image — self-contained variant of edge-agent/Dockerfile.
 #
-# The dev image gets the center's Django source from a runtime bind-mount
-# (./backend:/opt/backend:ro). An offline工控机 has no repo checkout to mount,
-# so this variant BAKES backend/ into /opt/backend at build time. Everything
-# else mirrors edge-agent/Dockerfile.
+# Two offline-critical differences vs the dev image:
+#   1. Python deps install from a HOST-built amd64 wheelhouse (--no-index), so
+#      the QEMU cross-build does ZERO network downloads (the in-container PyPI
+#      download is ~13 kB/s under emulation — see XIU-128 checkpoint).
+#   2. backend/ is BAKED into /opt/backend (the dev image bind-mounts it).
 #
-# Build context = repo root, target arch = amd64:
+# Build context = repo ROOT (needs deploy/offline/wheelhouse + backend/ + edge-agent/):
 #   docker buildx build --platform linux/amd64 \
 #     -f deploy/offline/Dockerfile.edge-agent -t edge-iot/edge-agent:offline-amd64 --load .
 FROM python:3.10-slim
@@ -16,17 +17,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY deploy/offline/wheelhouse /wheels
 
+# backend runtime deps + edge-agent's own deps (websockets/aiohttp/aiomqtt are
+# in the wheelhouse) — all offline.
 COPY backend/requirements.txt /tmp/backend-requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/backend-requirements.txt
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r /tmp/backend-requirements.txt
 
+# Edge-agent's own runtime deps (websockets/aiohttp/aiomqtt + transitive) from
+# the wheelhouse. We deliberately do NOT `pip install -e .`: an editable/PEP517
+# build pulls build deps from an index, which --no-index blocks. Instead the
+# package runs straight from source via `python -m edge_agent` (the console
+# script `edge-agent` maps to edge_agent.__main__:main; PYTHONPATH=/app/src).
 COPY edge-agent/pyproject.toml edge-agent/README.md /app/
 COPY edge-agent/src/ /app/src/
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels \
+        websockets aiohttp aiomqtt \
+    && rm -rf /wheels
 
 # Bake the center backend so `import backend.acquisition` works with no mount.
 COPY backend/ /opt/backend/
@@ -40,4 +47,4 @@ ENV LOG_LEVEL=INFO \
 
 RUN mkdir -p /var/lib/edge-agent /var/lib/edge-agent/logs
 
-CMD ["edge-agent"]
+CMD ["python", "-m", "edge_agent"]
