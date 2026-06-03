@@ -1,0 +1,26 @@
+# Offline backend image — installs Python deps from a HOST-built amd64
+# wheelhouse with --no-index, so the cross-arch (QEMU) build does ZERO network
+# downloads (the in-container PyPI download is ~13 kB/s under emulation and is
+# the real bottleneck — see XIU-128 checkpoint). The wheelhouse is produced by
+# the build script before buildx runs.
+#
+# Build context = repo ROOT (needs deploy/offline/wheelhouse + backend/):
+#   docker buildx build --platform linux/amd64 \
+#     -f deploy/offline/Dockerfile.backend -t edge-iot/backend:offline-amd64 --load .
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# No apt / gcc needed — every dep installs from a prebuilt manylinux wheel.
+COPY deploy/offline/wheelhouse /wheels
+COPY backend/requirements.txt /app/
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
+
+COPY backend/ /app/
+
+EXPOSE 8000
+CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]

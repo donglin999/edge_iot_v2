@@ -334,6 +334,9 @@ pyrightconfig.json
 # explicitly so the intent is obvious.
 dist/offline/
 
+# Offline build wheelhouse (host-downloaded amd64 wheels, XIU-128) — binaries.
+deploy/offline/wheelhouse/
+
 # macOS resource forks
 .AppleDB
 .AppleDesktop

@@ -30,20 +30,21 @@ docker buildx version >/dev/null || { echo "docker buildx required"; exit 1; }
 [ -d frontend/dist ] || { echo "frontend/dist missing — run: (cd frontend && npm ci && npm run build)"; exit 1; }
 mkdir -p "$OUT"
 
-echo "==> [2/5] pull amd64 base images"
+echo "==> [2/5] build host amd64 wheelhouse + pull amd64 base images"
+bash scripts/offline/build-wheelhouse.sh
 for img in "${BASE_IMAGES[@]}"; do
   docker pull --platform "$PLATFORM" "$img"
 done
 
-echo "==> [3/5] buildx amd64 application images (--load into local docker)"
-docker buildx build --platform "$PLATFORM" -f backend/Dockerfile \
-  -t edge-iot/backend:offline-amd64 --load backend
-docker buildx build --platform "$PLATFORM" -f deploy/offline/Dockerfile.web \
+echo "==> [3/5] buildx amd64 application images (deps from wheelhouse, no in-container DL)"
+docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" -f deploy/offline/Dockerfile.backend \
+  -t edge-iot/backend:offline-amd64 --load .
+docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" -f deploy/offline/Dockerfile.web \
   -t edge-iot/web:offline-amd64 --load .
 
 echo "==> [4/5] docker save -> images.tar (+ sha256, manifest)"
 ALL_IMAGES=("${BASE_IMAGES[@]}" "${BUILT_IMAGES[@]}")
-docker save "${ALL_IMAGES[@]}" -o "$OUT/images.tar"
+docker save --platform "$PLATFORM" "${ALL_IMAGES[@]}" -o "$OUT/images.tar"
 ( cd "$OUT" && shasum -a 256 images.tar > images.tar.sha256 )
 : > "$OUT/manifest.txt"
 for img in "${ALL_IMAGES[@]}"; do
