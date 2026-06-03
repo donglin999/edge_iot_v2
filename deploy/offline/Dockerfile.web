@@ -1,0 +1,22 @@
+# Offline web image — nginx:alpine serving the pre-built Vite SPA + proxying
+# /api,/ws to the backend. The static bundle is built ON THE HOST first
+# (`cd frontend && npm ci && npm run build` → frontend/dist) because the Vite/
+# esbuild toolchain cross-compiles badly inside a foreign-arch container
+# (see lesson: frontend-build-on-host). The *output* of `vite build` is plain
+# arch-independent static HTML/JS/CSS, so it is safe to COPY into an amd64
+# nginx image.
+#
+# Build context = repo root. Build for the target工控机 arch:
+#   docker buildx build --platform linux/amd64 \
+#     -f deploy/offline/Dockerfile.web -t edge-iot/web:offline-amd64 --load .
+FROM nginx:alpine
+
+# Pre-built SPA bundle (host-produced).
+COPY frontend/dist/ /usr/share/nginx/html/
+
+# nginx template — BACKEND_UPSTREAM is substituted at container start by the
+# stock nginx:alpine envsubst entrypoint hook.
+COPY deploy/offline/nginx-spa.conf /etc/nginx/templates/default.conf.template
+
+ENV BACKEND_UPSTREAM=django:8000
+EXPOSE 80

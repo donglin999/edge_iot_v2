@@ -1,0 +1,83 @@
+# ============================================================================
+# Offline distributed CENTER (distributed/main, incl. merged lwt fix XIU-112)
+# — amd64, self-contained, NO registry / NO build / NO npm install.
+#
+# Control-plane only: django(daphne) + redis + mosquitto + nginx(web). No
+# acquisition workers / InfluxDB here — those run per-edge (edge compose).
+#
+# External entrypoint: nginx `web` on host :8002 (serves the SPA + proxies
+# /api,/ws to center-django:8000). The center MQTT broker is exposed on
+# :1883 for edges to connect over the LAN.  Health: curl http://localhost:8002/
+#
+# (Prod XIU-119 used a transitional split — django直 :8002 + frontend :5175.
+#  The offline package consolidates both behind nginx on :8002.)
+# ============================================================================
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: center-redis
+    networks: [center-network]
+    environment: [TZ=Asia/Shanghai]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: center-mosquitto
+    ports:
+      - "1883:1883"
+    networks: [center-network]
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    environment: [TZ=Asia/Shanghai]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/#' -C 1 -W 3 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  django:
+    image: edge-iot/backend:offline-amd64
+    container_name: center-django
+    networks: [center-network]
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=center-redis
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=center-redis
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=unused-on-center
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+      - FLEET_MQTT_ENABLED=true
+      - FLEET_MQTT_HOST=center-mosquitto
+      - FLEET_MQTT_PORT=1883
+      - TZ=Asia/Shanghai
+    depends_on:
+      redis: {condition: service_healthy}
+      mosquitto: {condition: service_healthy}
+    restart: unless-stopped
+    command: sh -c "python manage.py migrate && daphne -b 0.0.0.0 -p 8000 control_plane.asgi:application"
+
+  web:
+    image: edge-iot/web:offline-amd64
+    container_name: center-frontend
+    networks: [center-network]
+    ports:
+      - "8002:80"
+    environment:
+      - BACKEND_UPSTREAM=center-django:8000
+    depends_on:
+      - django
+    restart: unless-stopped
+
+networks:
+  center-network:
+    driver: bridge

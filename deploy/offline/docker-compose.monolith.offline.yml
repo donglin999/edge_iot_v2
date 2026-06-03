@@ -1,0 +1,156 @@
+# ============================================================================
+# Offline monolith (master) — amd64, fully self-contained, NO registry / NO
+# build / NO npm install at runtime. Every image referenced here is loaded
+# from images.tar via `docker load` first (see scripts/offline/load-and-up.sh).
+#
+# Differences vs the dev docker-compose.yml:
+#   - django / celery use the pre-built  edge-iot/backend:offline-amd64  image
+#     instead of `build:`; no host bind-mount of ./backend (code is baked in).
+#   - the dev `frontend` (node:18-alpine + `npm install && vite dev`) is
+#     replaced by `web` = edge-iot/web:offline-amd64 (nginx + pre-built SPA)
+#     listening on :80 — that is the single external entrypoint. Django is
+#     internal-only (no host port), matching the prod red-line "curl
+#     http://localhost/ -> 200, no :8000 route exposed".
+#   - mock-modbus / mock-mqtt are under the `smoke` profile (off by default);
+#     a real工控机 points Devices at real PLCs. Start them only for a
+#     hardware-free smoke: `docker compose --profile smoke ... up -d`.
+#
+# Health criterion: curl -fsS http://localhost/  -> HTTP 200
+# ============================================================================
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis-iot
+    networks: [iot-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb-iot
+    networks: [iot-network]
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
+      - DOCKER_INFLUXDB_INIT_ORG=edge-iot
+      - DOCKER_INFLUXDB_INIT_BUCKET=iot-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  django:
+    image: edge-iot/backend:offline-amd64
+    container_name: django-iot
+    networks: [iot-network]
+    # db.sqlite3 is baked into the image for a FRESH install. To PRESERVE an
+    # existing install's data, uncomment and point at the on-disk db (prod
+    # red-line: never overwrite an existing db.sqlite3 — see runbook §Upgrade).
+    # volumes:
+    #   - /opt/edge_iot/app/backend/db.sqlite3:/app/db.sqlite3
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=redis-iot
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+    depends_on:
+      redis: {condition: service_healthy}
+      influxdb: {condition: service_healthy}
+    restart: unless-stopped
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+
+  celery-acq:
+    image: edge-iot/backend:offline-amd64
+    container_name: celery-acq
+    networks: [iot-network]
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=redis-iot
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+    depends_on:
+      redis: {condition: service_healthy}
+      influxdb: {condition: service_healthy}
+    restart: unless-stopped
+    command: celery -A control_plane worker -l info --pool=threads --concurrency=200 -Q acquisition -n acq@%h
+
+  celery-short:
+    image: edge-iot/backend:offline-amd64
+    container_name: celery-short
+    networks: [iot-network]
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - REDIS_HOST=redis-iot
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+    depends_on:
+      redis: {condition: service_healthy}
+      influxdb: {condition: service_healthy}
+    restart: unless-stopped
+    command: celery -A control_plane worker -l info --pool=threads --concurrency=8 -Q short -n short@%h
+
+  web:
+    image: edge-iot/web:offline-amd64
+    container_name: frontend-iot
+    networks: [iot-network]
+    ports:
+      - "80:80"
+    environment:
+      - BACKEND_UPSTREAM=django-iot:8000
+    depends_on:
+      - django
+    restart: unless-stopped
+
+  # --- smoke-only mocks (off by default; `--profile smoke` to enable) --------
+  mock-modbus:
+    image: python:3.10-slim
+    container_name: mock-modbus-iot
+    profiles: ["smoke"]
+    networks: [iot-network]
+    volumes:
+      - ./mock/entrypoint.sh:/entrypoint.sh:ro
+      - ./mock:/mock:ro
+    working_dir: /mock
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    restart: unless-stopped
+
+  mock-mqtt:
+    image: eclipse-mosquitto:2
+    container_name: mock-mqtt-iot
+    profiles: ["smoke"]
+    networks: [iot-network]
+    volumes:
+      - ./mock/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+networks:
+  iot-network:
+    driver: bridge
+
+volumes:
+  influxdb-data:
+  influxdb-config:

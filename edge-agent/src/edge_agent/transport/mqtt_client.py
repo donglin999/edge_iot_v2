@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
@@ -74,6 +75,18 @@ _PUBLISH_QOS = 1
 # blip cleans itself up in one or two iterations.
 _RECONNECT_BACKOFF_INITIAL = 1.0
 _RECONNECT_BACKOFF_MAX = 30.0
+
+# Phase 2 P4 follow-up (XIU-129) — background presence keepalive. An *idle*
+# edge (no AcqTask → no uplink publishes) otherwise has nothing that would
+# notice the broker bouncing: aiomqtt only surfaces a dead session on the
+# next operation, and there is none. After a ``persistence false`` broker
+# restart the retained ``online`` is gone and the edge never re-announces,
+# so the center (pure-LWT since XIU-112) wedges it ``offline`` forever.
+# This timer re-publishes ``edge/<id>/lwt={online}`` retained on a fixed
+# cadence, which doubles as the liveness probe: a failed publish means the
+# session died, so we tear it down and let ``_open_session`` reconnect +
+# re-announce. 0 disables the timer (legacy publish-driven behaviour).
+_PRESENCE_KEEPALIVE_INTERVAL = 20.0
 
 # Phase 2 P4 (XIU-103) — last-will + online presence on edge/<id>/lwt.
 # A retained payload on the LWT topic means the *latest* value on the
@@ -163,17 +176,24 @@ class MqttTransport(Transport):
         client_id: Optional[str] = None,
         client_factory: Optional[ClientFactory] = None,
         keepalive: int = 60,
+        presence_interval: float = _PRESENCE_KEEPALIVE_INTERVAL,
     ) -> None:
         self._broker_url = broker_url
         self._edge_id = edge_id
         self._client_id = client_id or f"edge-{edge_id}"
         self._keepalive = int(keepalive)
+        # Background presence-keepalive cadence (seconds). <= 0 disables the
+        # timer and falls back to the publish-driven reconnect of P3/P4.
+        self._presence_interval = float(presence_interval)
         self._client_factory = client_factory
         # The active aiomqtt session. ``None`` until :meth:`connect` (or the
         # first lazy publish) has brought it up; reset to ``None`` on every
         # MqttError so the next publish reconnects.
         self._client: Any = None
         self._lock = asyncio.Lock()
+        # Background ``asyncio.Task`` driving :meth:`_presence_loop`. Spawned
+        # by :meth:`connect`, cancelled by :meth:`close`.
+        self._presence_task: Optional[asyncio.Task] = None
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -187,9 +207,12 @@ class MqttTransport(Transport):
         one place rather than scattered across every send_* method.
         """
         async with self._lock:
-            if self._client is not None:
-                return
-            await self._open_session()
+            if self._client is None:
+                await self._open_session()
+        # Arm the background presence keepalive once the first session is up
+        # (outside the lock — it only creates a task). Idempotent: a second
+        # ``connect`` while the task is alive is a no-op.
+        self._start_presence_loop()
 
     async def close(self) -> None:
         """Tear the broker session down cleanly.
@@ -200,6 +223,12 @@ class MqttTransport(Transport):
         The session WILL is for *ungraceful* disconnects; on a planned
         stop we want the broker to see the right state immediately.
         """
+        # Stop the presence keepalive FIRST, before taking ``self._lock``.
+        # A keepalive parked in ``_open_session``'s reconnect backoff holds
+        # the lock; cancelling it here lets that ``async with`` unwind and
+        # release the lock so this ``close`` does not deadlock. It also stops
+        # the timer from reopening the very session we are about to tear down.
+        await self._stop_presence_loop()
         async with self._lock:
             if self._client is None:
                 return
@@ -342,6 +371,94 @@ class MqttTransport(Transport):
                 self._broker_url, self._client_id,
             )
             return
+
+    # ---- presence keepalive (XIU-129) -------------------------------------
+
+    def _start_presence_loop(self) -> None:
+        """Spawn the background presence keepalive task (idempotent).
+
+        No-op when the interval is disabled (<= 0) or a live task already
+        exists. Safe to call from every :meth:`connect` — only the first
+        call after a teardown actually creates a task.
+        """
+        if self._presence_interval <= 0:
+            return
+        if self._presence_task is not None and not self._presence_task.done():
+            return
+        self._presence_task = asyncio.ensure_future(self._presence_loop())
+
+    async def _stop_presence_loop(self) -> None:
+        """Cancel + await the presence keepalive task, if running."""
+        task = self._presence_task
+        self._presence_task = None
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _presence_loop(self) -> None:
+        """Re-assert ``online`` retained on a fixed cadence (XIU-129).
+
+        An idle edge never publishes, so a broker bounce — which on a
+        ``persistence false`` center wipes the retained ``online`` and which
+        aiomqtt only surfaces on the *next* operation — would otherwise leave
+        the edge silently disconnected and the (pure-LWT, XIU-112) center
+        wedged on ``offline`` forever. This loop both keeps the retained
+        ``online`` fresh and acts as the liveness probe the idle path lacks:
+        :meth:`_keepalive_once` reconnects whenever the probe publish fails.
+        """
+        while True:
+            await asyncio.sleep(self._presence_interval)
+            try:
+                await self._keepalive_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                # Never let one bad iteration kill the keepalive — the next
+                # tick retries. (Reconnect failures already loop internally
+                # inside ``_open_session``; this guards anything unexpected.)
+                logger.exception(
+                    "mqtt_transport: presence keepalive iteration failed"
+                )
+
+    async def _keepalive_once(self) -> None:
+        """One presence tick: re-publish ``online`` retained, heal if dead.
+
+        Holds ``self._lock`` so it cannot race :meth:`connect` / :meth:`close`
+        or a concurrent reconnect. If the session is already gone (a failed
+        uplink publish cleared it) we bring it back up — ``_open_session``
+        re-announces ``online`` itself. Otherwise we push a fresh ``online``
+        retained; a publish failure means the session is dead (e.g. the
+        broker restarted under an idle edge), so we drop it and reconnect.
+        """
+        async with self._lock:
+            if self._client is None:
+                # Session torn down (broker outage / failed uplink). Bring it
+                # back — ``_open_session`` publishes ``online`` on success.
+                await self._open_session()
+                return
+            errors = self._mqtt_error_type()
+            try:
+                await self._client.publish(
+                    lwt_topic(self._edge_id),
+                    payload=_lwt_payload(self._edge_id, LWT_STATE_ONLINE),
+                    qos=_PUBLISH_QOS,
+                    retain=True,
+                )
+            except errors as exc:
+                logger.warning(
+                    "mqtt_transport: presence keepalive publish failed (%s) — "
+                    "session dead, reconnecting", exc,
+                )
+                stale = self._client
+                self._client = None
+                with suppress(Exception):
+                    await stale.__aexit__(None, None, None)
+                # Reconnect now so the retained ``online`` is restored without
+                # waiting for the next tick (matters most right after a
+                # broker restart wiped the retained value).
+                await self._open_session()
 
     async def _publish_frame(self, frame: Dict[str, Any], frame_type: str) -> None:
         """Publish one frame at QoS 1; on MqttError drop the session.
