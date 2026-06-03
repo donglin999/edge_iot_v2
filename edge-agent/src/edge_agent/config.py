@@ -71,6 +71,13 @@ class EdgeConfig:
     # mirror the M5 stack for A/B / debugging.
     transport: str = "mqtt"
     mqtt_broker: str = "mqtt://mosquitto:1883"
+    # XIU-129: background presence keepalive cadence (seconds). The MQTT
+    # transport re-publishes ``edge/<id>/lwt={online}`` retained this often
+    # so an *idle* edge re-announces presence after a broker restart (the
+    # center is pure-LWT since XIU-112; a ``persistence false`` broker drops
+    # the retained ``online`` on bounce). 0 disables — falling back to the
+    # publish-driven reconnect, which only self-heals edges with live uplink.
+    mqtt_presence_interval: float = 20.0
 
     @classmethod
     def from_env(cls, env: Dict[str, str] | None = None) -> "EdgeConfig":
@@ -185,6 +192,19 @@ class EdgeConfig:
             )
         mqtt_broker = (env.get("EDGE_MQTT_BROKER") or "mqtt://mosquitto:1883").strip()
 
+        presence_raw = env.get("EDGE_MQTT_PRESENCE_INTERVAL_S", "")
+        if presence_raw:
+            try:
+                # max(0.0): negatives clamp to 0 (disabled) rather than
+                # spinning the keepalive on a no-op sleep.
+                presence_interval = max(0.0, float(presence_raw))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"EDGE_MQTT_PRESENCE_INTERVAL_S must be a number: {exc}"
+                ) from exc
+        else:
+            presence_interval = 20.0
+
         return cls(
             edge_id=env["EDGE_ID"],
             edge_token=env["EDGE_TOKEN"],
@@ -203,4 +223,5 @@ class EdgeConfig:
             history_url=history_url,
             transport=transport,
             mqtt_broker=mqtt_broker,
+            mqtt_presence_interval=presence_interval,
         )

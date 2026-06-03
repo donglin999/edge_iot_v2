@@ -88,6 +88,17 @@ from the broker's retained `edge/<id>/lwt` topic:
 
 - On every successful connect the edge publishes `edge/<id>/lwt` with
   `retained=true`, payload `{"state": "online", "ts": ...}`.
+- The edge also re-publishes that retained `online` on a fixed **presence
+  keepalive** cadence (`EDGE_MQTT_PRESENCE_INTERVAL_S`, default 20 s — v0.6
+  / XIU-129), independent of any uplink traffic. This is what lets an
+  *idle* edge recover after a broker restart: a `persistence false` broker
+  drops all retained payloads on bounce, and an idle edge publishes nothing
+  that would notice the dead aiomqtt session. The keepalive doubles as the
+  liveness probe — a failed re-publish tears the dead session down and
+  reconnects, which re-announces `online`. Without it, an idle edge that
+  lived through a broker restart stayed wedged `offline` forever (pure-LWT
+  center has no other recovery path). Active edges already self-healed via
+  their next uplink publish; the keepalive closes the idle gap.
 - The edge registers an MQTT **last-will** on the same topic with payload
   `{"state": "offline", "ts": ...}`. The broker auto-publishes it on any
   ungraceful disconnect (TCP RST, edge crash, keepalive timeout).

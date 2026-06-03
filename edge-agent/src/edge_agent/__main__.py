@@ -37,7 +37,11 @@ def _build_uplink_transport(cfg: EdgeConfig) -> Optional[Transport]:
     if cfg.transport == "ws":
         return None
     if cfg.transport == "mqtt":
-        return MqttTransport(broker_url=cfg.mqtt_broker, edge_id=cfg.edge_id)
+        return MqttTransport(
+            broker_url=cfg.mqtt_broker,
+            edge_id=cfg.edge_id,
+            presence_interval=cfg.mqtt_presence_interval,
+        )
     # ``EdgeConfig.from_env`` already rejects unknown values, but be loud
     # if a programmatic caller constructed a bad config directly.
     raise ConfigError(f"unsupported transport: {cfg.transport!r}")
