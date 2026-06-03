@@ -1,0 +1,101 @@
+# ============================================================================
+# Offline distributed EDGE (distributed/main) — one工控机 stack, amd64,
+# self-contained. edge-agent (in-process acquisition) + local InfluxDB +
+# optional mock Modbus. NO registry / NO build at runtime.
+#
+# Required env — copy edge.env.example -> edge.env and fill, then:
+#   docker compose --env-file edge.env -f docker-compose.edge.offline.yml up -d
+#
+#   EDGE_ID                  e.g. edge-shanghai-line-1
+#   EDGE_TOKEN               one-shot token from POST /api/fleet/edges/ (on center)
+#   CENTER_URL               ws://<center-ip>:8002/ws/fleet/
+#   EDGE_MQTT_BROKER         mqtt://<center-ip>:1883
+#   EDGE_HISTORY_HOST_PORT   18088 (edge-a) / 18089 (edge-b)  — unique per edge
+#
+# Reduced-config (low-RAM工控机, XIU-119): comment out the `influxdb` service
+# below and set EDGE_INFLUX_ENABLED=false in edge.env so the agent skips local
+# Influx writes (center pulls history off-box via the :180xx history port).
+# ============================================================================
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: edge-influxdb
+    networks: [edge-network]
+    volumes:
+      - edge-influxdb-data:/var/lib/influxdb2
+      - edge-influxdb-config:/etc/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
+      - DOCKER_INFLUXDB_INIT_ORG=edge-iot
+      - DOCKER_INFLUXDB_INIT_BUCKET=iot-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Smoke-only mock device (off by default). Enable with `--profile smoke`
+  # when there is no real PLC to point a Device at.
+  mock-modbus:
+    image: python:3.10-slim
+    container_name: mock-modbus-edge
+    profiles: ["smoke"]
+    networks: [edge-network]
+    volumes:
+      - ./mock/entrypoint.sh:/entrypoint.sh:ro
+      - ./mock:/mock:ro
+    working_dir: /mock
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    restart: unless-stopped
+
+  edge-agent:
+    image: edge-iot/edge-agent:offline-amd64
+    container_name: edge-agent
+    ports:
+      - "${EDGE_HISTORY_HOST_PORT:-18086}:18086"
+    networks: [edge-network]
+    volumes:
+      - edge-agent-state:/var/lib/edge-agent
+    environment:
+      - EDGE_ID=${EDGE_ID:?EDGE_ID is required}
+      - EDGE_TOKEN=${EDGE_TOKEN:?EDGE_TOKEN is required}
+      - CENTER_URL=${CENTER_URL:?CENTER_URL is required}
+      - EDGE_LABELS=${EDGE_LABELS:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - BACKEND_DIR=/opt/backend
+      - EDGE_STATE_DB=/var/lib/edge-agent/edge_state.db
+      - DJANGO_LOG_DIR=/var/lib/edge-agent/logs
+      - PYTHONPATH=/opt/backend:/app/src
+      - INFLUXDB_HOST=edge-influxdb
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=edge-iot
+      - INFLUXDB_BUCKET=iot-data
+      - EDGE_INFLUX_ENABLED=${EDGE_INFLUX_ENABLED:-true}
+      - EDGE_HISTORY_ENABLED=${EDGE_HISTORY_ENABLED:-true}
+      - EDGE_HISTORY_PORT=18086
+      - EDGE_HISTORY_MAX_POINTS=${EDGE_HISTORY_MAX_POINTS:-50000}
+      - EDGE_HISTORY_URL=${EDGE_HISTORY_URL:-}
+      - EDGE_TRANSPORT=${EDGE_TRANSPORT:-mqtt}
+      - EDGE_MQTT_BROKER=${EDGE_MQTT_BROKER:?EDGE_MQTT_BROKER is required}
+      - TZ=Asia/Shanghai
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  edge-network:
+    driver: bridge
+
+volumes:
+  edge-influxdb-data:
+  edge-influxdb-config:
+  edge-agent-state:

@@ -328,6 +328,12 @@ pyrightconfig.json
 # Additional
 # ================================
 
+# Offline amd64 install kits (XIU-128) — large image tarballs, never commit.
+# Only the scripts (scripts/offline/) + docs (docs/deploy/) + compose
+# overrides (deploy/offline/) are tracked. Covered by `dist/` above; listed
+# explicitly so the intent is obvious.
+dist/offline/
+
 # macOS resource forks
 .AppleDB
 .AppleDesktop
