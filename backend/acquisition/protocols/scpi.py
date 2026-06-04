@@ -22,7 +22,8 @@ LINO 安规测试仪走 **ASCII 串口指令** (RS-232 / RS-485)。本模块把�
   * ``FETC:RESU_?`` 单步返回模板 ``STEP_N1:N2_N3_N4_N5_N6`` 取
     N1=步号, N2=测试项目编码, N3..N5=三个测量读数, N6=单步状态(0/1/2/3)。
     N3..N5 各自的物理量 (电压/电流/电阻) 随测试项目类型而定,本实现按位置透传。
-  * 多步结果之间用 ``;`` 分隔 (SCPI 惯例),整体末尾加结束标记。
+  * 多步结果按 PDF (第 4 页) 每步一行、NL 分隔 (XIU-143 H1 修正:原假设 ``;`` 分隔
+    是自造格式,真机不会这么发;解析侧已改为按 STEP 关键字切分,不依赖分隔符)。
 ----------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -96,8 +97,9 @@ STATUS_LABELS = {0: "Ready", 1: "Testing", 2: "OK", 3: "NG"}
 #: DISP:PAGE 允许的页面。
 DISP_PAGES = ("SYST", "FILE", "TEST")
 
-#: 多步结果分隔符 (见文件头假设标注)。
-RESULT_SEP = ";"
+#: 多步结果分隔符:真机按 PDF (第 4 页) 每步一行、NL 分隔。
+#: 解析侧不依赖此分隔符 (parse_results 按 STEP 关键字切分),仅供仿真器拼接应答。
+RESULT_SEP = "\n"
 
 
 class ScpiError(ProtocolError):
@@ -381,8 +383,10 @@ class LinoSafetyTester:
     """
 
     def __init__(self) -> None:
-        self.groups: Dict[int, _Group] = {1: _Group()}
-        self.current_group: int = 1
+        # PDF (第 4 页): 开机默认 00 组 (XIU-143 L1)。组 0 仅作开机/未切组的占位,
+        # 切组指令仍走 01-99 校验 (见 _check_group)。
+        self.groups: Dict[int, _Group] = {0: _Group()}
+        self.current_group: int = 0
         self.status: int = STATUS_READY
         self.auto: int = 0  # 开机默认关
         self.page: str = "TEST"
@@ -442,9 +446,10 @@ class LinoSafetyTester:
         step_str, _, item_str = cmd.args[0].partition(":")
         step = _check_step(step_str)
         if item_str == "?":
+            # PDF (第 2 页): SOUR:STEP_1:? → 回纯项目码 "3" (XIU-143 M1)。
             grp = self._group()
             item = grp.steps.get(step, (0, ()))[0]
-            return f"STEP {step}:{item}"
+            return str(item)
         item = _check_item(item_str)
         grp = self._group()
         prev = grp.steps.get(step)
@@ -457,10 +462,11 @@ class LinoSafetyTester:
         if cmd.node != "STEP":
             raise ScpiError(f"未知 PARA 节点: {cmd.node!r}")
         if cmd.is_query or (cmd.args and cmd.args[0] == "?"):
-            # 查询当前组 8 步项目: STEP 1:N1 2:N2 ... 8:N8
+            # PDF (第 3 页): PARA:STEP_? → 回 8 个项目码、空格分隔 "1 2 3 4 0 0 0 0"
+            # (纯码,无 "STEP"/步号前缀;XIU-143 M2)。
             grp = self._group()
-            parts = [f"{s}:{grp.steps.get(s, (0, ()))[0]}" for s in range(STEP_MIN, STEP_MAX + 1)]
-            return "STEP " + " ".join(parts)
+            codes = [str(grp.steps.get(s, (0, ()))[0]) for s in range(STEP_MIN, STEP_MAX + 1)]
+            return " ".join(codes)
         # 设置: args[0]="1:6", args[1:]=9 参数
         if not cmd.args:
             raise ScpiError("PARA:STEP 缺少参数")
@@ -542,7 +548,8 @@ class _LoopbackTransport:
     def write(self, data: bytes) -> None:
         self._pending = self.sim.handle(data, terminator=self.terminator)
 
-    def read_response(self) -> Optional[bytes]:
+    def read_response(self, *, multi: bool = False) -> Optional[bytes]:
+        # 仿真器一次性把整个应答 (含多步多行) 放进 _pending,multi 无需特殊处理。
         resp, self._pending = self._pending, None
         return resp
 
@@ -561,10 +568,22 @@ class _SerialTransport:
         self.ser.write(data)
         self.ser.flush()
 
-    def read_response(self) -> Optional[bytes]:
-        # 读到结束标记为止 (pyserial Serial.read_until)。
+    def read_response(self, *, multi: bool = False) -> Optional[bytes]:
+        # 单行查询 (STAT/AUTO/GROU/SOUR/PARA):读到结束标记为止。
         line = self.ser.read_until(self.terminator)
-        return line if line else None
+        if not line:
+            return None
+        if not multi:
+            return line
+        # 多行查询 (RESU):真机每步一行、各自 NL 结尾,单次 read_until 只拿到第一行就返回
+        # 会丢后续步 (XIU-143 H1)。继续读到出现「读空 (超时无更多数据)」为止。
+        chunks = [line]
+        while True:
+            nxt = self.ser.read_until(self.terminator)
+            if not nxt:
+                break
+            chunks.append(nxt)
+        return b"".join(chunks)
 
     def close(self) -> None:
         try:
@@ -695,12 +714,15 @@ class SCPIProtocol(BaseProtocol):
             raise ReadError("SCPI 未连接")
         self.transport.write(encode(text, use_eoi=self.use_eoi, terminator=self.terminator))
 
-    def query(self, text: str) -> str:
-        """下发一条查询类指令并返回去掉结束标记的应答正文。"""
+    def query(self, text: str, *, multi: bool = False) -> str:
+        """下发一条查询类指令并返回去掉结束标记的应答正文。
+
+        ``multi=True`` 用于 RESU 这类多行应答 (真机每步一行),读到无更多数据为止。
+        """
         if not self.is_connected or self.transport is None:
             raise ReadError("SCPI 未连接")
         self.transport.write(encode(text, use_eoi=self.use_eoi, terminator=self.terminator))
-        resp = self.transport.read_response()
+        resp = self.transport.read_response(multi=multi)
         if resp is None:
             raise ReadError(f"SCPI 查询无应答: {text!r}")
         return decode(resp, terminator=self.terminator)
@@ -729,7 +751,7 @@ class SCPIProtocol(BaseProtocol):
         return int(self.query(build_mmem_status()))
 
     def read_results_raw(self) -> str:
-        return self.query(build_fetc_query_result())
+        return self.query(build_fetc_query_result(), multi=True)
 
     def read_results(self) -> List[StepResult]:
         """解析 RESU 应答成结构化单步结果列表。"""
@@ -760,10 +782,10 @@ class SCPIProtocol(BaseProtocol):
         if qtype == "group":
             return int(self.query(build_mmem_query_group()))
         if qtype == "result":
-            return self.query(build_fetc_query_result())
+            return self.query(build_fetc_query_result(), multi=True)
         if qtype == "step_status":
             step = _check_step(p.get("step", 0) or 0)
-            results = parse_results(self.query(build_fetc_query_result()))
+            results = parse_results(self.query(build_fetc_query_result(), multi=True))
             for r in results:
                 if r.step == step:
                     return r.status
@@ -785,19 +807,30 @@ class SCPIProtocol(BaseProtocol):
 # ---------------------------------------------------------------------------
 
 
+#: 单步记录边界:每条以 ``STEP`` 关键字起始。用前瞻切分,兼容真机的 NL / 空格分隔,
+#: 也兼容旧仿真器的 ``;`` 分隔 —— 不依赖任何单一分隔符 (XIU-143 H1)。
+_STEP_RECORD_RE = re.compile(r"(?=STEP\b)", re.IGNORECASE)
+
+
 def parse_results(raw: str) -> List[StepResult]:
-    """把 ``FETC:RESU ?`` 应答 (多步, ``;`` 分隔) 解析成 :class:`StepResult` 列表。
+    """把 ``FETC:RESU ?`` 应答 (多步) 解析成 :class:`StepResult` 列表。
 
     单步形如 ``STEP 1:3 0 0 0 2`` (N1=步 N2=项目 N3..N5=读数 N6=状态)。
+
+    多步分隔不依赖任何固定分隔符:真机按 PDF 每步一行 (NL 分隔),也可能空格分隔;
+    旧仿真器曾用 ``;``。这里统一按 ``STEP`` 关键字切记录 (XIU-143 H1 修正:原实现
+    先把整串压成单行再 ``split(';')``,真机的换行/空格多步回包会被吞成 1 步丢数)。
     """
     if isinstance(raw, (bytes, bytearray)):
         raw = decode(raw)
-    text = _normalize_separators(str(raw))
+    # 先把文档/真机的 "_" 还原成空格,但保留记录边界 —— 不能整串 _normalize_separators
+    # 后再切分,否则换行被压平就找不到边界了。
+    text = str(raw).replace(DOC_SPACE, " ")
     results: List[StepResult] = []
-    for chunk in str(text).split(RESULT_SEP):
+    for chunk in _STEP_RECORD_RE.split(text):
         # 单步形如 "STEP 1:3 2100 0.01 0 2" —— 注意这里 STEP 是节点,没有 SUBSYS: 前缀,
-        # 故不能复用 parse_command,直接按 token 拆。
-        tokens = chunk.strip().split(" ")
+        # 故不能复用 parse_command,直接按 token 拆。chunk 内残留的 ; / 换行/多空格统一压平。
+        tokens = [t for t in re.split(r"[;\s]+", chunk.strip()) if t]
         if len(tokens) < 2 or tokens[0].upper() != "STEP":
             continue
         step_str, _, item_str = tokens[1].partition(":")
@@ -806,7 +839,7 @@ def parse_results(raw: str) -> List[StepResult]:
             item = int(item_str)
         except ValueError:
             continue
-        rest = [t for t in tokens[2:] if t != ""]
+        rest = tokens[2:]
         status = int(rest[-1]) if rest else STATUS_READY
         readings = tuple((rest[:-1] + ["0", "0", "0"])[:3])
         if step == 0 and item == 0:

@@ -161,24 +161,27 @@ class TestSimulator:
 
     def test_group_switch_and_query(self):
         sim = LinoSafetyTester()
-        assert sim.handle(encode(build_mmem_query_group())) == b"01\x0a"
+        # PDF (第 4 页): 开机默认 00 组 (XIU-143 L1)
+        assert sim.handle(encode(build_mmem_query_group())) == b"00\x0a"
         sim.handle(encode(build_mmem_set_group(7)))
         assert sim.handle(encode(build_mmem_query_group())) == b"07\x0a"
 
     def test_sour_set_then_query(self):
         sim = LinoSafetyTester()
         sim.handle(encode(build_sour_set_step(1, 3)))
-        assert sim.handle(encode(build_sour_query_step(1))) == b"STEP 1:3\x0a"
+        # PDF (第 2 页): SOUR:STEP_1:? → 纯项目码 "3" (XIU-143 M1)
+        assert sim.handle(encode(build_sour_query_step(1))) == b"3\x0a"
         # 未设置的步返回项目 0
-        assert sim.handle(encode(build_sour_query_step(2))) == b"STEP 2:0\x0a"
+        assert sim.handle(encode(build_sour_query_step(2))) == b"0\x0a"
 
     def test_para_set_then_group_query(self):
         sim = LinoSafetyTester()
         sim.handle(encode(build_para_set_step(1, 6, ["220", "0", "0", "0", "4", "0.6", "2100", "0.03", "3"])))
         sim.handle(encode(build_sour_set_step(2, 3)))
         resp = decode(sim.handle(encode("PARA:STEP ?")))
-        # 8 步项目, 步1=6 步2=3 其余 0
-        assert resp == "STEP 1:6 2:3 3:0 4:0 5:0 6:0 7:0 8:0"
+        # PDF (第 3 页): PARA:STEP_? → 8 个纯项目码、空格分隔 (XIU-143 M2)
+        # 步1=6 步2=3 其余 0
+        assert resp == "6 3 0 0 0 0 0 0"
 
     def test_resu_empty(self):
         sim = LinoSafetyTester()
@@ -191,7 +194,11 @@ class TestSimulator:
         sim.load_result(1, 3, ["2100", "0.01", "0"], status=2)
         sim.load_result(2, 1, ["10", "0.1", "0"], status=3)
         resp = decode(sim.handle(encode(build_fetc_query_result())))
-        assert resp == "STEP 1:3 2100 0.01 0 2;STEP 2:1 10 0.1 0 3"
+        # PDF (第 4 页): 每步一行、NL 分隔 (XIU-143 H1),不是自造的 ";"
+        assert resp == "STEP 1:3 2100 0.01 0 2\nSTEP 2:1 10 0.1 0 3"
+        # 仿真器回包能被解析侧完整还原 (无丢步)
+        results = parse_results(resp)
+        assert [(r.step, r.item, r.status) for r in results] == [(1, 3, 2), (2, 1, 3)]
 
     def test_unknown_subsystem_raises(self):
         sim = LinoSafetyTester()
@@ -205,7 +212,8 @@ class TestSimulator:
 
 
 class TestParseResults:
-    def test_roundtrip(self):
+    def test_roundtrip_legacy_semicolon(self):
+        # 向后兼容:旧 ";" 分隔仍能解析 (不再依赖,但不应回退)
         raw = "STEP 1:3 2100 0.01 0 2;STEP 2:1 10 0.1 0 3"
         results = parse_results(raw)
         assert len(results) == 2
@@ -215,10 +223,71 @@ class TestParseResults:
     def test_empty_placeholder_skipped(self):
         assert parse_results("STEP 0:0 0 0 0 0") == []
 
+    def test_real_device_newline_multistep(self):
+        # XIU-143 H1: PDF (第 4 页) 真机形态 —— 每步一行、NL 分隔、"_"=空格。
+        # 原实现把整串压平后 split(';') 只剩 1 步、其余静默丢弃。
+        real = "STEP 1:1 25.08A 20.2m 0 2\nSTEP 2:2 499V 9.84M 0 2"
+        results = parse_results(real)
+        assert len(results) == 2  # 必须两步都在
+        assert results[0].step == 1 and results[0].item == 1 and results[0].status == 2
+        assert results[0].readings == ("25.08A", "20.2m", "0")
+        assert results[1].step == 2 and results[1].item == 2 and results[1].status == 2
+        assert results[1].readings == ("499V", "9.84M", "0")
+
+    def test_real_device_underscore_form(self):
+        # PDF 原文用 "_" 代表空格;每步仍各占一行
+        real = "STEP_1:1_25.08A_20.2m_0_2\nSTEP_2:2_499V_9.84M_0_2"
+        results = parse_results(real)
+        assert [(r.step, r.item, r.status) for r in results] == [(1, 1, 2), (2, 2, 2)]
+
+    def test_real_device_space_separated_multistep(self):
+        # 真机若把多步挤在一行、仅空格分隔,也必须按 STEP 关键字拆出全部步
+        real = "STEP 1:3 2100 0.01 0 2 STEP 2:1 10 0.1 0 3 STEP 3:4 500 0 0 2"
+        results = parse_results(real)
+        assert [r.step for r in results] == [1, 2, 3]
+        assert [r.status for r in results] == [2, 3, 2]
+
 
 # ---------------------------------------------------------------------------
 # SCPIProtocol loopback 端到端
 # ---------------------------------------------------------------------------
+
+
+class _FakeSerial:
+    """假串口:read_until 逐行弹出预置行,读空时返回 b'' (模拟超时无更多数据)。"""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def read_until(self, term):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class TestSerialTransportMultiline:
+    def test_single_line_reads_one(self):
+        from acquisition.protocols.scpi import _SerialTransport
+
+        t = _SerialTransport(_FakeSerial([b"0\x0a", b"junk\x0a"]))
+        # 默认 (单行) 只读第一行,不吞掉后续
+        assert t.read_response() == b"0\x0a"
+
+    def test_multi_reads_until_empty(self):
+        # XIU-143 H1 附加隐患:真机每步一行各自 NL 结尾,单次 read_until 只拿第一行。
+        from acquisition.protocols.scpi import _SerialTransport
+
+        t = _SerialTransport(_FakeSerial([
+            b"STEP 1:1 25.08A 20.2m 0 2\x0a",
+            b"STEP 2:2 499V 9.84M 0 2\x0a",
+        ]))
+        resp = t.read_response(multi=True)
+        results = parse_results(resp)
+        assert [(r.step, r.item, r.status) for r in results] == [(1, 1, 2), (2, 2, 2)]
+
+    def test_multi_empty_response_is_none(self):
+        from acquisition.protocols.scpi import _SerialTransport
+
+        t = _SerialTransport(_FakeSerial([]))
+        assert t.read_response(multi=True) is None
 
 
 class TestProtocolRegistration:
