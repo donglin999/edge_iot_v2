@@ -27,14 +27,35 @@ docker buildx version >/dev/null || { echo "docker buildx required"; exit 1; }
 [ -d frontend/dist ] || { echo "frontend/dist missing — run: (cd frontend && npm ci && npm run build)"; exit 1; }
 mkdir -p "$ROOT/center" "$ROOT/edge"
 
+# Print the architecture of one image inside a docker-save tar, read from that
+# image's config blob (architecture field) so the manifest reflects the bytes
+# actually shipped — not the local by-name image (XIU-140). Kept bash-3.2 safe
+# (no associative arrays — /usr/bin/env bash is 3.2 on the Mac build host).
+tar_arch () { # $1=tar $2=repotag
+  python3 - "$1" "$2" <<'PY'
+import json, sys, tarfile
+tar, want = sys.argv[1], sys.argv[2]
+with tarfile.open(tar) as t:
+    for e in json.load(t.extractfile('manifest.json')):
+        if want in (e.get('RepoTags') or []):
+            print(json.load(t.extractfile(e['Config'])).get('architecture', 'unknown'))
+            break
+    else:
+        print('unknown')
+PY
+}
+
 save_kit () { # $1=outdir ; rest=images
   local out="$1"; shift
   docker save --platform "$PLATFORM" "$@" -o "$out/images.tar"
   ( cd "$out" && shasum -a 256 images.tar > images.tar.sha256 )
+  # arch is read from the saved tar blob config, NOT `docker image inspect <name>`,
+  # which on a Mac build host hits the local arm64 cache and misreports kit arch
+  # (XIU-140). Size still comes from inspect.
   : > "$out/manifest.txt"
   for img in "$@"; do
     printf '%-44s arch=%s size=%s\n' "$img" \
-      "$(docker image inspect "$img" --format '{{.Architecture}}')" \
+      "$(tar_arch "$out/images.tar" "$img")" \
       "$(docker image inspect "$img" --format '{{.Size}}')" >> "$out/manifest.txt"
   done
   echo "tar size: $(du -h "$out/images.tar" | cut -f1)" >> "$out/manifest.txt"
