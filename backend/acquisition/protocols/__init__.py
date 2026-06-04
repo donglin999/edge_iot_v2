@@ -18,6 +18,7 @@ from . import modbus  # noqa: F401   modbus_tcp + modbus_rtu
 from . import mqtt    # noqa: F401   mqtt
 from . import opcua   # noqa: F401   opcua
 from . import s7      # noqa: F401   siemens_s7
+from . import scpi    # noqa: F401   scpi (LINO 安规测试仪串口指令集)
 
 __all__ = [
     "BaseProtocol",
