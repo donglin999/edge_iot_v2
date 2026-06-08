@@ -153,7 +153,13 @@ GET /api/config/points/
 
 ### 环境变量
 
-容器内默认配置已写入 `docker-compose.yml`（service hostname：`redis-iot`、`influxdb-iot`），开箱即用。
+容器内默认配置已写入 `docker-compose.yml`，开箱即用。
+
+> **沙永健工厂分支注意**：本分支 compose 改用 **host 网络 + privileged**（SCPI 串口需求，
+> XIU-144）。host 网络下无 compose 服务名 DNS，服务间一律走 `127.0.0.1:<port>`，故
+> `REDIS_HOST` / `INFLUXDB_HOST` 默认即为 `127.0.0.1`（非 `redis-iot` / `influxdb-iot`），
+> 串口设备号经 `SCPI_SERIAL_DEVICE`（默认 `/dev/ttyUSB0`）覆盖。详见
+> [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md#沙永健工厂host-网络--privileged-运行方式)。
 
 如需覆盖，可创建 `backend/.env`：
 
@@ -171,15 +177,20 @@ ACQUISITION_MAX_RECONNECT_ATTEMPTS=3         # 最大重连次数
 
 ### Docker Compose 服务清单
 
-| Service       | 端口          | 说明              |
-| ------------- | ------------- | ----------------- |
-| `django`      | 8000          | Django + DRF API  |
-| `celery`      | -             | 后台任务 Worker   |
-| `frontend`    | 5173          | Vite 开发服务器   |
-| `redis`       | 6379          | Celery broker     |
-| `influxdb`    | 8086          | 时序存储          |
-| `mock-modbus` | 5020          | Mock Modbus TCP   |
-| `mock-mqtt`   | 1883 / 9001   | Mock MQTT Broker  |
+> 本分支为 host 网络模式：「端口」列为各服务**直接绑定的宿主机端口**（已无 `ports:` 映射）。
+> 后端 `celery` 拆为 `celery-acq`（acquisition 队列）与 `celery-short`（short 队列），
+> 二者与 `django` 均为 `privileged: true` 并直通串口设备。
+
+| Service        | 宿主机端口    | 说明                                  |
+| -------------- | ------------- | ------------------------------------- |
+| `django`       | 8000          | Django + DRF API（privileged + 串口） |
+| `celery-acq`   | -             | 采集 Worker（privileged + 串口）      |
+| `celery-short` | -             | 短任务 Worker（privileged + 串口）    |
+| `frontend`     | 5173          | Vite 开发服务器                       |
+| `redis`        | 6379          | Celery broker                         |
+| `influxdb`     | 8086          | 时序存储                              |
+| `mock-modbus`  | 5020          | Mock Modbus TCP                       |
+| `mock-mqtt`    | 1883 / 9001   | Mock MQTT Broker                      |
 
 ## 测试
 

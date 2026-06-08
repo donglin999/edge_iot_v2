@@ -1,5 +1,85 @@
 # 部署指南
 
+> **沙永健工厂分支 (`feature/shayongjian-factory-scpi`)**：根 `docker-compose.yml`
+> 采用 **host 网络 + privileged** 运行方式，与下文默认 bridge 模式不同。新增 SCPI
+> 串口协议 (LINO 安规测试仪) 需直连宿主机串口与网络栈，详见下一节，部署前必读。
+
+## 沙永健工厂：host 网络 + privileged 运行方式
+
+本工厂分支新增 **SCPI 串口协议**（LINO 安规测试仪，走 RS-232 / USB-serial）。
+按 board 硬性要求（XIU-141 / XIU-144），根 `docker-compose.yml` 的容器需要：
+
+- **`network_mode: host`** —— 容器直接使用宿主机网络栈（采集端可直连现场设备网络）。
+- **`privileged: true`** —— 后端容器授予全部容器权限，覆盖宿主机串口设备访问。
+
+### 串口设备要求
+
+后端三个服务（`django` / `celery-acq` / `celery-short`）都可能打开串口：
+
+| 服务 | 何处开串口 |
+| --- | --- |
+| `django`（web 进程） | 设备「测试连接」接口同步调用 `SCPIProtocol.connect()` |
+| `celery-acq`（`acquisition` 队列） | `start/stop_acquisition_task` 长跑采集 |
+| `celery-short`（`short` 队列） | `acquire_once` / `check_protocol_connection` 一次性读/测连 |
+
+三者均设 `privileged: true` 并显式 `devices:` 直通串口设备。设备号通过环境变量
+`SCPI_SERIAL_DEVICE` 覆盖，**默认 `/dev/ttyUSB0`**：
+
+```bash
+# 部署前确认实际串口设备号（USB-serial 常见为 /dev/ttyUSB0 或 /dev/ttyACM0），
+# 推荐用稳定的 by-id 路径避免插拔后改号：
+ls -l /dev/serial/by-id/
+
+# 用实际设备号启动（也可写进 .env）：
+SCPI_SERIAL_DEVICE=/dev/ttyUSB0 docker compose up -d
+```
+
+> `privileged: true` 已使容器可见宿主机全部 `/dev`，显式 `devices:` 仅用于明确意图/审计；
+> 若默认 `/dev/ttyUSB0` 在宿主机不存在，`docker compose up` 会因该映射失败，需先设
+> `SCPI_SERIAL_DEVICE` 指向真实设备。在配置好真机的设备上 `loopback` 仿真口不需要串口。
+
+### 与默认 bridge 模式的差异（host 网络的副作用）
+
+host 网络与 `ports:` 端口映射**互斥**、与自定义 `networks:` 桥接**不兼容**，故本分支
+compose 相对默认 bridge 模式做了如下改动：
+
+| 项 | 默认 bridge 模式 | 本分支 host 模式 |
+| --- | --- | --- |
+| 网络 | 自定义桥接 `iot-network` | `network_mode: host`（顶层 `networks:` 已整体移除） |
+| 端口暴露 | 各服务 `ports:` 映射 | 全部移除，进程**直接绑定宿主机端口** |
+| 服务间寻址 | compose 服务名 DNS（`redis-iot` / `influxdb-iot` / `django`） | 无服务名 DNS，一律 `127.0.0.1:<port>` |
+
+各服务在宿主机上直接监听的端口（无需 `ports:` 映射）：
+
+| 服务 | 宿主机端口 |
+| --- | --- |
+| redis | 6379 |
+| influxdb | 8086 |
+| django | 8000 |
+| frontend (Vite dev) | 5173 |
+| mock-modbus | 5020 |
+| mock-mqtt | 1883 / 9001 |
+
+host 网络下「不再有 compose 服务名 DNS」，受影响的内部连接串改写如下：
+
+- 后端 → Redis / InfluxDB：`REDIS_HOST` / `INFLUXDB_HOST` 由服务名改为 `127.0.0.1`
+  （Celery broker `redis://127.0.0.1:6379/0` 由 `settings.py` 据此自动拼装）。
+- 前端 Vite dev server 代理：`VITE_PROXY_TARGET` 由默认 `http://django:8000` 改为
+  `http://127.0.0.1:8000`（`/api`、`/ws` 反代到本机 Django）。
+- 生产以 nginx 反代静态包时，`proxy_pass` 同理需指向 `http://127.0.0.1:8000`
+  （而非默认的 `http://django:8000`）。
+
+> 端口直绑宿主机意味着这些端口**对外可达**（不再受 bridge 隔离 / `127.0.0.1:` 前缀约束）。
+> 工厂内网部署可接受；若上公网，请在宿主机防火墙上收敛 6379/8086/8000 等端口。
+
+### 校验
+
+本分支只改部署配置、不动协议代码。提交前用静态校验确认（**勿在 1.7GiB 生产 VM 上 build/run**）：
+
+```bash
+docker compose config        # 语法 + host 网络/privileged/devices 生效校验，exit 0 即通过
+```
+
 ## Docker Compose部署
 
 ### 生产环境配置

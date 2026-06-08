@@ -1,11 +1,20 @@
+# 沙永健工厂 (feature/shayongjian-factory-scpi) 单体部署 compose。
+#
+# 本工厂分支新增 SCPI 串口协议 (LINO 安规测试仪)，容器需直接访问宿主机串口设备
+# (RS-232 / USB-serial) 并使用宿主机网络栈。按 board 硬性要求 (XIU-141 / XIU-144):
+#   * network_mode: host —— 所有服务使用宿主机网络。host 网络下不再有 compose 服务名
+#     DNS，服务间一律走 127.0.0.1:<port> 互访 (见各服务 REDIS_HOST / INFLUXDB_HOST /
+#     VITE_PROXY_TARGET)。
+#   * privileged: true   —— 后端容器 (django / celery-acq / celery-short) 授予全部容器
+#     权限，覆盖串口设备访问，并显式 devices: 映射串口设备。
+#
+# host 网络与 `ports:` 端口映射互斥、与自定义 `networks:` 桥接不兼容 —— 二者已全部移除，
+# 端口由进程直接绑定宿主机。详见 docs/DEPLOYMENT.md「host 网络 + privileged 运行方式」。
 services:
   redis:
     image: redis:7-alpine
     container_name: redis-iot
-    ports:
-      - "6379:6379"
-    networks:
-      - iot-network
+    network_mode: host          # 直接绑宿主机 6379 (原 ports 6379:6379 已移除)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -16,10 +25,7 @@ services:
   influxdb:
     image: influxdb:2.7
     container_name: influxdb-iot
-    ports:
-      - "8086:8086"
-    networks:
-      - iot-network
+    network_mode: host          # 直接绑宿主机 8086 (原 ports 8086:8086 已移除)
     volumes:
       - influxdb-data:/var/lib/influxdb2
       - influxdb-config:/etc/influxdb2
@@ -42,17 +48,19 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: django-iot
-    ports:
-      - "8000:8000"
-    networks:
-      - iot-network
+    network_mode: host          # 直接绑宿主机 8000 (原 ports 8000:8000 已移除)
+    privileged: true            # 全部容器权限：test-connection 端点在 web 进程内 SCPIProtocol.connect() 直开串口
+    devices:
+      # SCPI 串口设备直通。privileged 已覆盖 /dev，此处显式映射便于审计/明确意图。
+      # 实际设备号见 docs/DEPLOYMENT.md，用 SCPI_SERIAL_DEVICE 覆盖 (默认 /dev/ttyUSB0)。
+      - "${SCPI_SERIAL_DEVICE:-/dev/ttyUSB0}:${SCPI_SERIAL_DEVICE:-/dev/ttyUSB0}"
     volumes:
       - ./backend:/app
     environment:
       - DJANGO_SETTINGS_MODULE=control_plane.settings
-      - REDIS_HOST=redis-iot
+      - REDIS_HOST=127.0.0.1            # host 网络：原服务名 redis-iot → 127.0.0.1
       - REDIS_PORT=6379
-      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_HOST=127.0.0.1         # host 网络：原服务名 influxdb-iot → 127.0.0.1
       - INFLUXDB_PORT=8086
       - INFLUXDB_TOKEN=my-super-secret-auth-token
       - INFLUXDB_ORG=edge-iot
@@ -70,15 +78,18 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: celery-acq
-    networks:
-      - iot-network
+    network_mode: host          # host 网络 (原 networks: iot-network 已移除)
+    privileged: true            # 全部容器权限：acquisition 队列长跑采集任务直开串口
+    devices:
+      # 见 django 服务说明；用 SCPI_SERIAL_DEVICE 覆盖 (默认 /dev/ttyUSB0)。
+      - "${SCPI_SERIAL_DEVICE:-/dev/ttyUSB0}:${SCPI_SERIAL_DEVICE:-/dev/ttyUSB0}"
     volumes:
       - ./backend:/app
     environment:
       - DJANGO_SETTINGS_MODULE=control_plane.settings
-      - REDIS_HOST=redis-iot
+      - REDIS_HOST=127.0.0.1
       - REDIS_PORT=6379
-      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_HOST=127.0.0.1
       - INFLUXDB_PORT=8086
       - INFLUXDB_TOKEN=my-super-secret-auth-token
       - INFLUXDB_ORG=edge-iot
@@ -96,15 +107,18 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: celery-short
-    networks:
-      - iot-network
+    network_mode: host          # host 网络 (原 networks: iot-network 已移除)
+    privileged: true            # 全部容器权限：short 队列 acquire_once / check_protocol_connection 直开串口
+    devices:
+      # 见 django 服务说明；用 SCPI_SERIAL_DEVICE 覆盖 (默认 /dev/ttyUSB0)。
+      - "${SCPI_SERIAL_DEVICE:-/dev/ttyUSB0}:${SCPI_SERIAL_DEVICE:-/dev/ttyUSB0}"
     volumes:
       - ./backend:/app
     environment:
       - DJANGO_SETTINGS_MODULE=control_plane.settings
-      - REDIS_HOST=redis-iot
+      - REDIS_HOST=127.0.0.1
       - REDIS_PORT=6379
-      - INFLUXDB_HOST=influxdb-iot
+      - INFLUXDB_HOST=127.0.0.1
       - INFLUXDB_PORT=8086
       - INFLUXDB_TOKEN=my-super-secret-auth-token
       - INFLUXDB_ORG=edge-iot
@@ -120,10 +134,7 @@ services:
   mock-modbus:
     image: python:3.10-slim
     container_name: mock-modbus-iot
-    ports:
-      - "5020:5020"
-    networks:
-      - iot-network
+    network_mode: host          # 直接绑宿主机 5020 (原 ports 5020:5020 已移除)
     volumes:
       - ./mock/entrypoint.sh:/entrypoint.sh:ro
       - ./mock:/mock:ro
@@ -134,11 +145,7 @@ services:
   mock-mqtt:
     image: eclipse-mosquitto:2
     container_name: mock-mqtt-iot
-    ports:
-      - "1883:1883"
-      - "9001:9001"
-    networks:
-      - iot-network
+    network_mode: host          # 直接绑宿主机 1883 / 9001 (原 ports 已移除)
     volumes:
       - ./mock/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     restart: unless-stopped
@@ -146,22 +153,19 @@ services:
   frontend:
     image: node:18-alpine
     container_name: frontend-iot
-    ports:
-      - "5173:5173"
-    networks:
-      - iot-network
+    network_mode: host          # 直接绑宿主机 5173 (原 ports 5173:5173 已移除)
     volumes:
       - ./frontend:/app
       - ./frontend/node_modules:/app/node_modules:rw
     working_dir: /app
+    environment:
+      # host 网络下无 compose 服务名 DNS：Vite dev proxy 默认 target http://django:8000
+      # 不再可解析，改指 127.0.0.1:8000 (django 直接绑在宿主机)。
+      - VITE_PROXY_TARGET=http://127.0.0.1:8000
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:
       - django
     restart: unless-stopped
-
-networks:
-  iot-network:
-    driver: bridge
 
 volumes:
   influxdb-data:
