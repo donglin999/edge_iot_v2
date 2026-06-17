@@ -40,7 +40,7 @@ const DashboardPage = () => {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [deviceStats, setDeviceStats] = useState<DeviceStats>({ total: 0, online: 0, offline: 0, error: 0 });
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'24h' | '7d' | '30d'>('24h');
 
   const fetchOverview = useCallback(async (signal?: AbortSignal) => {
@@ -170,17 +170,6 @@ const DashboardPage = () => {
       default:
         return 'status-badge status-badge--stopped';
     }
-  };
-
-  const formatDuration = (started: string | null, finished: string | null) => {
-    if (!started || !finished) return '-';
-    const diff = new Date(finished).getTime() - new Date(started).getTime();
-    const seconds = Math.floor(diff / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ${minutes % 60}m`;
   };
 
   const formatTime = (date: string | null) => {

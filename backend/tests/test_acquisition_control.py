@@ -323,11 +323,20 @@ class TestStartAcquisitionTask:
 class TestStopAcquisitionTask:
     """Tests for the stop_acquisition_task Celery task."""
 
-    def test_stop_running_session(self, running_session):
-        """Test stopping a running session."""
+    @patch("celery.app.control.Control.revoke")
+    def test_stop_running_session(self, mock_revoke, running_session):
+        """Test stopping a running session.
+
+        ``revoke`` is mocked so the unit test does not require a live Celery
+        broker (Redis). Without this it only passes when a broker happens to be
+        reachable on localhost:6379, and fails in CI / clean environments.
+        """
         result = tasks.stop_acquisition_task(session_id=running_session.id)
 
         assert result["status"] == "stopped"
+        mock_revoke.assert_called_once_with(
+            running_session.celery_task_id, terminate=True
+        )
         running_session.refresh_from_db()
         assert running_session.status == acq_models.AcquisitionSession.STATUS_STOPPED
 

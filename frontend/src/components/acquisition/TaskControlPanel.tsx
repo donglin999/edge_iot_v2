@@ -288,6 +288,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
 
         // Log device-level results
         if (result.validation.device_results) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           Object.entries(result.validation.device_results).forEach(([deviceCode, deviceResult]: [string, any]) => {
             if (deviceResult.status === 'error') {
               addLog('error', `设备 ${deviceCode} 连接失败: ${deviceResult.error}`);

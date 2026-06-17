@@ -28,6 +28,8 @@ const DeviceDetailPage = () => {
 
   useEffect(() => {
     loadDeviceData();
+    // 仅在 deviceId 变化时重新加载；loadDeviceData 每次渲染重建，不入依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceId]);
 
   const loadDeviceData = async () => {

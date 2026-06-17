@@ -41,7 +41,7 @@ import type { UploadProps } from 'antd';
 import { apiClient } from '../services/apiClient';
 import { downloadTemplate, listProtocols, type ProtocolDescriptor } from '../services/protocolApi';
 
-const { Text, Title, Paragraph } = Typography;
+const { Text, Title } = Typography;
 
 interface RowError {
   row: number;
