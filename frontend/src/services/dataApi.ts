@@ -113,7 +113,7 @@ export async function fetchPointHistory(
   pointCode: string,
   startTime?: string,
   endTime?: string,
-  limit: number = 1000,
+  limit = 1000,
   signal?: AbortSignal
 ): Promise<PointHistoryResponse> {
   const params = new URLSearchParams({
@@ -160,7 +160,7 @@ export async function fetchActiveSessions(
  * Fetch all acquisition sessions
  */
 export async function fetchSessions(
-  limit: number = 50,
+  limit = 50,
   signal?: AbortSignal
 ): Promise<AcquisitionSession[]> {
   // 标准 list 端点:DRF 全局分页后返回 `{ results }`;用 `?limit=N` 取最近
@@ -201,8 +201,8 @@ export async function fetchSession(
  */
 export async function fetchSessionDataPoints(
   sessionId: number,
-  limit: number = 100,
-  offset: number = 0,
+  limit = 100,
+  offset = 0,
   signal?: AbortSignal
 ): Promise<SessionDataPointsResponse> {
   const response = await fetchWithAbort(
