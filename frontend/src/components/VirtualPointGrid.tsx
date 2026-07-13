@@ -9,7 +9,7 @@
  * Column count is derived from the measured container width so the layout
  * still adapts responsively (like the original AntD grid breakpoints).
  */
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { FixedSizeGrid, GridChildComponentProps } from 'react-window';
 import type { PointLatestValue } from '../services/dataApi';
 
@@ -25,6 +25,44 @@ interface VirtualPointGridProps {
   /** Gap (px) between cards. */
   gap?: number;
 }
+
+// Per-cell data passed via react-window's `itemData`. Threading everything the
+// cell needs through here keeps the `Cell` component identity stable across
+// parent renders, so react-window doesn't remount every visible cell each time
+// the parent re-renders.
+interface CellData {
+  points: PointLatestValue[];
+  columnCount: number;
+  gap: number;
+  renderCard: (point: PointLatestValue) => React.ReactNode;
+}
+
+// Hoisted out of the parent render so its component identity never changes.
+const Cell: React.FC<GridChildComponentProps<CellData>> = ({
+  columnIndex,
+  rowIndex,
+  style,
+  data,
+}) => {
+  const { points, columnCount, gap, renderCard } = data;
+  const index = rowIndex * columnCount + columnIndex;
+  if (index >= points.length) {
+    return <div style={style} />;
+  }
+  return (
+    <div
+      style={{
+        ...style,
+        left: Number(style.left) + gap / 2,
+        top: Number(style.top) + gap / 2,
+        width: Number(style.width) - gap,
+        height: Number(style.height) - gap,
+      }}
+    >
+      {renderCard(points[index])}
+    </div>
+  );
+};
 
 const VirtualPointGrid: React.FC<VirtualPointGridProps> = ({
   points,
@@ -52,40 +90,22 @@ const VirtualPointGrid: React.FC<VirtualPointGridProps> = ({
   const columnWidth = width > 0 ? width / columnCount : minColumnWidth;
   const rowCount = Math.ceil(points.length / columnCount);
 
-  const Cell: React.FC<GridChildComponentProps> = ({
-    columnIndex,
-    rowIndex,
-    style,
-  }) => {
-    const index = rowIndex * columnCount + columnIndex;
-    if (index >= points.length) {
-      return <div style={style} />;
-    }
-    return (
-      <div
-        style={{
-          ...style,
-          left: Number(style.left) + gap / 2,
-          top: Number(style.top) + gap / 2,
-          width: Number(style.width) - gap,
-          height: Number(style.height) - gap,
-        }}
-      >
-        {renderCard(points[index])}
-      </div>
-    );
-  };
+  const itemData = useMemo<CellData>(
+    () => ({ points, columnCount, gap, renderCard }),
+    [points, columnCount, gap, renderCard],
+  );
 
   return (
     <div ref={containerRef} style={{ width: '100%' }}>
       {width > 0 && (
-        <FixedSizeGrid
+        <FixedSizeGrid<CellData>
           columnCount={columnCount}
           columnWidth={columnWidth}
           rowCount={rowCount}
           rowHeight={rowHeight}
           height={Math.min(height, rowCount * rowHeight)}
           width={width}
+          itemData={itemData}
         >
           {Cell}
         </FixedSizeGrid>
