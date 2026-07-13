@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Dict, Any
 
@@ -19,9 +20,40 @@ from rest_framework import viewsets
 from acquisition import models as acq_models, serializers, tasks
 from acquisition.protocols import ProtocolRegistry
 from acquisition.services.templates import build_template
+from common.network import PrivateNetworkNotAllowed, assert_config_targets_allowed
 from configuration import models as config_models
 
 logger = logging.getLogger(__name__)
+
+
+# SEC (Flux injection): the point-history endpoint interpolates start/stop
+# bounds directly into a Flux ``range(...)`` call. We accept only two safe
+# shapes and reject everything else so no attacker-controlled Flux can be
+# smuggled in:
+#   (a) a relative duration such as ``-1h`` / ``30m`` / ``-7d``
+#   (b) an RFC3339 / ISO8601 absolute timestamp such as ``2025-10-10T00:00:00Z``
+# The literal ``now()`` is also whitelisted because it is the default stop
+# bound and is a fixed, non-injectable token.
+_FLUX_DURATION_RE = re.compile(r"^-?\d+(ns|us|ms|s|m|h|d|w)$")
+_FLUX_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _validate_flux_time_arg(value: str) -> str:
+    """Return ``value`` unchanged if it is a safe Flux time bound, else raise
+    ``ValueError``. The returned value is safe to interpolate bare into a Flux
+    ``range()`` call."""
+    if value is None:
+        raise ValueError("时间参数不能为空")
+    v = value.strip()
+    if v == "now()":
+        return v
+    if _FLUX_DURATION_RE.match(v):
+        return v
+    if _FLUX_RFC3339_RE.match(v):
+        return v
+    raise ValueError(repr(value))
 
 
 def _update_session_locked(session, *, metadata_mutator=None, field_updates=None):
@@ -673,6 +705,19 @@ class AcquisitionSessionViewSet(
         end_time = request.query_params.get('end_time', 'now()')
         limit = int(request.query_params.get('limit', 1000))
 
+        # SEC: strictly validate the range bounds before they reach the Flux
+        # query. Only a whitelisted set of shapes is accepted; anything else is
+        # rejected with 400 so no attacker-controlled Flux can be injected into
+        # range(start:…, stop:…).
+        try:
+            safe_start = _validate_flux_time_arg(start_time)
+            safe_stop = _validate_flux_time_arg(end_time)
+        except ValueError as exc:
+            return Response(
+                {"detail": f"非法的时间参数: {exc}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         from django.conf import settings as dj_settings
         from storage import StorageRegistry
 
@@ -685,15 +730,6 @@ class AcquisitionSessionViewSet(
             "bucket": getattr(dj_settings, "INFLUXDB_BUCKET", "default"),
         }
 
-        # Build Flux range clause: relative durations stay bare, RFC3339 stays bare,
-        # `now()` is a function call. Anything else is escaped as a string literal
-        # to prevent Flux injection.
-        def _flux_range_arg(value: str) -> str:
-            v = value.strip()
-            if v == "now()" or v.startswith("-") or v[:1].isdigit():
-                return v
-            return f'"{v}"'
-
         # Escape user input to prevent Flux injection in the filter.
         safe_point = point_code.replace("\\", "\\\\").replace('"', '\\"')
         bucket = influx_config["bucket"]
@@ -702,7 +738,7 @@ class AcquisitionSessionViewSet(
         # are excluded).
         flux_query = (
             f'from(bucket:"{bucket}") '
-            f'|> range(start: {_flux_range_arg(start_time)}, stop: {_flux_range_arg(end_time)}) '
+            f'|> range(start: {safe_start}, stop: {safe_stop}) '
             f'|> filter(fn: (r) => r["_field"] == "{safe_point}") '
             f'|> sort(columns: ["_time"]) '
             f'|> limit(n: {limit})'
@@ -839,6 +875,13 @@ class ConnectionTestViewSet(
         protocol_type = serializer.validated_data['protocol_type']
         device_config = serializer.validated_data['device_config']
 
+        # SEC (SSRF): refuse to probe loopback/link-local/private targets unless
+        # explicitly allowed (see common.network / ALLOW_PRIVATE_NETWORK_TESTS).
+        try:
+            assert_config_targets_allowed(device_config)
+        except PrivateNetworkNotAllowed as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         # 异步测试连接
         celery_result = tasks.check_protocol_connection.delay(protocol_type, device_config)
 
@@ -890,6 +933,13 @@ class StorageTestViewSet(
 
         storage_type = serializer.validated_data['storage_type']
         storage_config = serializer.validated_data['storage_config']
+
+        # SEC (SSRF): same guard as the connection-test endpoint — a storage
+        # config carries a ``url``/``host`` we would otherwise blindly connect to.
+        try:
+            assert_config_targets_allowed(storage_config)
+        except PrivateNetworkNotAllowed as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         # 异步测试连接
         celery_result = tasks.check_storage_connection.delay(storage_type, storage_config)

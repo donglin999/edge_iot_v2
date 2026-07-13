@@ -21,9 +21,33 @@ def _load_env_file() -> None:
 _load_env_file()
 
 DEBUG = env("DEBUG")
-_default_allowed_hosts = ["localhost", "127.0.0.1", "testserver", "0.0.0.0", "django", "host.docker.internal"]
-ALLOWED_HOSTS = env.list("ALLOWED_HOSTS") or _default_allowed_hosts
 SECRET_KEY = env("SECRET_KEY")
+_DEV_SECRET_KEY = "dev-secret-key-change-me"
+_default_allowed_hosts = ["localhost", "127.0.0.1", "testserver", "0.0.0.0", "django", "host.docker.internal"]
+
+if DEBUG:
+    # Local/dev: keep the permissive host list and the dev SECRET_KEY working
+    # exactly as before so `python manage.py runserver` needs no .env.
+    ALLOWED_HOSTS = env.list("ALLOWED_HOSTS") or _default_allowed_hosts
+else:
+    # Production safety guards (DEBUG=False). A prod deploy with a missing/partial
+    # .env must fail loudly instead of silently running with a publicly-known
+    # SECRET_KEY or a wide-open ALLOWED_HOSTS.
+    from django.core.exceptions import ImproperlyConfigured
+
+    if SECRET_KEY == _DEV_SECRET_KEY:
+        raise ImproperlyConfigured(
+            "SECRET_KEY is still the insecure dev default while DEBUG=False. "
+            "Set a strong, secret SECRET_KEY via the environment/.env before "
+            "running in production."
+        )
+    # Never fall back to the permissive dev host list in production.
+    ALLOWED_HOSTS = env.list("ALLOWED_HOSTS")
+    if not ALLOWED_HOSTS:
+        raise ImproperlyConfigured(
+            "ALLOWED_HOSTS must be explicitly configured when DEBUG=False; "
+            "refusing to start with an empty or permissive host list."
+        )
 
 INSTALLED_APPS = [
     "daphne",  # Must be first for ASGI support
@@ -105,6 +129,12 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# SECURITY / auth follow-up: the API is currently served with DRF's default
+# permission (AllowAny) — no authentication is enforced on any endpoint. This is
+# deliberate for now: the frontend has NO login flow, so turning on a global
+# IsAuthenticated / authentication class would break the entire app. Adding auth
+# is a product decision that requires a coordinated frontend login flow; it must
+# NOT be bolted on here unilaterally. Tracked as a documented follow-up.
 REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_RENDERER_CLASSES": [
@@ -148,6 +178,13 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=3, minute=30),
     },
 }
+
+# SEC (SSRF): the connection/storage *test* endpoints open a connection to a
+# host taken from the request body. When False, common.network blocks targets
+# that resolve to loopback / link-local (incl. 169.254.169.254 cloud metadata) /
+# RFC1918 private ranges. Default True keeps dev/on-prem internal testing working;
+# set ALLOW_PRIVATE_NETWORK_TESTS=false on any internet-reachable deployment.
+ALLOW_PRIVATE_NETWORK_TESTS = env.bool("ALLOW_PRIVATE_NETWORK_TESTS", default=True)
 
 # InfluxDB Settings
 INFLUXDB_HOST = env.str("INFLUXDB_HOST", default="localhost")
