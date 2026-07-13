@@ -34,16 +34,23 @@ class AcquisitionConfig(AppConfig):
         if not is_runserver_child and not is_celery_worker:
             return
 
-        # Orphan session cleanup runs first — purely DB work, no external I/O.
-        # Safe to call from both runserver and celery; idempotent (UPDATE ...
-        # WHERE status='running' AND updated_at < cutoff).
-        self._cleanup_orphan_sessions()
-
         # Register shutdown handler
         self._register_shutdown_handler()
 
-        # Recover running sessions after Django startup
+        # Heartbeat-based recovery runs FIRST: it classifies every RUNNING
+        # session (fresh → leave, brand-new → grace, stale → auto-restart via
+        # the bounded-retry policy). Running it before the orphan sweep means a
+        # re-dispatched session has already had its ``updated_at`` refreshed, so
+        # the orphan cleanup below won't clobber it back to ERROR (the two used
+        # to fight over the same rows).
         self._recover_sessions()
+
+        # Orphan session cleanup is now a pure-DB *safety net* for anything the
+        # heartbeat pass couldn't classify (idempotent UPDATE ... WHERE
+        # status='running' AND updated_at < cutoff). Its 10-min threshold is far
+        # looser than the 60s heartbeat window, so it only ever catches rows the
+        # restart logic already handled or genuinely abandoned.
+        self._cleanup_orphan_sessions()
 
     def _cleanup_orphan_sessions(self):
         """Mark stale RUNNING sessions as ERROR on startup.
@@ -95,19 +102,25 @@ class AcquisitionConfig(AppConfig):
         startup we check each RUNNING session:
 
         * Fresh heartbeat (< 60 s) → worker is still alive in another
-          container; do nothing, the existing celery task remains in charge.
-        * Stale heartbeat or missing → the worker died (process kill, OOM,
-          power loss). Mark the session as ERROR with the reason so the
-          history reflects what actually happened. We do NOT auto-restart;
-          the operator can press "启动" again from the UI when ready.
+          container; leave it RUNNING and reset its restart budget (it is
+          healthy).
+        * Stale heartbeat or missing (past the startup grace window) → the
+          worker died (process kill, OOM, power loss). Hand the session to the
+          bounded-retry restart policy (:func:`attempt_restart`) instead of
+          just marking it ERROR — self-healing (phase 2a). The policy either
+          re-dispatches the acquisition task (bumping ``restart_count`` with
+          backoff) or, once the retry budget is exhausted, marks the session
+          ERROR and raises a critical escalation alarm.
 
-        The previous implementation deleted RUNNING sessions and re-spawned
-        them, which masked silent crashes and lost history.
+        The previous implementation marked stale sessions ERROR and waited for
+        a human to press "启动"; the one before that deleted + re-spawned them
+        (which masked silent crashes and lost history).
         """
         try:
             import time
 
             from acquisition.models import AcquisitionSession
+            from acquisition.services import restart_policy
 
             running = list(AcquisitionSession.objects.filter(
                 status=AcquisitionSession.STATUS_RUNNING,
@@ -116,44 +129,40 @@ class AcquisitionConfig(AppConfig):
                 logger.info("No running sessions to recover")
                 return
 
+            stale_seconds = self.HEARTBEAT_STALE_SECONDS
             now = time.time()
             for session in running:
-                last_update = (session.metadata or {}).get("last_health_update")
-                age = now - float(last_update) if last_update else None
+                age = restart_policy.heartbeat_age(session, now=now)
 
-                if age is not None and age < self.HEARTBEAT_STALE_SECONDS:
+                if age is not None and age < stale_seconds:
                     logger.info(
                         "Session %s heartbeat fresh (%.1fs ago) — leaving as RUNNING",
                         session.id, age,
                     )
+                    # Healthy → reset restart budget / clear any escalation alarm.
+                    restart_policy.record_recovery(session)
                     continue
 
                 # No heartbeat yet → could be a brand-new session that hasn't
                 # finished its first cycle. Allow a grace period based on
                 # session age before declaring it dead.
-                if age is None and session.started_at:
-                    session_age = (timezone_now() - session.started_at).total_seconds()
-                    if session_age < self.HEARTBEAT_STALE_SECONDS:
-                        logger.info(
-                            "Session %s no heartbeat yet but only %.1fs old — leaving",
-                            session.id, session_age,
-                        )
-                        continue
+                if age is None and restart_policy.is_within_startup_grace(
+                    session, stale_seconds,
+                ):
+                    logger.info(
+                        "Session %s no heartbeat yet but still in startup grace "
+                        "— leaving", session.id,
+                    )
+                    continue
 
                 reason = (
                     f"Worker heartbeat stale ({age:.0f}s ago)" if age is not None
                     else "Worker never reported a heartbeat"
                 )
-                logger.warning("Session %s: %s — marking ERROR", session.id, reason)
-                session.status = AcquisitionSession.STATUS_ERROR
-                session.error_message = reason
-                session.stopped_at = session.stopped_at or timezone_now()
-                meta = session.metadata or {}
-                meta["recovered_at_startup"] = timezone_now().isoformat()
-                session.metadata = meta
-                session.save(update_fields=[
-                    "status", "error_message", "stopped_at", "metadata", "updated_at",
-                ])
+                logger.warning(
+                    "Session %s: %s — attempting auto-restart", session.id, reason,
+                )
+                restart_policy.attempt_restart(session)
         except Exception as exc:  # noqa: BLE001
             logger.error("Session recovery failed: %s", exc, exc_info=True)
 
