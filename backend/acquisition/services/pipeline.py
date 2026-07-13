@@ -61,11 +61,16 @@ class ReadWorker(threading.Thread):
         max_reconnect: int = 3,
         connection_timeout: float = 30.0,
         reconnect_backoff: float = 5.0,
+        session=None,
     ) -> None:
         super().__init__(daemon=True, name=f"ReadWorker-{device.code}")
         self.device = device
         self.points = points
         self.sinks = sinks
+        # Owning acquisition session (for alarm scoping). Optional — when the
+        # pipeline runs a worker without one, connectivity alarms are keyed by
+        # ``device_code`` alone (``session=None``).
+        self._session = session
         self.read_groups = ReadPlanBuilder.build(device, _PointAdapter.iter(points))
         self.cycle_interval = 1.0 / max(0.0001, float(sample_rate_hz))
         self.shutdown_event = shutdown_event
@@ -113,6 +118,12 @@ class ReadWorker(threading.Thread):
         # Tracks whether ``gave_up`` has already been emitted for the
         # current backoff window so we don't repeat it every loop.
         self._gave_up_emitted = False
+        # One-shot guard for the PERSISTED connectivity alarm. Set when the
+        # healthy->down transition raises the alarm, cleared on recovery. The
+        # ephemeral WS ``gave_up``/``reconnecting`` events flap per backoff
+        # cycle; this alarm must fire once and be cleared once, so it needs a
+        # flag whose lifetime spans the whole downtime (not per-cycle).
+        self._offline_alarm_raised = False
         # Aggregation state for read_failed events.
         self._failed_count = 0
         self._failed_window_start: Optional[float] = None
@@ -192,6 +203,52 @@ class ReadWorker(threading.Thread):
                 self.device.code, event_type, exc,
             )
 
+    # --------------------------------------------------------------- alarms
+    def _raise_offline_alarm(self) -> None:
+        """Persist a connectivity alarm on the healthy->down transition.
+
+        Fired at most once per downtime (guarded by ``_offline_alarm_raised``),
+        alongside — never replacing — the ephemeral WS ``gave_up`` event. Uses
+        the phase-1 reporting helper, which is idempotent per ``dedup_key`` and
+        swallows its own ORM/broadcast errors, so this is safe to call from the
+        worker thread. The import is local because ``reporting`` transitively
+        pulls in views/serializers and this module is imported early at app
+        start — a module-level import would risk a cycle (matching how the
+        read loop imports ``Reading``/``time`` locally).
+        """
+        if self._offline_alarm_raised:
+            return
+        from acquisition.services.reporting import raise_system_alarm
+
+        code = self.device.code
+        raise_system_alarm(
+            category="connectivity",
+            severity="critical",
+            message=f"设备 {code} 连接失败，已离线",
+            device_code=code,
+            session=self._session,
+            value={
+                "consecutive_failures": self.health.get("consecutive_failures", 0),
+                "last_error": self._last_error,
+            },
+            dedup_key=f"connectivity:{code}",
+        )
+        self._offline_alarm_raised = True
+
+    def _clear_offline_alarm(self) -> None:
+        """Resolve the persisted connectivity alarm on recovery + re-arm.
+
+        No-op unless an offline alarm is outstanding, so a normal connect never
+        touches the ORM. Resetting ``_offline_alarm_raised`` re-arms the
+        one-shot so a device that goes down again later fires a fresh alarm.
+        """
+        if not self._offline_alarm_raised:
+            return
+        from acquisition.services.reporting import clear_system_alarm
+
+        clear_system_alarm(f"connectivity:{self.device.code}")
+        self._offline_alarm_raised = False
+
     def _flush_failed_events(self, *, force: bool = False) -> None:
         """Emit a ``read_failed`` aggregate when the burst threshold or
         window has elapsed (or ``force`` is set, e.g. on disconnect)."""
@@ -255,6 +312,13 @@ class ReadWorker(threading.Thread):
                 )
             self._has_connected_once = True
 
+            # Persistence: resolve the connectivity alarm on ANY successful
+            # connect while an offline alarm is outstanding — this covers both
+            # the ``reconnected`` (recovered after downtime) and the
+            # first-``connected``-after-never-connecting recovery paths. Guarded
+            # by the flag so it only touches the ORM on a real transition.
+            self._clear_offline_alarm()
+
             # Reset per-cycle event flags now that we are back online.
             self._connecting_emitted = False
             self._reconnect_attempt = 0
@@ -266,6 +330,10 @@ class ReadWorker(threading.Thread):
                 status="disconnected",
             )
             self.protocol = None
+            # Capture the connect error so the persisted connectivity alarm can
+            # report a cause even when no read ever succeeded (a pure connect
+            # failure never runs through ``_record_failure``).
+            self._last_error = str(exc)
             logger.warning("ReadWorker[%s] connect failed: %s", self.device.code, exc)
             return False
 
@@ -310,6 +378,12 @@ class ReadWorker(threading.Thread):
                             will_retry_in_seconds=int(self.reconnect_backoff),
                         )
                         self._gave_up_emitted = True
+                    # Persistence: the worker has decided the device is down.
+                    # Raise the connectivity alarm ONCE for this downtime (the
+                    # helper is self-guarded), IN ADDITION to the ephemeral WS
+                    # events above — so an offline device is recorded even when
+                    # no browser is watching.
+                    self._raise_offline_alarm()
                     if self._interruptible_sleep(self.reconnect_backoff):
                         break
                     # Reset so we re-attempt; otherwise we'd never recover.
@@ -451,6 +525,7 @@ class AcquisitionPipeline:
                 sample_rate_hz=self.sample_rate_hz,
                 shutdown_event=self.shutdown_event,
                 health_dict=self.health,
+                session=self.session,
             )
             self.workers.append(worker)
             worker.start()
