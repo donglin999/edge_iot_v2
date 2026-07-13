@@ -33,6 +33,16 @@ export default defineConfig(({ command, mode }) => {
     plugins: [react()],
     build: {
       outDir: 'dist',
+      rollupOptions: {
+        output: {
+          // Split heavy vendor libs into their own long-lived chunks so the
+          // main entry stays small and antd/recharts cache independently.
+          manualChunks: {
+            antd: ['antd', '@ant-design/icons'],
+            recharts: ['recharts'],
+          },
+        },
+      },
     },
     // Dev-server-only — excluded entirely from the production build.
     ...(command === 'serve'

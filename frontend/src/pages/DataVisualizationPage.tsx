@@ -7,7 +7,7 @@
  *   2. History panel  — single-point history chart with time-range Segmented
  *      control and CSV export. Empty until a specific point is selected.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Alert,
@@ -119,6 +119,28 @@ const formatRelative = (iso: string | null, now: number): string => {
   return `${dt.fromNow(true)}前更新`;
 };
 
+// A single 1s clock lives in this provider. Only components that consume the
+// context (the small <RelativeTime> labels) re-render each tick — the page and
+// the memoized point cards do not, because their element identity is unchanged
+// when the provider re-renders its `children`.
+const NowContext = React.createContext<number>(Date.now());
+
+const NowProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  return <NowContext.Provider value={now}>{children}</NowContext.Provider>;
+};
+
+// Isolated ticking subtree: re-renders once per second on its own, without
+// dragging the enclosing card (or the whole page) into the re-render.
+const RelativeTime: React.FC<{ iso: string | null }> = ({ iso }) => {
+  const now = useContext(NowContext);
+  return <>{formatRelative(iso, now)}</>;
+};
+
 const DataVisualizationPage: React.FC = () => {
   const navigate = useNavigate();
 
@@ -131,13 +153,16 @@ const DataVisualizationPage: React.FC = () => {
   const [tasks, setTasks] = useState<AcqTask[]>([]);
   const [tasksLoading, setTasksLoading] = useState(true);
   const [latestValues, setLatestValues] = useState<PointLatestValue[]>([]);
+  // Task-scoped dataset (filtered ONLY by the selected task, never by the
+  // device/point selection). The device & point dropdown option lists are
+  // derived from this so picking a device doesn't collapse the device list.
+  const [taskScopedValues, setTaskScopedValues] = useState<PointLatestValue[]>([]);
   const [latestUpdatedAt, setLatestUpdatedAt] = useState<number | null>(null);
   const [latestError, setLatestError] = useState<string | null>(null);
   const [latestLoading, setLatestLoading] = useState(false);
   const [historyRange, setHistoryRange] = useState<HistoryRange>('1h');
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [exporting, setExporting] = useState(false);
-  const [now, setNow] = useState(Date.now());
 
   // Use a ref so changing pollInterval doesn't kick off duplicate timers
   // mid-flight. The polling effect re-runs only on filter or interval change.
@@ -228,11 +253,23 @@ const DataVisualizationPage: React.FC = () => {
     };
   }, [pollInterval, fetchLatest, applyLatest]);
 
-  // Refresh "5 秒前更新" labels every second.
+  // Task-scoped fetch: refetch the full (device-unfiltered) point set whenever
+  // the selected task changes. Feeds the device / point dropdown options so
+  // they stay complete regardless of the current device/point selection.
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+    const aborter = new AbortController();
+    fetchLatest(
+      { taskId: filter.taskId, deviceId: null, pointCode: null },
+      aborter.signal,
+    )
+      .then((points) => {
+        if (!aborter.signal.aborted) setTaskScopedValues(points);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) setLatestError((err as Error).message);
+      });
+    return () => aborter.abort();
+  }, [filter.taskId, fetchLatest]);
 
   const handleManualRefresh = useCallback(() => {
     fetchLatest(filterRef.current)
@@ -242,19 +279,20 @@ const DataVisualizationPage: React.FC = () => {
       });
   }, [fetchLatest, applyLatest]);
 
-  // Cascading-reset helpers.
+  // Cascading-reset helpers. `onPointChange` is memoized so the memoized
+  // PointValueCard's onSelect prop stays stable and cards don't re-render.
   const onTaskChange = (value: number | null) => {
     setFilter({ taskId: value ?? null, deviceId: null, pointCode: null });
   };
   const onDeviceChange = (value: number | null) => {
     setFilter((prev) => ({ ...prev, deviceId: value ?? null, pointCode: null }));
   };
-  const onPointChange = (value: string | null) => {
+  const onPointChange = useCallback((value: string | null) => {
     setFilter((prev) => ({ ...prev, pointCode: value ?? null }));
     setHistoryRefreshKey((n) => n + 1);
-  };
+  }, []);
 
-  // Cascading options derived from latestValues + tasks.
+  // Cascading options derived from the task-scoped dataset + tasks.
   const taskOptions = useMemo(
     () =>
       tasks
@@ -263,9 +301,11 @@ const DataVisualizationPage: React.FC = () => {
     [tasks],
   );
 
+  // Device options span the whole task (NOT the current device selection), so
+  // the user can freely switch devices without first clearing the filter.
   const deviceOptions = useMemo(() => {
     const seen = new Map<number, string>();
-    latestValues.forEach((p) => {
+    taskScopedValues.forEach((p) => {
       if (!seen.has(p.device_id)) {
         seen.set(p.device_id, p.device_name || `设备 #${p.device_id}`);
       }
@@ -274,11 +314,18 @@ const DataVisualizationPage: React.FC = () => {
       label: name,
       value: id,
     }));
-  }, [latestValues]);
+  }, [taskScopedValues]);
 
+  // Point options narrow to the selected device (desirable cascade) but are
+  // still sourced from the task-scoped dataset rather than the device-filtered
+  // latestValues, so clearing the device restores the full point list.
   const pointOptions = useMemo(() => {
+    const source =
+      filter.deviceId != null
+        ? taskScopedValues.filter((p) => p.device_id === filter.deviceId)
+        : taskScopedValues;
     const seen = new Map<string, string>();
-    latestValues.forEach((p) => {
+    source.forEach((p) => {
       if (!seen.has(p.point_code)) {
         seen.set(p.point_code, p.point_name || p.point_code);
       }
@@ -287,7 +334,7 @@ const DataVisualizationPage: React.FC = () => {
       label: `${name} (${code})`,
       value: code,
     }));
-  }, [latestValues]);
+  }, [taskScopedValues, filter.deviceId]);
 
   // Selected point object (for history panel).
   const selectedPoint = useMemo(() => {
@@ -337,6 +384,7 @@ const DataVisualizationPage: React.FC = () => {
   const ctaPoint = latestValues[0] ?? null;
 
   return (
+    <NowProvider>
     <div className="data-viz-page">
       <div className="data-viz-page__header">
         <div>
@@ -468,8 +516,7 @@ const DataVisualizationPage: React.FC = () => {
               <PointValueCard
                 point={p}
                 active={p.point_code === filter.pointCode}
-                now={now}
-                onClick={() => onPointChange(p.point_code)}
+                onSelect={onPointChange}
               />
             )}
           />
@@ -480,8 +527,7 @@ const DataVisualizationPage: React.FC = () => {
                 <PointValueCard
                   point={p}
                   active={p.point_code === filter.pointCode}
-                  now={now}
-                  onClick={() => onPointChange(p.point_code)}
+                  onSelect={onPointChange}
                 />
               </Col>
             ))}
@@ -585,17 +631,20 @@ const DataVisualizationPage: React.FC = () => {
         )}
       </Card>
     </div>
+    </NowProvider>
   );
 };
 
 interface PointValueCardProps {
   point: PointLatestValue;
   active: boolean;
-  now: number;
-  onClick: () => void;
+  onSelect: (pointCode: string) => void;
 }
 
-const PointValueCard: React.FC<PointValueCardProps> = ({ point, active, now, onClick }) => {
+// React.memo: with a stable `onSelect` and no per-second `now` prop, an
+// unchanged card skips re-rendering on poll refreshes and on the 1s clock tick
+// (the ticking relative-time label re-renders in isolation via NowContext).
+const PointValueCard: React.FC<PointValueCardProps> = React.memo(({ point, active, onSelect }) => {
   const quality = qualityToBadge(point.quality);
   const isUnavailable = point.value === null || point.value === undefined;
 
@@ -604,7 +653,7 @@ const PointValueCard: React.FC<PointValueCardProps> = ({ point, active, now, onC
       hoverable
       className={`point-value-card${active ? ' point-value-card--active' : ''}`}
       bordered
-      onClick={onClick}
+      onClick={() => onSelect(point.point_code)}
       bodyStyle={{ padding: 14 }}
     >
       <div className="point-value-card__header">
@@ -631,11 +680,13 @@ const PointValueCard: React.FC<PointValueCardProps> = ({ point, active, now, onC
           </Text>
         </Tooltip>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          {formatRelative(point.timestamp, now)}
+          <RelativeTime iso={point.timestamp} />
         </Text>
       </div>
     </Card>
   );
-};
+});
+
+PointValueCard.displayName = 'PointValueCard';
 
 export default DataVisualizationPage;

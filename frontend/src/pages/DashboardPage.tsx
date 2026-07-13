@@ -39,7 +39,9 @@ const DashboardPage = () => {
   const [data, setData] = useState<OverviewPayload | null>(null);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [deviceStats, setDeviceStats] = useState<DeviceStats>({ total: 0, online: 0, offline: 0, error: 0 });
-  const [loading, setLoading] = useState(true);
+  // Only the very first load shows the full-page spinner. Background refreshes
+  // (30s interval) update data in place without tearing down the dashboard.
+  const [initialLoading, setInitialLoading] = useState(true);
   const [, setError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'24h' | '7d' | '30d'>('24h');
 
@@ -88,7 +90,6 @@ const DashboardPage = () => {
     const { signal } = aborter;
 
     const load = async () => {
-      setLoading(true);
       try {
         // allSettled: a single failing endpoint must not blank the whole
         // dashboard — render whatever succeeded and flag the rest.
@@ -143,7 +144,7 @@ const DashboardPage = () => {
       } catch (err) {
         if (!isAbortError(err)) setError((err as Error).message);
       } finally {
-        if (!signal.aborted) setLoading(false);
+        if (!signal.aborted) setInitialLoading(false);
       }
     };
 
@@ -187,7 +188,7 @@ const DashboardPage = () => {
     ? Math.round(((data?.status?.success || 0) + (data?.status?.completed || 0)) / totalStatusCount * 100)
     : 0;
 
-  if (loading) {
+  if (initialLoading) {
     return (
       <div className="dashboard">
         <div className="dashboard__loading">
@@ -669,7 +670,7 @@ const DashboardPage = () => {
             </svg>
           </Link>
 
-          <Link to="/visualization" className="quick-action-card">
+          <Link to="/data" className="quick-action-card">
             <div className="quick-action-card__icon quick-action-card__icon--info">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <line x1="18" y1="20" x2="18" y2="10" />

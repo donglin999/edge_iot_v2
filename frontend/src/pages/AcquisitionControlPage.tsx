@@ -9,12 +9,16 @@ import './AcquisitionControlPage.css';
 const AcquisitionControlPage = () => {
   const [tasks, setTasks] = useState<AcqTask[]>([]);
   const [activeSessions, setActiveSessions] = useState<AcquisitionSession[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Full-page spinner only on the initial mount. Background reloads (triggered
+  // by onStatusChange after start/stop, or the manual refresh button) refresh
+  // data in place so the TaskControlPanels and their WebSockets aren't torn down.
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [useWebSocketUpdates, setUseWebSocketUpdates] = useState(true);
 
   const loadData = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
+    setRefreshing(true);
     setError(null);
 
     try {
@@ -30,7 +34,10 @@ const AcquisitionControlPage = () => {
       if (isAbortError(err)) return;
       setError((err as Error).message);
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (!signal?.aborted) {
+        setInitialLoading(false);
+        setRefreshing(false);
+      }
     }
   }, []);
 
@@ -120,7 +127,7 @@ const AcquisitionControlPage = () => {
     }
   };
 
-  if (loading) {
+  if (initialLoading) {
     return (
       <div className="loading">
         <div className="loading__spinner" />
@@ -145,7 +152,7 @@ const AcquisitionControlPage = () => {
             />
             <span className="ws-toggle__label">实时更新</span>
           </label>
-          <button onClick={() => loadData()} disabled={loading} className="btn btn--secondary">
+          <button onClick={() => loadData()} disabled={refreshing} className="btn btn--secondary">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M23 4v6h-6M1 20v-6h6" />
               <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
