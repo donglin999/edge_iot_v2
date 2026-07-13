@@ -2,6 +2,8 @@
 from pathlib import Path
 
 import environ
+from datetime import timedelta
+
 from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -146,6 +148,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "configuration.tasks.cleanup_import_jobs",
         # Daily at 03:30 — off-peak for an industrial acquisition gateway.
         "schedule": crontab(hour=3, minute=30),
+    },
+    "watchdog-recover-sessions": {
+        # Self-healing (phase 2a): auto-restart dead acquisition sessions with
+        # bounded retry + backoff. Idempotent scan; safe if it overlaps a
+        # startup recovery pass. 30s keeps time-to-recover well under a minute
+        # while staying cheap on a tiny industrial gateway.
+        "task": "acquisition.tasks.watchdog_recover_sessions",
+        "schedule": timedelta(seconds=30),
     },
 }
 
