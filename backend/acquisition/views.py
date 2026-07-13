@@ -974,15 +974,21 @@ class AlarmRuleSerializer(drf_serializers.ModelSerializer):
 
 
 class AlarmSerializer(drf_serializers.ModelSerializer):
-    rule_name = drf_serializers.CharField(source="rule.name", read_only=True)
-    severity = drf_serializers.CharField(source="rule.severity", read_only=True)
+    # ``rule`` is nullable now (connectivity/system alarms have no rule), so
+    # ``rule_name`` must tolerate ``rule is None`` — DRF's attribute traversal
+    # returns None for a null relation, and ``default=None`` covers the rest.
+    # ``severity`` / ``category`` / ``dedup_key`` are real model fields
+    # (``fields="__all__"`` picks them up); severity is denormalized onto the
+    # row so rule-less alarms carry their own level.
+    rule_name = drf_serializers.CharField(
+        source="rule.name", read_only=True, default=None, allow_null=True,
+    )
 
     class Meta:
         model = acq_models.Alarm
         fields = "__all__"
         read_only_fields = (
-            "id", "fired_at", "created_at", "updated_at",
-            "rule_name", "severity",
+            "id", "fired_at", "created_at", "updated_at", "rule_name",
         )
 
 

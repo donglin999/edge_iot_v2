@@ -24,7 +24,12 @@ logger = logging.getLogger(__name__)
     retry_backoff=True,
     retry_kwargs={"max_retries": 3},
 )
-def start_acquisition_task(self, task_id: int, config_version_id: int = None) -> Dict[str, Any]:
+def start_acquisition_task(
+    self,
+    task_id: int,
+    config_version_id: int = None,
+    resume_session_id: int = None,
+) -> Dict[str, Any]:
     """
     Start continuous data acquisition for a task.
 
@@ -36,9 +41,20 @@ def start_acquisition_task(self, task_id: int, config_version_id: int = None) ->
     the task the duplicate invocation exits immediately rather than spawning a
     second pipeline against the same devices.
 
+    Self-healing (phase 2a): the auto-restart watchdog re-dispatches this task
+    with ``resume_session_id`` set to a *dead* (stale-heartbeat) RUNNING
+    session. In that case the guard **adopts** that specific session — the same
+    row is reused (celery_task_id/heartbeat refreshed) instead of a new one
+    being created — so exactly one pipeline runs per task and the session's
+    ``restart_count`` bookkeeping persists across restarts. A genuinely live
+    duplicate (fresh heartbeat, or a *different* running session) is still
+    skipped.
+
     Args:
         task_id: ID of the AcqTask to execute
         config_version_id: Optional specific configuration version
+        resume_session_id: When set, adopt this stale RUNNING session instead
+            of creating a new one (used by the auto-restart watchdog).
 
     Returns:
         Dict with execution results
@@ -68,24 +84,47 @@ def start_acquisition_task(self, task_id: int, config_version_id: int = None) ->
             .first()
         )
         if existing is not None:
-            logger.warning(
-                "start_acquisition_task: task %s already has a RUNNING session "
-                "%s; skipping duplicate invocation %s",
-                task_id, existing.id, self.request.id,
+            # Auto-restart adoption: the watchdog asked us to resume THIS exact
+            # stale session (its old worker died). Reuse the row so restart
+            # bookkeeping persists — no second pipeline is spawned.
+            if resume_session_id is not None and existing.id == resume_session_id:
+                logger.warning(
+                    "start_acquisition_task: adopting stale session %s for task "
+                    "%s (auto-restart, invocation %s)",
+                    existing.id, task_id, self.request.id,
+                )
+                session = existing
+                session.celery_task_id = self.request.id or ""
+                session.error_message = ""
+                meta = session.metadata or {}
+                # Refresh the heartbeat so the watchdog doesn't immediately
+                # re-trigger before the resumed pipeline writes its own.
+                meta["last_health_update"] = time.time()
+                session.metadata = meta
+                session.save(update_fields=[
+                    "celery_task_id", "error_message", "metadata", "updated_at",
+                ])
+            else:
+                # Live duplicate (fresh heartbeat, redelivery, or a different
+                # session) — skip so we never run two pipelines for one task.
+                logger.warning(
+                    "start_acquisition_task: task %s already has a RUNNING session "
+                    "%s; skipping duplicate invocation %s",
+                    task_id, existing.id, self.request.id,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "already running",
+                    "session_id": existing.id,
+                }
+        else:
+            # Create acquisition session
+            session = acq_models.AcquisitionSession.objects.create(
+                task=task,
+                status=acq_models.AcquisitionSession.STATUS_RUNNING,
+                celery_task_id=self.request.id or "",
+                started_at=timezone.now(),
             )
-            return {
-                "status": "skipped",
-                "reason": "already running",
-                "session_id": existing.id,
-            }
-
-        # Create acquisition session
-        session = acq_models.AcquisitionSession.objects.create(
-            task=task,
-            status=acq_models.AcquisitionSession.STATUS_RUNNING,
-            celery_task_id=self.request.id or "",
-            started_at=timezone.now(),
-        )
 
         try:
             # Use acquisition service to run the task
@@ -159,6 +198,84 @@ def stop_acquisition_task(self, session_id: int) -> Dict[str, Any]:
     except acq_models.AcquisitionSession.DoesNotExist:
         logger.error(f"Session {session_id} does not exist")
         return {"status": "error", "error": "Session not found"}
+
+
+@shared_task
+def watchdog_recover_sessions() -> Dict[str, Any]:
+    """Periodic self-healing watchdog for RUNNING acquisition sessions.
+
+    Runs on Celery beat (~30 s). Unlike startup recovery in
+    :mod:`acquisition.apps` (which only fires once, after the *process*
+    restarts), this catches the case where the process stays alive but the
+    acquisition Celery task/thread dies: the session is still marked RUNNING,
+    yet its ``metadata.last_health_update`` heartbeat goes stale.
+
+    For each RUNNING session:
+
+    * fresh heartbeat  → healthy; reset its restart budget / clear any alarm.
+    * brand-new (no heartbeat yet, inside the startup grace window) → leave it.
+    * stale / missing heartbeat → hand to the bounded-retry restart policy.
+
+    Safe to run when Celery beat is NOT configured — it is pure idempotent
+    scanning and never raises (errors are logged, the beat loop keeps going).
+    """
+    from acquisition.services import restart_policy
+
+    stale_seconds = restart_policy.HEARTBEAT_STALE_SECONDS
+    now = time.time()
+
+    try:
+        running = list(
+            acq_models.AcquisitionSession.objects.filter(
+                status=acq_models.AcquisitionSession.STATUS_RUNNING,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — never let the watchdog crash beat
+        logger.error("watchdog_recover_sessions scan failed: %s", exc, exc_info=True)
+        return {"status": "error", "error": str(exc)}
+
+    scanned = len(running)
+    restarted = 0
+    escalated = 0
+
+    for session in running:
+        try:
+            age = restart_policy.heartbeat_age(session, now=now)
+
+            if age is not None and age < stale_seconds:
+                # Alive → keep the restart budget fresh, clear escalation alarm.
+                restart_policy.record_recovery(session)
+                continue
+
+            if age is None and restart_policy.is_within_startup_grace(
+                session, stale_seconds,
+            ):
+                # Brand-new session that hasn't produced a heartbeat yet.
+                continue
+
+            # Stale or long-missing heartbeat → the worker died. Restart it
+            # under the bounded-retry + backoff policy.
+            if restart_policy.attempt_restart(session):
+                restarted += 1
+            elif session.status == acq_models.AcquisitionSession.STATUS_ERROR:
+                escalated += 1
+        except Exception as exc:  # noqa: BLE001 — one bad session must not stop the scan
+            logger.error(
+                "watchdog_recover_sessions: session %s failed: %s",
+                getattr(session, "id", "?"), exc, exc_info=True,
+            )
+
+    if restarted or escalated:
+        logger.warning(
+            "watchdog_recover_sessions: scanned=%d restarted=%d escalated=%d",
+            scanned, restarted, escalated,
+        )
+    return {
+        "status": "ok",
+        "scanned": scanned,
+        "restarted": restarted,
+        "escalated": escalated,
+    }
 
 
 @shared_task

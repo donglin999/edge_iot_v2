@@ -115,9 +115,32 @@ class Alarm(TimeStampedModel):
         (STATUS_CLEARED, "已恢复"),
     )
 
-    rule = models.ForeignKey(AlarmRule, on_delete=models.CASCADE, related_name="alarms")
+    # An Alarm can represent a threshold breach (``rule`` set), or a
+    # connectivity / session / system failure that has no rule at all
+    # (``rule`` is NULL). ``category`` disambiguates the two, and ``severity``
+    # is denormalized onto the row so rule-less alarms still carry a level.
+    CATEGORIES = (
+        ("threshold", "阈值"),
+        ("connectivity", "连接"),
+        ("system", "系统"),
+        ("lifecycle", "生命周期"),
+    )
+
+    # SET_NULL (not CASCADE): deleting an AlarmRule must NOT delete the
+    # connectivity / system alarm history that lives independently of it.
+    rule = models.ForeignKey(AlarmRule, on_delete=models.SET_NULL,
+                             related_name="alarms", null=True, blank=True)
     session = models.ForeignKey(AcquisitionSession, on_delete=models.CASCADE,
                                  related_name="alarms", null=True, blank=True)
+    category = models.CharField(max_length=16, choices=CATEGORIES,
+                                default="threshold", db_index=True)
+    # Denormalized copy of severity. Threshold alarms mirror their rule's
+    # severity; rule-less alarms carry their own.
+    severity = models.CharField(max_length=16, choices=AlarmRule.SEVERITIES,
+                                default="warning")
+    # One firing alarm per logical problem (e.g. ``connectivity:<device>``),
+    # so a flapping device updates one row instead of creating thousands.
+    dedup_key = models.CharField(max_length=255, blank=True, db_index=True)
     point_code = models.CharField(max_length=128)
     device_code = models.CharField(max_length=255, blank=True)
     value = models.JSONField()

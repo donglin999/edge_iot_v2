@@ -91,6 +91,8 @@ def evaluate_readings(
                 alarm = Alarm.objects.create(
                     rule=rule,
                     session=session,
+                    category=Alarm.CATEGORIES[0][0],  # "threshold"
+                    severity=rule.severity,  # denormalized copy of the rule's level
                     point_code=code,
                     device_code=device_code,
                     value=value,
@@ -101,9 +103,26 @@ def evaluate_readings(
                 )
                 fired.append(alarm)
                 logger.warning("ALARM %s: %s", rule.severity, alarm.message)
+                # Push the new threshold alarm live (best-effort; never raises).
+                _broadcast(alarm, "created")
             elif not triggered and existing:
                 existing.status = Alarm.STATUS_CLEARED
                 existing.cleared_at = timezone.now()
                 existing.save(update_fields=["status", "cleared_at", "updated_at"])
                 logger.info("ALARM cleared: rule=%s code=%s value=%s", rule.name, code, value)
+                _broadcast(existing, "cleared")
     return fired
+
+
+def _broadcast(alarm: Alarm, event: str) -> None:
+    """Best-effort WebSocket push for a threshold alarm transition.
+
+    Delegates to :mod:`acquisition.services.reporting`, which swallows any
+    channel-layer error so the acquisition loop is never disturbed.
+    """
+    try:
+        from acquisition.services.reporting import broadcast_alarm
+
+        broadcast_alarm(alarm, event)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("threshold alarm broadcast failed: %s", exc)

@@ -51,6 +51,11 @@ jobs:
       - name: 运行测试
         run: python -m pytest tests/ -c tests/pytest.ini
 
+      # 5. 端到端拉通：设备→采集→sink→告警/自起 全链路（@pytest.mark.e2e）
+      #    上一步已覆盖全部用例，这一步单独跑 e2e 子集，给一个独立的"全流程拉通"绿灯
+      - name: 端到端拉通测试 (e2e)
+        run: python -m pytest tests/ -c tests/pytest.ini -m e2e
+
   # ── 前端：React + Vite ───────────────────────────────────────────────
   frontend:
     name: 前端检查与构建 (eslint + build)
