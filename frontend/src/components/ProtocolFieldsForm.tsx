@@ -36,6 +36,7 @@ const ProtocolFieldsForm: React.FC<Props> = ({ fields, namePath }) => {
             )}
           </span>
         );
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const rules: any[] = [];
         if (spec.required) {
           rules.push({ required: true, message: `请填写 ${spec.label}` });

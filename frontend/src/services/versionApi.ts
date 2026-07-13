@@ -166,7 +166,7 @@ async function downloadXlsx(url: string, fallback: string): Promise<void> {
 /**
  * Export the current site configuration as an Excel file.
  */
-export async function exportCurrentConfig(siteCode: string = 'default'): Promise<void> {
+export async function exportCurrentConfig(siteCode = 'default'): Promise<void> {
   const url = `${API_BASE}/export-excel/?site_code=${encodeURIComponent(siteCode)}`;
   await downloadXlsx(url, `config_${siteCode}_${Date.now()}.xlsx`);
 }

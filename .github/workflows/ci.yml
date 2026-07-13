@@ -1,0 +1,84 @@
+# GitHub Actions CI —— 边缘IoT数据采集系统
+#
+# 作用：每次 push 或开 PR 时，自动在 GitHub 的干净服务器上拉代码、装依赖、
+#       跑后端测试、检查并构建前端。红叉会显示在 PR 上，挡住有问题的合并。
+#
+# 这个文件放在 .github/workflows/ 下，GitHub 自动识别并执行，不需要任何额外配置。
+
+name: CI
+
+# ── 触发条件：什么时候跑 ───────────────────────────────────────────────
+on:
+  push:
+    branches: ['**']        # 推到任意分支都跑
+  pull_request:
+    branches: [master]      # 针对 master 开的 PR 也跑
+
+# 同一分支新 push 时，取消上一次还没跑完的 CI，省时间省额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 后端：Django + pytest ────────────────────────────────────────────
+  backend:
+    name: 后端测试 (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend   # 所有 run 步骤都在 backend/ 下执行
+
+    steps:
+      # 1. 把仓库代码拉到 CI 服务器上
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      # 2. 装 Python 3.10（与 backend/Dockerfile 的 python:3.10-slim 对齐）
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip           # 缓存 pip 下载，后续跑得更快
+
+      # 3. 装依赖：业务依赖 + 测试依赖
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r tests/requirements-test.txt
+
+      # 4. 跑测试（SQLite + Celery eager，无需 Redis/InfluxDB）
+      - name: 运行测试
+        run: python -m pytest tests/ -c tests/pytest.ini
+
+  # ── 前端：React + Vite ───────────────────────────────────────────────
+  frontend:
+    name: 前端检查与构建 (eslint + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      # 装 Node 20（Vite 4 需要 Node 18+），并缓存 npm
+      - name: 安装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # npm ci：按 package-lock.json 精确安装，比 npm install 更适合 CI
+      - name: 安装依赖
+        run: npm ci
+
+      # 代码风格检查（package.json 里的 lint 脚本，--max-warnings 0 即零容忍）
+      - name: Lint
+        run: npm run lint
+
+      # 构建（tsc 类型检查 + vite build），能 build 过才算前端没坏
+      - name: 构建
+        run: npm run build

@@ -300,6 +300,8 @@ const DataVisualizationPage: React.FC = () => {
     const end = new Date();
     const start = new Date(end.getTime() - RANGE_TO_MS[historyRange]);
     return { start: start.toISOString(), end: end.toISOString() };
+    // historyRefreshKey 故意保留：手动刷新时强制重算"现在"的时间窗口
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyRange, historyRefreshKey]);
 
   const handleExport = async () => {
@@ -316,7 +318,7 @@ const DataVisualizationPage: React.FC = () => {
         dp.quality,
       ]);
       const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-      const blob = new Blob([`﻿${csv}`], { type: 'text/csv;charset=utf-8;' });
+      const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8;' });
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
       link.download = `${filter.pointCode}_${dayjs().format('YYYYMMDD_HHmmss')}.csv`;
