@@ -266,6 +266,19 @@ class GlobalAcquisitionConsumer(AsyncWebsocketConsumer):
             'data': event['data'],
         }))
 
+    async def alarm_event(self, event):
+        """Forward an alarm create/clear event to the browser.
+
+        Sent by ``acquisition.services.reporting.broadcast_alarm`` (and the
+        threshold-rule evaluator) to the ``acquisition_global`` group. Shape:
+        ``{"type": "alarm", "event": "created"|"cleared", "alarm": {...}}``.
+        """
+        await self.send(text_data=json.dumps({
+            'type': 'alarm',
+            'event': event.get('event'),
+            'alarm': event.get('alarm'),
+        }))
+
     @database_sync_to_async
     def get_active_sessions(self):
         """Fetch all active sessions."""

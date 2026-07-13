@@ -49,8 +49,11 @@ interface AlarmRule {
 
 interface Alarm {
   id: number;
-  rule: number;
-  rule_name: string;
+  // rule is null for connectivity / system / lifecycle alarms (no threshold rule).
+  rule: number | null;
+  rule_name: string | null;
+  category?: 'threshold' | 'connectivity' | 'system' | 'lifecycle';
+  dedup_key?: string;
   severity: 'info' | 'warning' | 'critical';
   point_code: string;
   device_code: string;
@@ -64,6 +67,13 @@ const SEVERITY_COLORS: Record<string, string> = {
   info: 'blue',
   warning: 'gold',
   critical: 'red',
+};
+
+const CATEGORY_LABEL: Record<string, string> = {
+  threshold: '阈值',
+  connectivity: '连接',
+  system: '系统',
+  lifecycle: '生命周期',
 };
 
 const STATUS_LABEL: Record<string, { label: string; color: string }> = {
@@ -176,15 +186,39 @@ const AlarmsPage = () => {
       title: '严重度',
       dataIndex: 'severity',
       width: 90,
-      render: (s: string) => <Tag color={SEVERITY_COLORS[s]}>{s.toUpperCase()}</Tag>,
+      render: (s: string) => <Tag color={SEVERITY_COLORS[s]}>{(s ?? '').toUpperCase()}</Tag>,
     },
-    { title: '规则', dataIndex: 'rule_name' },
+    {
+      title: '类别',
+      dataIndex: 'category',
+      width: 90,
+      render: (c: string) => <Tag>{CATEGORY_LABEL[c] ?? c ?? '阈值'}</Tag>,
+    },
+    {
+      // Threshold alarms show their rule name; rule-less system/connectivity
+      // alarms have no rule, so fall back to the alarm message.
+      title: '规则 / 说明',
+      render: (_v, row) => row.rule_name || row.message || '—',
+    },
     { title: '设备', dataIndex: 'device_code' },
-    { title: '测点', dataIndex: 'point_code', render: (c: string) => <code>{c}</code> },
+    {
+      title: '测点',
+      dataIndex: 'point_code',
+      render: (c: string) => (c ? <code>{c}</code> : '—'),
+    },
     {
       title: '触发值',
       dataIndex: 'value',
-      render: (v) => <Text strong>{String(v)}</Text>,
+      render: (v: unknown) => {
+        // Threshold alarms carry a scalar; system alarms carry a JSON dict
+        // (often {}). Render scalars directly, objects compactly, {} as —.
+        if (v == null) return <Text strong>—</Text>;
+        if (typeof v === 'object') {
+          const keys = Object.keys(v as Record<string, unknown>);
+          return <Text strong>{keys.length === 0 ? '—' : JSON.stringify(v)}</Text>;
+        }
+        return <Text strong>{String(v)}</Text>;
+      },
     },
     {
       title: '状态',
