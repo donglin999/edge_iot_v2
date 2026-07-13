@@ -271,10 +271,13 @@ class GlobalAcquisitionConsumer(AsyncWebsocketConsumer):
         """Fetch all active sessions."""
         from acquisition import models as acq_models
 
+        # "Active" == currently running *or* paused (a paused session is still a
+        # live acquisition that has not been stopped). The previous code listed
+        # STATUS_RUNNING twice, silently dropping paused sessions.
         sessions = acq_models.AcquisitionSession.objects.filter(
             status__in=[
                 acq_models.AcquisitionSession.STATUS_RUNNING,
-                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_PAUSED,
             ]
         ).select_related('task')[:50]  # Limit to 50 most recent
 
