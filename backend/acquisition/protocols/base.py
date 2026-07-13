@@ -136,14 +136,77 @@ class BaseProtocol(ABC):
     def read_batch(self, group: "ReadGroup") -> "List[Reading]":  # noqa: F821
         """Execute a single :class:`ReadGroup` and return decoded readings.
 
-        Subclasses opting into the new pipeline (see
-        ``acquisition/services/read_plan.py``) must override this. The default
-        raises :class:`NotImplementedError` so legacy protocols can still ship
-        with only :meth:`read_points`.
+        Default implementation for protocols that only implement
+        :meth:`read_points` (MQTT, Siemens S7, OPC-UA, Mitsubishi PLC, ...).
+        It projects the group's :class:`~acquisition.services.read_plan.PointMeta`
+        entries into the legacy dict shape :meth:`read_points` consumes, runs a
+        single ``read_points`` call, then maps each returned dict back onto the
+        :class:`~acquisition.services.read_plan.Reading` contract that the
+        pipeline (``ReadWorker._read_cycle``) and sinks consume.
+
+        Contract notes:
+
+        * Per-point failures are expected to arrive as ``quality == "bad"``
+          dicts from :meth:`read_points` (its implementations isolate a single
+          bad point instead of discarding the batch), so a partially failing
+          group degrades gracefully rather than raising.
+        * A genuine transport-level failure (``read_points`` raising, e.g. not
+          connected / every point failed) is re-raised as :class:`ReadError`,
+          matching :meth:`_ModbusBase.read_batch` so the pipeline reconnects.
+
+        Modbus keeps its optimised override; this default is never used there.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement read_batch yet"
-        )
+        # Local import keeps the module import graph free of any early
+        # dependency on the services layer (read_plan is Django-free, so this
+        # is cheap and cycle-safe).
+        import time as _time
+
+        from acquisition.services.read_plan import Reading
+
+        point_dicts: List[Dict[str, Any]] = []
+        for pm in group.points:
+            # Start from protocol-private metadata (MQTT topic, coefficient,
+            # precision, ...) then layer the canonical identity/decoder hints.
+            d: Dict[str, Any] = dict(getattr(pm, "extra", None) or {})
+            d.setdefault("code", pm.code)
+            d.setdefault("address", pm.address)
+            # Different protocols read the type hint under different keys.
+            d.setdefault("data_type", pm.data_type)
+            d.setdefault("type", pm.data_type)
+            d.setdefault("num", pm.num_registers)
+            if pm.function_code is not None:
+                d.setdefault("function_code", pm.function_code)
+            point_dicts.append(d)
+
+        try:
+            raw_results = self.read_points(point_dicts)
+        except ReadError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ReadError(
+                f"{type(self).__name__}.read_batch failed: {exc}"
+            ) from exc
+
+        now_ns = _time.time_ns()
+        readings: List["Reading"] = []  # noqa: F821
+        for item in raw_results or []:
+            if not isinstance(item, dict):
+                continue
+            ts = item.get("timestamp")
+            try:
+                ts_ns = int(ts) if ts is not None else now_ns
+            except (TypeError, ValueError):
+                ts_ns = now_ns
+            readings.append(
+                Reading(
+                    point_code=item.get("code"),
+                    value=item.get("value"),
+                    timestamp_ns=ts_ns,
+                    quality=item.get("quality", "good"),
+                    raw=item.get("raw_data", item.get("raw")),
+                )
+            )
+        return readings
 
     @abstractmethod
     def health_check(self) -> bool: ...
