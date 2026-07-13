@@ -76,6 +76,14 @@ _FLUSH_RETRY_DELAY_S = 1.0
 _FLUSH_BACKOFF_MAX_S = 30.0
 # Drop-log throttle: emit one warning every N drops to avoid log spam.
 _BUFFER_DROP_LOG_EVERY = 100
+# Storage (re)connect backoff. When InfluxDB is unreachable at sink
+# construction, ``_init_storage`` returns None and the durable spill queue
+# (which lives *inside* the storage object) never comes into being. Without a
+# retry the whole session would buffer-and-drop forever, even after InfluxDB
+# recovers. So flush()/consume() re-attempt the connect on this exponential
+# cadence; once it succeeds the buffered points drain normally.
+_STORAGE_REINIT_DELAY_S = 1.0
+_STORAGE_REINIT_BACKOFF_MAX_S = 30.0
 
 
 class InfluxDBSink(Sink):
@@ -111,6 +119,15 @@ class InfluxDBSink(Sink):
         # without it both could snapshot the same batch, double-write it,
         # and then delete twice as many points from the buffer.
         self._flush_in_progress = False
+        # Storage re-init state (Bug: InfluxDB down at session start). When
+        # _init_storage() above failed, self._storage is None; flush()/consume()
+        # call _ensure_storage() to retry the connect on a monotonic-clock
+        # backoff so a later recovery drains the buffer instead of dropping it.
+        # ``_reinit_in_progress`` keeps concurrent workers from piling up
+        # overlapping connect() attempts against a sick backend.
+        self._storage_reinit_next_at = 0.0
+        self._storage_reinit_attempts = 0
+        self._storage_reinit_in_progress = False
 
         # Build lookup maps keyed by point_code so consume() does not touch
         # the ORM. `device_by_point_code` is needed because point_code is
@@ -151,6 +168,53 @@ class InfluxDBSink(Sink):
         except Exception as exc:  # noqa: BLE001
             logger.warning("InfluxDBSink: failed to init storage: %s", exc)
             return None
+
+    def _ensure_storage(self):
+        """Return live storage, retrying a failed startup connect on backoff.
+
+        No-op fast-path when storage already exists. Otherwise at most one
+        thread at a time re-attempts ``_init_storage`` once the monotonic-clock
+        backoff gate has elapsed; on success ``self._storage`` is populated so
+        the next ``flush()`` drains the buffer that accumulated while InfluxDB
+        was down. The connect attempt runs *outside* ``self._lock`` because it
+        may block.
+        """
+        if self._storage is not None:
+            return self._storage
+
+        now = time.monotonic()
+        with self._lock:
+            if self._storage is not None:
+                return self._storage
+            if self._storage_reinit_in_progress:
+                return None
+            if now < self._storage_reinit_next_at:
+                return None
+            self._storage_reinit_in_progress = True
+
+        storage = self._init_storage()
+
+        with self._lock:
+            self._storage_reinit_in_progress = False
+            if storage is not None:
+                self._storage = storage
+                attempts = self._storage_reinit_attempts
+                self._storage_reinit_attempts = 0
+                self._storage_reinit_next_at = 0.0
+                logger.info(
+                    "InfluxDBSink: storage (re)connected after %d failed "
+                    "attempt(s); %d buffered point(s) will drain",
+                    attempts,
+                    len(self._buffer),
+                )
+            else:
+                self._storage_reinit_attempts += 1
+                backoff = min(
+                    _STORAGE_REINIT_BACKOFF_MAX_S,
+                    _STORAGE_REINIT_DELAY_S * (2 ** (self._storage_reinit_attempts - 1)),
+                )
+                self._storage_reinit_next_at = now + backoff
+        return self._storage
 
     # --------------------------------------------------------------- Sink API
     def consume(self, reading: Reading) -> None:
@@ -219,6 +283,13 @@ class InfluxDBSink(Sink):
 
     def flush(self) -> None:
         now = time.time()
+
+        # If storage never came up (InfluxDB down at session start), retry the
+        # connect here — gated by its own backoff — so the buffer that
+        # consume() has been accumulating drains once the backend recovers,
+        # instead of being silently dropped for the whole session.
+        if self._storage is None:
+            self._ensure_storage()
 
         # The backoff gate, the in-progress guard and the buffer snapshot must
         # all be decided under a single lock acquisition. Reading
