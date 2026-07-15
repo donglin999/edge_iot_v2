@@ -182,10 +182,20 @@ def stop_acquisition_task(self, session_id: int) -> Dict[str, Any]:
             logger.warning(f"Session {session_id} is already stopped")
             return {"status": "already_stopped"}
 
-        # Revoke the celery task if it's running
+        # Revoke the celery task if it's running. This publishes a revoke
+        # command to the broker (Redis) — best-effort: if the broker is
+        # unreachable we must still mark the session STOPPED, otherwise a
+        # transient broker outage would make sessions impossible to stop.
         if session.celery_task_id:
-            from celery import current_app
-            current_app.control.revoke(session.celery_task_id, terminate=True)
+            try:
+                from celery import current_app
+                current_app.control.revoke(session.celery_task_id, terminate=True)
+            except Exception as exc:  # noqa: BLE001 — broker may be down
+                logger.warning(
+                    "Failed to revoke celery task %s for session %s "
+                    "(broker unreachable?): %s; marking STOPPED anyway",
+                    session.celery_task_id, session_id, exc,
+                )
 
         # Update final status
         session.status = acq_models.AcquisitionSession.STATUS_STOPPED
