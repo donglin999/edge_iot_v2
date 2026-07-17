@@ -16,6 +16,7 @@ const AcquisitionControlPage = lazy(() => import('./pages/AcquisitionControlPage
 const VersionHistoryPage = lazy(() => import('./pages/VersionHistoryPage'));
 const DataVisualizationPage = lazy(() => import('./pages/DataVisualizationPage'));
 const AlarmsPage = lazy(() => import('./pages/AlarmsPage'));
+const ScadaGatewayPage = lazy(() => import('./pages/ScadaGatewayPage'));
 
 const RouteFallback = () => (
   <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '60vh' }}>
@@ -42,6 +43,7 @@ const App = () => (
             <Route index element={<DashboardPage />} />
             <Route path="acquisition" element={<AcquisitionControlPage />} />
             <Route path="devices" element={<DeviceListPage />} />
+            <Route path="scada" element={<ScadaGatewayPage />} />
             <Route path="devices/:id" element={<DeviceDetailPage />} />
             <Route path="data" element={<DataVisualizationPage />} />
             <Route path="import" element={<ImportJobPage />} />
