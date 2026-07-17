@@ -51,14 +51,37 @@ bash scripts/offline/build-offline-bundle.sh
 
 ## 2. 部署（在无网工控机上，一键）
 
+### 两种运行模式（省资源）
+
+配置时才需要前端，平时只要采集在跑：
+
+| 模式 | 起哪些 | 用途 |
+|------|--------|------|
+| **完整模式**（默认） | redis + migrate + celery + **django + web** | 配置网关/设备/测点、看可视化 |
+| **采集模式** `--headless` | redis + migrate + celery | 日常跑数采，**省 ~100-150MB** |
+
+采集模式下自愈/告警照常（看门狗在 celery 里），启动时会自动恢复上次 RUNNING 的会话。
+`migrate` 是一次性容器（跑完即退），两种模式都执行，所以无界面也能自洽。
+
 ```bash
 # U 盘目录拷到本地，进入目录
 cd zhongshan-monolith-amd64
 
-# 一键：校验 + docker load + docker compose up -d
+# 首次：完整模式（要用界面配置）
 ./load-and-up.sh
 # 需要改配置时： ./load-and-up.sh --env-file .env   （先 cp .env.example .env 修改）
+
+# 配置完成后，切到省资源的采集模式
+docker compose stop django web          # 老版 compose 用 docker-compose
+# 或下次直接：
+./load-and-up.sh --headless
+
+# 需要再开界面
+docker compose --profile ui -f docker-compose.yml up -d
 ```
+
+> **更大的一块资源在 celery 并发**：`CELERY_ACQ_CONCURRENCY` 默认 200 线程（为大规模现场准备）。
+> 只有几台设备的工控机，在 `.env` 里调到 `8`~`32` 能省下可观内存，比关前端更有效。
 
 **验证**：
 

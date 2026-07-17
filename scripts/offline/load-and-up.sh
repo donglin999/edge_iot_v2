@@ -3,20 +3,29 @@
 # 离线一键加载器 —— 在工控机上、解包目录内运行（操作同目录的 ./images.tar +
 # ./docker-compose.yml）。
 #
-#   ./load-and-up.sh                 # docker load + 架构自检 + compose up
+#   ./load-and-up.sh                 # 完整模式(带界面)：配置用
+#   ./load-and-up.sh --headless      # 采集模式(无界面)：省资源，日常跑
 #   ./load-and-up.sh --env-file .env # 用 .env 覆盖默认配置
 #   ./load-and-up.sh --load-only     # 只 docker load + 检查，不 up
+#
+# 两种模式：
+#   完整模式 = redis + migrate + celery + django + web（能开网页配置）
+#   采集模式 = redis + migrate + celery（不起 django/web，省 ~100-150MB）
+#             采集照跑，启动时自动恢复上次 RUNNING 的会话。
+#   切换：停界面 docker compose stop django web ；开界面 --profile ui up -d
 #
 # 已知 flag 之后的额外参数原样透传给 `docker compose up`。
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ENV_ARGS=(); UP_ARGS=(); LOAD_ONLY=0
+ENV_ARGS=(); UP_ARGS=(); LOAD_ONLY=0; PROFILE_ARGS=(--profile ui); MODE="完整模式(带界面)"
 while [ $# -gt 0 ]; do
   case "$1" in
     --env-file) ENV_ARGS+=(--env-file "$2"); shift 2 ;;
     --load-only) LOAD_ONLY=1; shift ;;
+    --headless) PROFILE_ARGS=(); MODE="采集模式(无界面)"; shift ;;
+    --ui) PROFILE_ARGS=(--profile ui); MODE="完整模式(带界面)"; shift ;;
     *) UP_ARGS+=("$1"); shift ;;
   esac
 done
@@ -62,10 +71,17 @@ elif command -v docker-compose >/dev/null 2>&1; then
 else
   echo "!! 未找到 docker compose(v2) 或 docker-compose(v1)，请先安装其一。"; exit 1
 fi
-echo "==> ${DC[*]} up -d"
-"${DC[@]}" "${ENV_ARGS[@]}" -f docker-compose.yml up -d "${UP_ARGS[@]}"
+echo "==> 启动模式：${MODE}"
+echo "==> ${DC[*]} ${PROFILE_ARGS[*]} up -d"
+"${DC[@]}" "${ENV_ARGS[@]}" "${PROFILE_ARGS[@]}" -f docker-compose.yml up -d "${UP_ARGS[@]}"
 echo ""
-"${DC[@]}" -f docker-compose.yml ps
+"${DC[@]}" "${PROFILE_ARGS[@]}" -f docker-compose.yml ps
 echo ""
-echo "==> 健康检查：稍候片刻后访问  http://<本机IP>/   应返回前端页面"
-echo "    命令行自检： curl -fsS http://localhost/ >/dev/null && echo OK"
+if [ ${#PROFILE_ARGS[@]} -gt 0 ]; then
+  echo "==> 健康检查：稍候片刻后访问  http://<本机IP>:${WEB_PORT:-80}/   应返回前端页面"
+  echo "    配置完成后可切到省资源的采集模式： ${DC[*]} stop django web"
+else
+  echo "==> 采集模式已启动（无界面）。采集在 celery-acq 中运行，会自动恢复上次 RUNNING 的会话。"
+  echo "    需要配置时开界面： ${DC[*]} --profile ui -f docker-compose.yml up -d"
+fi
+echo "    查看采集日志： docker logs celery-acq --tail 50"
