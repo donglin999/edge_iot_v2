@@ -7,9 +7,34 @@ Alibaba-Cloud-IoT style pattern::
     /sys/{product_key}/device/{device_name}/thing/property/{code}/post
 
 where ``{code}`` is the per-point measurement code (测点编码). We subscribe once,
-substituting the single-level wildcard ``+`` for ``{code}``, then recover the
-concrete ``code`` from each inbound message's topic and map it back to the
-requested point.
+substituting the single-level wildcard ``+`` for ``{code}``, then map each
+inbound message back to the requested point.
+
+Real payload structure
+----------------------
+Confirmed against the live gateway — this is the contract, not a guess::
+
+    {"data": {
+        "deviceCode":    "AN300400152600059",
+        "propertyCode":  "N180100560001",
+        "dataType":      2,
+        "propertyValue": "2",
+        "time":          "1755653755532"
+    }}
+
+* ``data.propertyValue`` carries the value, **as a string** (``"2"``). It is
+  coerced by the point's declared ``data_type``.
+* ``data.propertyCode`` is the authoritative measurement code — preferred over
+  the code reversed out of the topic.
+* ``data.deviceCode`` is the gateway's own device id (informational: the
+  protocol instance already knows which device it is reading).
+* ``data.time`` is a **string of milliseconds**; it is normalised to
+  nanoseconds by magnitude (see :meth:`SCADAProtocol._to_ns`).
+* ``data.dataType`` is an int enum of unknown meaning — deliberately ignored.
+* Some gateways double-encode ``data`` as a JSON *string*; that is tolerated.
+
+Older/odd payload shapes (bare scalar, ``value``, ``{code}``, ``params``) remain
+supported as fallbacks after the real structure, so legacy feeds keep working.
 
 Connection/queue/loop plumbing (TLS, username/password, bounded queue, draining
 in ``read_points``) is entirely inherited from :class:`MQTTProtocol`; only topic
@@ -38,7 +63,13 @@ _CODE_SENTINEL = "\x00__CODE__\x00"
 
 @ProtocolRegistry.register("scada")
 class SCADAProtocol(MQTTProtocol):
-    """MQTT-based SCADA gateway adapter (one topic per measurement point)."""
+    """MQTT-based SCADA gateway adapter (one topic per measurement point).
+
+    Payloads carry ``{"data": {"propertyCode": ..., "propertyValue": "...",
+    "time": "<ms>"}}`` (see the module docstring for the full, confirmed
+    structure). Value/code/timestamp are taken from there; the topic-derived
+    code and the legacy payload shapes are fallbacks only.
+    """
 
     META = ProtocolMeta(
         name="scada",
@@ -90,7 +121,9 @@ class SCADAProtocol(MQTTProtocol):
         FieldSpec("unit", "单位", default=""),
         FieldSpec("description", "中文名称", default="", example="注射压力实际值"),
         FieldSpec("payload_path", "JSON 路径", default="",
-                  help_text="可选,形如 'params.value';留空时自动探测 value/{code}/params[{code}] 等常见结构"),
+                  help_text="可选,形如 'data.propertyValue';留空时自动探测:优先网关真实结构 "
+                            "data.propertyValue(data 亦可为 JSON 字符串),再兜底 "
+                            "标量/value/{code}/params[{code}] 等旧结构"),
     )
 
     # ------------------------------------------------------------------ #
@@ -169,18 +202,26 @@ class SCADAProtocol(MQTTProtocol):
                 return []
             code = match.group("code")
 
-            point = next(
-                (p for p in points if str(p.get("code")) == code), None
-            )
-            if point is None:
-                # Received a topic we're not asked to collect.
-                return []
-
             raw = message.get("payload")
             try:
                 payload = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
             except (json.JSONDecodeError, ValueError, TypeError):
                 self.logger.warning("SCADA non-JSON payload on %s, skipping", topic)
+                return []
+
+            # The gateway's own propertyCode is authoritative; the topic-derived
+            # code is only a fallback for payloads that don't carry one.
+            data = self._data_section(payload)
+            if isinstance(data, dict):
+                prop_code = str(data.get("propertyCode") or "").strip()
+                if prop_code:
+                    code = prop_code
+
+            point = next(
+                (p for p in points if str(p.get("code")) == code), None
+            )
+            if point is None:
+                # Received a code we're not asked to collect.
                 return []
 
             value = self._extract_value(payload, code, point.get("payload_path", ""))
@@ -203,17 +244,36 @@ class SCADAProtocol(MQTTProtocol):
             return []
 
     # -- value extraction ------------------------------------------------ #
+    @staticmethod
+    def _data_section(payload: Any) -> Any:
+        """Return ``payload["data"]``, decoding it if double-encoded as JSON."""
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        if isinstance(data, (str, bytes, bytearray)):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return None
+        return data
+
     def _extract_value(self, payload: Any, code: str, payload_path: str) -> Any:
         """Tolerant value extraction.
 
         Order (when no explicit ``payload_path``):
-        1. bare scalar payload
-        2. ``payload["value"]``
-        3. ``payload[code]``
-        4. ``payload["params"][code]["value"]`` or ``payload["params"][code]``
+        1. ``payload["data"]["propertyValue"]`` — the real gateway structure
+           (``data`` may itself be a JSON string)
+        2. bare scalar payload            (legacy fallback)
+        3. ``payload["value"]``           (legacy fallback)
+        4. ``payload[code]``              (legacy fallback)
+        5. ``payload["params"][code]["value"]`` or ``payload["params"][code]``
         """
         if payload_path:
             return self._follow_path(payload, payload_path)
+
+        data = self._data_section(payload)
+        if isinstance(data, dict) and data.get("propertyValue") is not None:
+            return data["propertyValue"]
 
         if isinstance(payload, (int, float, str, bool)):
             return payload
@@ -252,15 +312,47 @@ class SCADAProtocol(MQTTProtocol):
 
     # -- timestamp ------------------------------------------------------- #
     @staticmethod
-    def _extract_timestamp(payload: Any, message: Dict[str, Any]) -> int:
-        """Prefer a payload-carried timestamp, else the receipt time (ns)."""
+    def _to_ns(raw: Any) -> Optional[int]:
+        """Normalise a s/ms/µs/ns timestamp to nanoseconds, by magnitude.
+
+        The gateway sends a *string* of milliseconds (``"1755653755532"``), but
+        peers differ, so classify on magnitude rather than trusting a unit:
+        ``<1e11`` → s, ``<1e14`` → ms, ``<1e17`` → µs, else already ns.
+        Returns ``None`` when unparseable or non-positive, so callers can fall
+        back to the receipt time.
+        """
+        try:
+            t = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if t <= 0:
+            return None
+        if t < 10 ** 11:
+            return t * 10 ** 9   # seconds
+        if t < 10 ** 14:
+            return t * 10 ** 6   # milliseconds  ← what the gateway actually sends
+        if t < 10 ** 17:
+            return t * 10 ** 3   # microseconds
+        return t                 # already nanoseconds
+
+    @classmethod
+    def _extract_timestamp(cls, payload: Any, message: Dict[str, Any]) -> int:
+        """Prefer a payload-carried timestamp (normalised to ns), else the
+        receipt time — which ``MQTTProtocol`` already records via
+        ``time.time_ns()``, so it needs no normalisation."""
+        data = cls._data_section(payload)
+        if isinstance(data, dict) and "time" in data:
+            ts = cls._to_ns(data["time"])
+            if ts is not None:
+                return ts
+
         if isinstance(payload, dict):
             for key in ("time", "timestamp", "ts"):
                 if key in payload:
-                    try:
-                        return int(payload[key])
-                    except (TypeError, ValueError):
-                        pass
+                    ts = cls._to_ns(payload[key])
+                    if ts is not None:
+                        return ts
+
         recv = message.get("timestamp")
         if recv is not None:
             try:

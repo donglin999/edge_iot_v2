@@ -41,7 +41,8 @@
 | `N270400151294` | 注射位置实际值 | `float` | |
 | `F40040100030008` | 射胶时间实际值 | `float` | |
 
-`payload_path` 留空即可，采集端会自动探测常见 payload 结构（见下）。
+`payload_path` 留空即可：采集端会自动走网关真实结构 `data.propertyValue`，并保留
+旧结构兜底（见下）。
 
 ## JSON 配置（可直接喂给导入/建站接口）
 
@@ -68,18 +69,53 @@
 }
 ```
 
-## 消息负载解析（容错顺序）
+## 消息负载解析
 
-对每条话题匹配成功、且测点被订阅的消息，按以下顺序提取数值（`payload_path`
-非空时直接按点号路径取值，跳过自动探测）：
+### 真实结构（已用真机网关验证，即当前契约）
 
-1. payload 本身是标量（数字/字符串/布尔）
-2. `payload["value"]`
-3. `payload[code]`
-4. `payload["params"][code]["value"]`，否则 `payload["params"][code]`
+```json
+{"data": {
+    "deviceCode":    "AN300400152600059",
+    "propertyCode":  "N180100560001",
+    "dataType":      2,
+    "propertyValue": "2",
+    "time":          "1755653755532"
+}}
+```
 
-时间戳优先取 payload 里的 `time` / `timestamp` / `ts`，否则用消息接收时间
-（`time.time_ns()`）。非 JSON / 畸形负载会记录日志并跳过，不会中断采集循环。
+| 字段 | 说明 |
+| --- | --- |
+| `data.propertyValue` | **数值，字符串形式**（`"2"`）。按测点 `data_type` 做类型转换 |
+| `data.propertyCode` | **权威测点编码**，优先于话题反解出的 `{code}` |
+| `data.deviceCode` | 网关自身设备号；仅供参考（协议实例已知道自己在读哪台设备） |
+| `data.time` | **毫秒字符串**，归一到纳秒（见下） |
+| `data.dataType` | int 枚举，含义未知，**不依赖**；类型转换仍以测点 `data_type` 为准 |
 
-> 待确认：真实 payload 的确切结构与时间戳单位（秒 / 毫秒 / 纳秒）。拿到一条真实
-> 样本后即可收紧 `payload_path` 与时间戳换算，去掉自动探测的兜底分支。
+个别网关会把 `data` 双重编码成 JSON 字符串，采集端会自动 `json.loads` 兼容。
+
+### 取值顺序（容错）
+
+`payload_path` 非空时直接按点号路径取值（优先级最高，跳过自动探测）；留空时：
+
+1. `payload["data"]["propertyValue"]` ← **真实结构，主路径**
+2. payload 本身是标量（数字/字符串/布尔）  ← 以下均为旧结构兜底
+3. `payload["value"]`
+4. `payload[code]`
+5. `payload["params"][code]["value"]`，否则 `payload["params"][code]`
+
+### 时间戳归一
+
+优先取 `data.time`，否则取 payload 顶层的 `time` / `timestamp` / `ts`；`str`/`int`
+均可。按**数量级**判定单位并统一换算成纳秒：
+
+| 数量级 | 单位 | 换算 |
+| --- | --- | --- |
+| `< 1e11` | 秒 | `×1e9` |
+| `< 1e14` | 毫秒 ← 网关实际用这个 | `×1e6` |
+| `< 1e17` | 微秒 | `×1e3` |
+| 其他 | 纳秒 | 原样 |
+
+例：`"1755653755532"` → `1755653755532000000`（2025-08-20）。缺失 / 非法（含 `<=0`）
+时回落到消息接收时间（`MQTTProtocol` 已用 `time.time_ns()` 打点，本身即纳秒，不再换算）。
+
+非 JSON / 畸形负载会记录日志并跳过，不会中断采集循环。

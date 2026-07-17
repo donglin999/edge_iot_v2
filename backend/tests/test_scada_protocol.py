@@ -194,12 +194,172 @@ class TestTimestamp:
         out = proto._parse_message(
             msg({"value": 1, "ts": 1700000000000}), [{"code": CODE}]
         )
-        assert out[0]["timestamp"] == 1700000000000
+        # ms in the payload -> normalised to ns.
+        assert out[0]["timestamp"] == 1700000000000 * 10 ** 6
 
     def test_falls_back_to_receipt_time(self):
+        # Receipt time is stamped by MQTTProtocol with time.time_ns(), i.e. it
+        # is already ns and must pass through un-normalised.
         proto = make_proto()
         out = proto._parse_message(msg({"value": 1}, timestamp=999), [{"code": CODE}])
         assert out[0]["timestamp"] == 999
+
+
+# ---------------------------------------------------------------------------
+# Real gateway structure — {"data": {...}} — this is the production contract
+# ---------------------------------------------------------------------------
+REAL_CODE = "N180100560001"
+REAL_TOPIC = (
+    "/sys/123daffb91264286adcdf3bfe55194c7/device/A0201010001150403"
+    "/thing/property/N180100560001/post"
+)
+
+
+def real_data(**overrides):
+    d = {
+        "deviceCode": "AN300400152600059",
+        "propertyCode": REAL_CODE,
+        "dataType": 2,
+        "propertyValue": "2",
+        "time": "1755653755532",
+    }
+    d.update(overrides)
+    return d
+
+
+class TestRealGatewayStructure:
+    def test_real_payload_yields_code_value_and_ns_timestamp(self):
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": real_data()}, topic=REAL_TOPIC),
+            [{"code": REAL_CODE, "data_type": "float"}],
+        )
+        assert len(out) == 1
+        assert out[0]["code"] == REAL_CODE
+        assert out[0]["value"] == pytest.approx(2.0)
+        # "1755653755532" ms -> ns (2025-08-20), exact.
+        assert out[0]["timestamp"] == 1755653755532000000
+        assert out[0]["quality"] == "good"
+
+    def test_property_value_string_honours_data_type(self):
+        proto = make_proto()
+        for data_type, expected in (
+            ("float", 2.0),
+            ("int", 2),
+            ("string", "2"),
+            # "2" is not one of the truthy tokens (1/true/yes/y/on) -> False.
+            ("bool", False),
+        ):
+            out = proto._parse_message(
+                msg({"data": real_data()}, topic=REAL_TOPIC),
+                [{"code": REAL_CODE, "data_type": data_type}],
+            )
+            assert out[0]["value"] == expected, data_type
+            assert isinstance(out[0]["value"], type(expected)), data_type
+
+    def test_double_encoded_data_string(self):
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": json.dumps(real_data())}, topic=REAL_TOPIC),
+            [{"code": REAL_CODE, "data_type": "float"}],
+        )
+        assert len(out) == 1
+        assert out[0]["code"] == REAL_CODE
+        assert out[0]["value"] == pytest.approx(2.0)
+        assert out[0]["timestamp"] == 1755653755532000000
+
+    def test_property_code_wins_over_topic_code(self):
+        """Topic says CODE, payload says REAL_CODE -> payload wins."""
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": real_data()}, topic=TOPIC),  # topic-derived code = CODE
+            [{"code": REAL_CODE, "data_type": "float"}],
+        )
+        assert len(out) == 1
+        assert out[0]["code"] == REAL_CODE
+        # ...and the topic-derived code is NOT collected.
+        out = proto._parse_message(
+            msg({"data": real_data()}, topic=TOPIC), [{"code": CODE, "data_type": "float"}]
+        )
+        assert out == []
+
+    def test_topic_code_used_when_property_code_absent(self):
+        proto = make_proto()
+        data = real_data()
+        del data["propertyCode"]
+        out = proto._parse_message(
+            msg({"data": data}, topic=TOPIC), [{"code": CODE, "data_type": "float"}]
+        )
+        assert len(out) == 1
+        assert out[0]["code"] == CODE
+        assert out[0]["value"] == pytest.approx(2.0)
+
+    def test_real_payload_for_unrequested_point_skipped(self):
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": real_data()}, topic=REAL_TOPIC),
+            [{"code": "SOMETHING_ELSE", "data_type": "float"}],
+        )
+        assert out == []
+
+    def test_explicit_payload_path_still_wins(self):
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": real_data(), "override": 9.9}, topic=REAL_TOPIC),
+            [{"code": REAL_CODE, "data_type": "float", "payload_path": "override"}],
+        )
+        assert out[0]["value"] == pytest.approx(9.9)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp unit normalisation
+# ---------------------------------------------------------------------------
+class TestTimestampNormalisation:
+    EXPECTED_NS = 1755653755532000000
+
+    @pytest.mark.parametrize("raw, expected", [
+        (1755653755, 1755653755 * 10 ** 9),            # seconds (int)
+        ("1755653755", 1755653755 * 10 ** 9),          # seconds (str)
+        (1755653755532, EXPECTED_NS),                  # ms (int)
+        ("1755653755532", EXPECTED_NS),                # ms (str) <- the gateway
+        (1755653755532000, EXPECTED_NS),               # µs
+        (1755653755532000000, EXPECTED_NS),            # ns, already normalised
+    ])
+    def test_units_normalise_to_ns(self, raw, expected):
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": real_data(time=raw)}, topic=REAL_TOPIC),
+            [{"code": REAL_CODE, "data_type": "float"}],
+        )
+        assert out[0]["timestamp"] == expected
+
+    @pytest.mark.parametrize("raw", ["", "garbage", None, 0, -5, [1, 2]])
+    def test_unparseable_time_falls_back_to_receipt(self, raw):
+        proto = make_proto()
+        out = proto._parse_message(
+            msg({"data": real_data(time=raw)}, topic=REAL_TOPIC, timestamp=4242),
+            [{"code": REAL_CODE, "data_type": "float"}],
+        )
+        assert out[0]["timestamp"] == 4242
+
+    def test_missing_time_falls_back_to_receipt(self):
+        proto = make_proto()
+        data = real_data()
+        del data["time"]
+        out = proto._parse_message(
+            msg({"data": data}, topic=REAL_TOPIC, timestamp=4242),
+            [{"code": REAL_CODE, "data_type": "float"}],
+        )
+        assert out[0]["timestamp"] == 4242
+
+    def test_falls_back_to_now_when_no_receipt_time(self):
+        import time as _time
+
+        proto = make_proto()
+        before = _time.time_ns()
+        ts = proto._extract_timestamp({"data": real_data(time="garbage")}, {})
+        after = _time.time_ns()
+        assert before <= ts <= after
 
 
 # ---------------------------------------------------------------------------
