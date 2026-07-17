@@ -11,6 +11,7 @@ from django.utils import timezone
 from acquisition import models as acq_models
 from acquisition.protocols import ProtocolRegistry
 from acquisition.services.acquisition_service import AcquisitionService
+from acquisition.services.device_config import build_device_config
 from configuration import models as config_models
 from storage import StorageRegistry
 
@@ -348,15 +349,9 @@ def acquire_once(task_id: int) -> Dict[str, Any]:
     results: list[Dict[str, Any]] = []
     for device_id, group in by_device.items():
         device = group["device"]
-        cfg = {
-            "source_ip": device.ip_address,
-            "source_port": device.port,
-            "protocol_type": device.protocol,
-            **(device.metadata or {}),
-            # Single-shot probe — we want to fail fast, not block the
-            # caller; the continuous pipeline sets its own timeouts.
-            "timeout": 5.0,
-        }
+        # Single-shot probe — we want to fail fast, not block the caller; the
+        # continuous pipeline sets its own timeouts.
+        cfg = build_device_config(device, overrides={"timeout": 5.0})
         try:
             protocol = ProtocolRegistry.create(device.protocol, cfg)
             with protocol:

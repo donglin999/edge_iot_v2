@@ -17,6 +17,7 @@ from rest_framework.views import APIView
 
 from configuration.services.exporter import ExcelExportService
 from configuration.services.importer import ExcelImportService
+from configuration.services.scada_provision import provision as provision_scada
 from . import import_paths, models, serializers, tasks
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,47 @@ class SiteViewSet(viewsets.ModelViewSet):
 
     queryset = models.Site.objects.all().order_by("code")
     serializer_class = serializers.SiteSerializer
+
+
+@extend_schema_view(
+    list=extend_schema(summary="列出 SCADA 网关"),
+    retrieve=extend_schema(summary="查看 SCADA 网关"),
+    create=extend_schema(summary="创建 SCADA 网关"),
+    update=extend_schema(summary="更新 SCADA 网关"),
+    partial_update=extend_schema(summary="部分更新 SCADA 网关"),
+    destroy=extend_schema(summary="删除 SCADA 网关"),
+)
+class ScadaGatewayViewSet(viewsets.ModelViewSet):
+    """SCADA 网关管理：一组 SCADA 设备共用的 MQTT 连接配置。"""
+
+    # ``devices`` is annotated-free on purpose: ``device_count`` comes from the
+    # serializer's ``devices.count`` source, and prefetching keeps that from
+    # turning into an N+1 across the list view.
+    queryset = models.ScadaGateway.objects.prefetch_related("devices").order_by("code")
+    serializer_class = serializers.ScadaGatewaySerializer
+
+    @extend_schema(
+        summary="批量创建网关下的设备/测点/采集任务",
+        request=serializers.ScadaProvisionSerializer,
+        responses={200: None, 201: None},
+    )
+    @action(detail=True, methods=["post"])
+    def provision(self, request, pk=None):
+        gateway = self.get_object()
+        serializer = serializers.ScadaProvisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        result = provision_scada(gateway, serializer.validated_data)
+
+        created = result["created"]
+        # 201 only when this call actually added rows; a pure re-provision
+        # (idempotent no-op) is a 200.
+        code = (
+            status.HTTP_201_CREATED
+            if created["devices"] or created["points"]
+            else status.HTTP_200_OK
+        )
+        return Response(result, status=code)
 
 
 @extend_schema_view(

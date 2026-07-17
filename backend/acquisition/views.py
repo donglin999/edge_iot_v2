@@ -19,6 +19,7 @@ from rest_framework import viewsets
 
 from acquisition import models as acq_models, serializers, tasks
 from acquisition.protocols import ProtocolRegistry
+from acquisition.services.device_config import build_device_config
 from acquisition.services.templates import build_template
 from common.network import PrivateNetworkNotAllowed, assert_config_targets_allowed
 from configuration import models as config_models
@@ -248,12 +249,7 @@ class AcquisitionSessionViewSet(
 
             try:
                 # 创建协议实例并验证连接
-                device_config = {
-                    "source_ip": device.ip_address,
-                    "source_port": device.port,
-                    "protocol_type": device.protocol,
-                    **(device.metadata or {})
-                }
+                device_config = build_device_config(device)
 
                 protocol = ProtocolRegistry.create(device.protocol, device_config)
                 protocol.connect()
