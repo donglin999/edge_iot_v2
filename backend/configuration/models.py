@@ -30,6 +30,46 @@ class Site(TimeStampedModel):
         return f"{self.code} - {self.name}"
 
 
+class ScadaGateway(TimeStampedModel):
+    """Shared MQTT connection profile for a fleet of SCADA devices.
+
+    Every 中山小家电 SCADA device sits behind the *same* MQTT service and the
+    same ``product_key`` — only ``scada_device_name`` and the point codes vary.
+    Previously each ``Device.metadata`` repeated the whole connection block;
+    this model normalises it so a device only stores
+    ``{"scada_device_name": "<name>"}``.
+
+    The field names here are deliberately *not* prefixed the way the protocol
+    expects (``product_key`` vs ``scada_product_key``) — the mapping onto the
+    protocol's ``device_config`` keys lives in
+    :func:`acquisition.services.device_config.build_device_config`.
+    """
+
+    #: Mirrors ``acquisition.protocols.scada.DEFAULT_TOPIC_TEMPLATE``. Kept as a
+    #: literal (not an import) so the configuration app stays free of any
+    #: acquisition-layer import at module scope.
+    DEFAULT_TOPIC_TEMPLATE = "/sys/{product_key}/device/{device_name}/thing/property/{code}/post"
+
+    code = models.CharField(max_length=64, unique=True)
+    name = models.CharField(max_length=128)
+    source_ip = models.CharField(max_length=255, blank=True, default="")
+    source_port = models.PositiveIntegerField(default=8883)
+    mqtt_use_tls = models.BooleanField(default=True)
+    mqtt_username = models.CharField(max_length=128, blank=True, default="")
+    mqtt_password = models.CharField(max_length=255, blank=True, default="")
+    mqtt_qos = models.PositiveSmallIntegerField(default=0)
+    mqtt_client_id = models.CharField(max_length=128, blank=True, default="")
+    mqtt_read_timeout = models.FloatField(default=5.0)
+    product_key = models.CharField(max_length=128, blank=True, default="")
+    topic_template = models.CharField(max_length=255, default=DEFAULT_TOPIC_TEMPLATE)
+
+    class Meta:
+        ordering = ["code"]
+
+    def __str__(self) -> str:
+        return f"{self.code} - {self.name}"
+
+
 class Device(TimeStampedModel):
     """Represents a data acquisition connection endpoint.
 
@@ -41,6 +81,18 @@ class Device(TimeStampedModel):
     """
 
     site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="devices")
+    # Optional shared MQTT connection profile (scada devices only). When set,
+    # the gateway's connection block is overlaid onto the protocol config by
+    # ``build_device_config`` and ``metadata`` need only carry
+    # ``{"scada_device_name": ...}``. SET_NULL (not CASCADE): deleting a
+    # gateway must not silently delete the devices/points/history behind it.
+    gateway = models.ForeignKey(
+        "ScadaGateway",
+        on_delete=models.SET_NULL,
+        related_name="devices",
+        blank=True,
+        null=True,
+    )
     name = models.CharField(max_length=128)
     # ``code`` is the stable identity of a device across re-imports. The
     # importer composes it from the protocol's ``IDENTITY_FIELDS``.

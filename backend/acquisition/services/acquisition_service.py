@@ -17,6 +17,7 @@ from acquisition import models as acq_models
 from acquisition.protocols import ProtocolRegistry  # noqa: F401  (kept for legacy imports)
 from configuration import models as config_models
 
+from .device_config import build_device_config
 from .pipeline import AcquisitionPipeline, ReadWorker
 from .sinks import WebSocketSink
 
@@ -110,12 +111,7 @@ class AcquisitionService:
             device = group["device"]
             points = group["points"]
             try:
-                cfg = {
-                    "source_ip": device.ip_address,
-                    "source_port": device.port,
-                    "protocol_type": device.protocol,
-                    **(device.metadata or {}),
-                }
+                cfg = build_device_config(device)
                 protocol = ProtocolRegistry.create(device.protocol, cfg)
                 with protocol:
                     readings = protocol.read_points(points)

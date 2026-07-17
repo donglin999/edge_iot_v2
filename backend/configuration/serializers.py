@@ -284,3 +284,85 @@ class ImportDiffSerializer(serializers.Serializer):
 class TaskControlSerializer(serializers.Serializer):
     worker = serializers.CharField(required=False, allow_blank=True)
     note = serializers.CharField(required=False, allow_blank=True)
+
+
+class ScadaGatewaySerializer(serializers.ModelSerializer):
+    """SCADA 网关序列化：一组 SCADA 设备共用的 MQTT 连接配置。"""
+
+    device_count = serializers.IntegerField(source="devices.count", read_only=True)
+
+    class Meta:
+        model = models.ScadaGateway
+        fields = [
+            "id",
+            "code",
+            "name",
+            "source_ip",
+            "source_port",
+            "mqtt_use_tls",
+            "mqtt_username",
+            "mqtt_password",
+            "mqtt_qos",
+            "mqtt_client_id",
+            "mqtt_read_timeout",
+            "product_key",
+            "topic_template",
+            "device_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "device_count", "created_at", "updated_at")
+
+
+class ScadaProvisionPointSerializer(serializers.Serializer):
+    """provision 请求里的单个测点。"""
+
+    code = serializers.CharField(max_length=128)
+    description = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    data_type = serializers.CharField(max_length=32, required=False, allow_blank=True, default="float")
+    unit = serializers.CharField(max_length=32, required=False, allow_blank=True, default="")
+
+
+class ScadaProvisionDeviceSerializer(serializers.Serializer):
+    """provision 请求里的单台设备(注塑机)。"""
+
+    device_name = serializers.CharField(max_length=128)
+    name = serializers.CharField(max_length=128, required=False, allow_blank=True, default="")
+    points = ScadaProvisionPointSerializer(many=True, required=False, default=list)
+
+
+class ScadaProvisionTaskSerializer(serializers.Serializer):
+    """provision 请求里的采集任务。"""
+
+    code = serializers.CharField(max_length=64)
+    name = serializers.CharField(max_length=128, required=False, allow_blank=True, default="")
+    sample_rate_hz = serializers.DecimalField(
+        max_digits=8, decimal_places=2, required=False, default=Decimal("1.00")
+    )
+    is_active = serializers.BooleanField(required=False, default=True)
+
+
+class ScadaImportSerializer(serializers.Serializer):
+    """Excel 导入的 multipart 请求体（仅用于 OpenAPI 文档，视图直接读 request.FILES）。"""
+
+    file = serializers.FileField(help_text="两表格式的 .xlsx：「网关服务」+「设备与测点」")
+    task_code = serializers.CharField(
+        max_length=64, required=False, allow_blank=True,
+        help_text="可选；填了就同时创建采集任务并绑定本次导入的全部测点",
+    )
+    task_name = serializers.CharField(
+        max_length=128, required=False, allow_blank=True, help_text="可选；留空取 task_code",
+    )
+    sample_rate_hz = serializers.DecimalField(
+        max_digits=8, decimal_places=2, required=False, help_text="可选；默认 1.00",
+    )
+
+
+class ScadaProvisionSerializer(serializers.Serializer):
+    """批量在某个网关下创建设备 + 测点 + 采集任务。"""
+
+    site = serializers.PrimaryKeyRelatedField(
+        queryset=models.Site.objects.all(), required=False, allow_null=True
+    )
+    devices = ScadaProvisionDeviceSerializer(many=True)
+    task = ScadaProvisionTaskSerializer(required=False, allow_null=True)

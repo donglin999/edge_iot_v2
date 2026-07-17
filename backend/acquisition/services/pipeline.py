@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from acquisition.protocols import ProtocolRegistry
 
+from .device_config import build_device_config
 from .read_plan import ReadPlanBuilder, Reading
 from .sinks import AlarmSink, InfluxDBSink, Sink, WebSocketSink
 
@@ -277,17 +278,13 @@ class ReadWorker(threading.Thread):
 
         connect_start = time.time()
         try:
-            metadata = self.device.metadata or {}
-            cfg = {
-                "source_ip": self.device.ip_address,
-                "source_port": self.device.port,
-                "protocol_type": self.device.protocol,
-                **metadata,
-                # IMPORTANT: ``timeout`` must come after ``**metadata``
-                # so the auto-derived value overrides any user-supplied
-                # value rather than the other way around.
-                "timeout": self._auto_timeout,
-            }
+            # IMPORTANT: ``timeout`` goes through ``overrides`` so the
+            # auto-derived value lands after device metadata and overrides any
+            # user-supplied value rather than the other way around.
+            cfg = build_device_config(
+                self.device,
+                overrides={"timeout": self._auto_timeout},
+            )
             self.protocol = ProtocolRegistry.create(self.device.protocol, cfg)
             self.protocol.connect()
             self._update_health(
