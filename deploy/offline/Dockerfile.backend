@@ -1,0 +1,24 @@
+# 离线后端镜像 —— 从宿主机预构建的 amd64 wheelhouse 用 --no-index 装依赖，
+# 这样跨架构 (QEMU) 构建时零网络下载（容器内 PyPI 下载在模拟环境下只有
+# ~13 kB/s，是真正的瓶颈）。wheelhouse 由 build-wheelhouse.sh 在 buildx 前产出。
+#
+# 构建上下文 = 仓库根目录（需要 deploy/offline/wheelhouse + backend/）：
+#   docker buildx build --platform linux/amd64 \
+#     -f deploy/offline/Dockerfile.backend -t edge-iot/backend:offline-amd64 --load .
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# 无需 apt / gcc —— 每个依赖都从预构建的 manylinux wheel 安装。
+COPY deploy/offline/wheelhouse /wheels
+COPY backend/requirements.txt /app/
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
+
+COPY backend/ /app/
+
+EXPOSE 8000
+CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]

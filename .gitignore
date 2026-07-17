@@ -340,3 +340,6 @@ Temporary Items
 
 # WSL
 .wslconfig
+
+# 离线构建中间产物
+deploy/offline/wheelhouse/

@@ -1,0 +1,21 @@
+# 离线前端镜像 —— nginx:alpine 服务预构建的 Vite SPA + 反代 /api、/ws 到后端。
+# 静态包必须先在宿主机构建（`cd frontend && npm ci && npm run build` → frontend/dist），
+# 因为 Vite/esbuild 工具链在异构容器里交叉编译很糟糕（见教训：frontend-build-on-host）。
+# 但 `vite build` 的产物是纯静态、与架构无关的 HTML/JS/CSS，可安全 COPY 进 amd64 nginx。
+#
+# 构建上下文 = 仓库根目录。为目标机架构构建：
+#   docker buildx build --platform linux/amd64 \
+#     -f deploy/offline/Dockerfile.web -t edge-iot/web:offline-amd64 --load .
+FROM nginx:alpine
+
+# 预构建 SPA 包（宿主机产出）。
+COPY frontend/dist/ /usr/share/nginx/html/
+
+# nginx 模板 —— BACKEND_UPSTREAM 由 nginx:alpine 自带的 envsubst 入口钩子在容器启动时替换。
+COPY deploy/offline/nginx-spa.conf /etc/nginx/templates/default.conf.template
+
+# host 网络下 nginx 反代到本机 django（compose 会覆盖此默认值）
+ENV BACKEND_UPSTREAM=127.0.0.1:8000
+# 监听端口可由 compose/.env 的 WEB_PORT 覆盖（宿主机 :80 被占时改 8080 等）
+ENV WEB_PORT=80
+EXPOSE 80

@@ -1,0 +1,14 @@
+# web 镜像只需要 frontend/dist（+ nginx 模板），其余全部排除以缩小上下文。
+.git
+backend
+backend_cpp
+mock
+docs
+node_modules
+frontend/node_modules
+frontend/src
+frontend/e2e
+frontend/playwright-report
+**/__pycache__
+**/*.log
+dist

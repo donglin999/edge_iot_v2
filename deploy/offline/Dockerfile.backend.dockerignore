@@ -1,0 +1,20 @@
+# 后端镜像构建上下文过滤（BuildKit 按 <Dockerfile>.dockerignore 就近读取）。
+# 关键：绝不要把 dev 的 db.sqlite3 / 日志 / 缓存打进镜像（否则会把开发数据
+# 一起发出去）；migrate 会在容器首启时建全新库。
+.git
+**/__pycache__
+**/*.pyc
+**/*.pyo
+node_modules
+frontend
+backend_cpp
+dist
+docs
+mock
+backend/db.sqlite3
+backend/db.sqlite3-*
+backend/influx_spill.sqlite3
+backend/influx_spill.sqlite3-*
+backend/logs
+backend/uploads
+**/*.log

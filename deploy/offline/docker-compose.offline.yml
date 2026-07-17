@@ -1,0 +1,122 @@
+# ============================================================================
+# 离线单体（master + scada 协议）—— amd64，无 registry / 无 build / 无 npm。
+# 应用镜像（edge-iot/backend、edge-iot/web）由 images.tar 通过 docker load 载入。
+#
+# 【网络形态】所有服务用 host 网络（network_mode: host），因此容器内 127.0.0.1
+# 等于宿主机 loopback：
+#   - InfluxDB **由生产环境自行运行**在宿主机 127.0.0.1:8086（本包不启动它，
+#     只连它，org=Midea / bucket=Record）。
+#   - Redis 由本包启动（redis:7.0.10，目标机已有镜像）监听 127.0.0.1:6379。
+#     若宿主机已自跑 Redis 占用 6379，删掉下面 redis 服务即可，后端仍连 127.0.0.1:6379。
+#   - Django 仅绑 127.0.0.1:8000（不对外）；nginx(web) 绑 0.0.0.0:80 反代到它，
+#     是唯一对外入口。
+#
+# 敏感/可调值走 ${VAR:-默认}，可用同目录 .env 覆盖（./load-and-up.sh --env-file .env）。
+# 健康判据：curl -fsS http://localhost/  -> HTTP 200
+# ============================================================================
+
+services:
+  redis:
+    image: redis:7.0.10          # 目标机已有；本包起独立 redis
+    container_name: redis-iot
+    network_mode: host
+    restart: unless-stopped
+    # 若宿主机已自跑 redis 占用 6379，在 .env 里设 REDIS_PORT=6380（或其它空闲端口），
+    # 本自带 redis 监听端口与应用连接端口会一并切过去，互不冲突。
+    command: redis-server --port ${REDIS_PORT:-6379}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  django:
+    image: edge-iot/backend:offline-amd64
+    container_name: django-iot
+    network_mode: host
+    # 配置库 db.sqlite3 放共享卷 app-db，django 与 celery 共用同一份（否则各容器
+    # 各建一份、celery 看不到 django migrate 出来的表 → "no such table"）。
+    volumes:
+      - app-db:/data
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - DJANGO_DB_NAME=${DJANGO_DB_NAME:-/data/db.sqlite3}
+      - SECRET_KEY=${SECRET_KEY:-offline-monolith-change-me-please}
+      - DEBUG=${DEBUG:-True}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-*}
+      - ALLOW_PRIVATE_NETWORK_TESTS=${ALLOW_PRIVATE_NETWORK_TESTS:-True}
+      - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      # InfluxDB 由生产环境自行运行在宿主机；host 网络下 127.0.0.1 即宿主机
+      - INFLUXDB_HOST=${INFLUXDB_HOST:-127.0.0.1}
+      - INFLUXDB_PORT=${INFLUXDB_PORT:-8086}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-tKwtme7RYKb3c9LmBxxVKhWv-MF9TT9XTXFdlm5Q6eU6Q1RS0Ywjk2ND8a1S_CQUcpaNeEHWJwk9NQFnzJZa1g==}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-Midea}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-Record}
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+    command: sh -c "python manage.py migrate && python manage.py runserver 127.0.0.1:8000"
+
+  celery-acq:
+    image: edge-iot/backend:offline-amd64
+    container_name: celery-acq
+    network_mode: host
+    volumes:
+      - app-db:/data          # 与 django 共用同一份配置库
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - DJANGO_DB_NAME=${DJANGO_DB_NAME:-/data/db.sqlite3}
+      - SECRET_KEY=${SECRET_KEY:-offline-monolith-change-me-please}
+      - DEBUG=${DEBUG:-True}
+      - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - INFLUXDB_HOST=${INFLUXDB_HOST:-127.0.0.1}
+      - INFLUXDB_PORT=${INFLUXDB_PORT:-8086}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-tKwtme7RYKb3c9LmBxxVKhWv-MF9TT9XTXFdlm5Q6eU6Q1RS0Ywjk2ND8a1S_CQUcpaNeEHWJwk9NQFnzJZa1g==}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-Midea}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-Record}
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+    command: celery -A control_plane worker -l info --pool=threads --concurrency=200 -Q acquisition -n acq@%h
+
+  celery-short:
+    image: edge-iot/backend:offline-amd64
+    container_name: celery-short
+    network_mode: host
+    volumes:
+      - app-db:/data          # 与 django 共用同一份配置库
+    environment:
+      - DJANGO_SETTINGS_MODULE=control_plane.settings
+      - DJANGO_DB_NAME=${DJANGO_DB_NAME:-/data/db.sqlite3}
+      - SECRET_KEY=${SECRET_KEY:-offline-monolith-change-me-please}
+      - DEBUG=${DEBUG:-True}
+      - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - INFLUXDB_HOST=${INFLUXDB_HOST:-127.0.0.1}
+      - INFLUXDB_PORT=${INFLUXDB_PORT:-8086}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-tKwtme7RYKb3c9LmBxxVKhWv-MF9TT9XTXFdlm5Q6eU6Q1RS0Ywjk2ND8a1S_CQUcpaNeEHWJwk9NQFnzJZa1g==}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-Midea}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-Record}
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+    # -B：内嵌 celery beat（数采故障自起看门狗周期任务），单机无需独立容器
+    command: celery -A control_plane worker -B -l info --pool=threads --concurrency=8 -Q short -n short@%h
+
+  web:
+    image: edge-iot/web:offline-amd64
+    container_name: frontend-iot
+    network_mode: host          # 直接绑宿主机 :80
+    environment:
+      # host 网络下 nginx 反代到本机 django
+      - BACKEND_UPSTREAM=${BACKEND_UPSTREAM:-127.0.0.1:8000}
+      # 宿主机 :80 被占用时，在 .env 里设 WEB_PORT=8080 即可（nginx 监听端口随之切换）
+      - WEB_PORT=${WEB_PORT:-80}
+    depends_on:
+      - django
+    restart: unless-stopped
+
+volumes:
+  app-db:                     # 共享 sqlite 配置库（django + celery 共用）
