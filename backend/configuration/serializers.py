@@ -342,6 +342,22 @@ class ScadaProvisionTaskSerializer(serializers.Serializer):
     is_active = serializers.BooleanField(required=False, default=True)
 
 
+class ScadaImportSerializer(serializers.Serializer):
+    """Excel 导入的 multipart 请求体（仅用于 OpenAPI 文档，视图直接读 request.FILES）。"""
+
+    file = serializers.FileField(help_text="两表格式的 .xlsx：「网关服务」+「设备与测点」")
+    task_code = serializers.CharField(
+        max_length=64, required=False, allow_blank=True,
+        help_text="可选；填了就同时创建采集任务并绑定本次导入的全部测点",
+    )
+    task_name = serializers.CharField(
+        max_length=128, required=False, allow_blank=True, help_text="可选；留空取 task_code",
+    )
+    sample_rate_hz = serializers.DecimalField(
+        max_digits=8, decimal_places=2, required=False, help_text="可选；默认 1.00",
+    )
+
+
 class ScadaProvisionSerializer(serializers.Serializer):
     """批量在某个网关下创建设备 + 测点 + 采集任务。"""
 

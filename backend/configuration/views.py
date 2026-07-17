@@ -9,14 +9,22 @@ from django.db import transaction
 from django.db.models import Max
 from django.http import HttpResponse
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from configuration.services.exporter import ExcelExportService
-from configuration.services.importer import ExcelImportService
+from configuration.services.importer import ExcelImportService, RowError
+from configuration.services.scada_excel import (
+    build_scada_export,
+    build_scada_template,
+    build_task_payload,
+    parse_scada_workbook,
+)
 from configuration.services.scada_provision import provision as provision_scada
 from . import import_paths, models, serializers, tasks
 
@@ -77,6 +85,113 @@ class ScadaGatewayViewSet(viewsets.ModelViewSet):
             else status.HTTP_200_OK
         )
         return Response(result, status=code)
+
+    # ------------------------------------------------------------------
+    # Two-sheet Excel: template / export / import
+    #
+    # Deliberately synchronous (no ImportJob/celery hop): a SCADA config is
+    # one gateway plus a handful of devices, so the operator gets the row
+    # errors back in the same request that uploaded the file.
+    # ------------------------------------------------------------------
+    @extend_schema(
+        summary="下载 SCADA 两表 Excel 模板",
+        description="「网关服务」一行 MQTT 连接配置 +「设备与测点」每行一个测点，无需重复任何 MQTT 字段",
+        responses={200: OpenApiTypes.BINARY},
+    )
+    @action(detail=False, methods=["get"], url_path="template")
+    def template(self, request):
+        return _xlsx_response(build_scada_template(), "scada_template.xlsx")
+
+    @extend_schema(
+        summary="导出网关配置为 SCADA 两表 Excel",
+        description="导出格式与模板一致，可直接修改后重新导入",
+        responses={200: OpenApiTypes.BINARY},
+    )
+    @action(detail=True, methods=["get"], url_path="export")
+    def export(self, request, pk=None):
+        gateway = self.get_object()
+        ts = timezone.now().strftime("%Y%m%d_%H%M%S")
+        safe_code = gateway.code.replace("/", "_").replace(" ", "_")
+        return _xlsx_response(
+            build_scada_export(gateway), f"scada_{safe_code}_{ts}.xlsx"
+        )
+
+    @extend_schema(
+        summary="导入 SCADA 两表 Excel",
+        description=(
+            "multipart 上传字段名 file。可选表单字段 task_code / task_name / "
+            "sample_rate_hz：填了 task_code 就顺带创建采集任务并绑定本次全部测点。"
+            "按 code 幂等；校验失败返回 400 + 逐行错误，且不写入任何数据。"
+        ),
+        request={"multipart/form-data": serializers.ScadaImportSerializer},
+        responses={200: None, 201: None, 400: None},
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="import",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_excel(self, request):
+        upload = request.FILES.get("file")
+        if upload is None:
+            return _import_error_response([
+                RowError(0, "file", "请上传 Excel 文件（multipart 字段名 file）", protocol="scada")
+            ])
+
+        parsed = parse_scada_workbook(upload)
+        if not parsed.is_valid:
+            return _import_error_response(parsed.errors)
+
+        task_payload = build_task_payload(
+            task_code=request.data.get("task_code", ""),
+            task_name=request.data.get("task_name", ""),
+            sample_rate_hz=request.data.get("sample_rate_hz"),
+        )
+
+        gateway_data = dict(parsed.gateway)
+        gateway_code = gateway_data.pop("code")
+
+        # One transaction over gateway upsert + provision: a failure anywhere
+        # leaves the DB exactly as it was, which is what the "nothing partially
+        # written" contract in the frontend relies on.
+        with transaction.atomic():
+            gateway, _ = models.ScadaGateway.objects.update_or_create(
+                code=gateway_code, defaults=gateway_data
+            )
+            result = provision_scada(
+                gateway, {"devices": parsed.devices, "task": task_payload}
+            )
+
+        created = result["created"]
+        code = (
+            status.HTTP_201_CREATED
+            if created["devices"] or created["points"]
+            else status.HTTP_200_OK
+        )
+        return Response({**result, "errors": []}, status=code)
+
+
+def _xlsx_response(content: bytes, filename: str) -> HttpResponse:
+    response = HttpResponse(
+        content,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
+def _import_error_response(errors) -> Response:
+    """400 in the importer's house shape: row + column + message per problem."""
+    return Response(
+        {
+            "gateway": None,
+            "created": {"devices": 0, "points": 0},
+            "devices": [],
+            "errors": [e.to_dict() for e in errors],
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 @extend_schema_view(
