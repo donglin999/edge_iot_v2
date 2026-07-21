@@ -26,13 +26,6 @@ const DeviceIcon = () => (
   </svg>
 );
 
-const ScadaIcon = () => (
-  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-    <path d="M4.5 16a4.5 4.5 0 011-8.9 6 6 0 0111.6 1.4A3.8 3.8 0 0119 16" />
-    <path d="M12 12v9M12 21l-3-3M12 21l3-3" />
-  </svg>
-);
-
 const DataIcon = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
     <path d="M3 3v18h18" />
@@ -83,7 +76,6 @@ const navItems: NavItem[] = [
   { path: '/', label: '任务总览', icon: <DashboardIcon />, end: true },
   { path: '/acquisition', label: '采集控制', icon: <AcquisitionIcon /> },
   { path: '/devices', label: '连接与测点', icon: <DeviceIcon /> },
-  { path: '/scada', label: 'SCADA 网关', icon: <ScadaIcon /> },
   { path: '/data', label: '数据可视化', icon: <DataIcon /> },
   { path: '/import', label: '导入作业', icon: <ImportIcon /> },
   { path: '/alarms', label: '告警中心', icon: <AlarmIcon /> },
@@ -94,7 +86,6 @@ const routeTitles: Record<string, string> = {
   '/': '任务总览',
   '/acquisition': '采集控制',
   '/devices': '连接与测点',
-  '/scada': 'SCADA 网关',
   '/data': '数据可视化',
   '/import': '导入作业',
   '/alarms': '告警中心',

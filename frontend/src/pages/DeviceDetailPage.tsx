@@ -10,6 +10,7 @@ import {
   Point,
   DeviceStats,
 } from '../services/deviceApi';
+import DeviceFormModal from '../components/DeviceFormModal';
 import './DeviceDetailPage.css';
 
 const DeviceDetailPage = () => {
@@ -25,6 +26,8 @@ const DeviceDetailPage = () => {
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionResult, setConnectionResult] = useState<{ success: boolean; message: string } | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  // 「修改配置」走的是和设备管理页同一个弹窗:按协议分发到各自的配置界面。
+  const [editOpen, setEditOpen] = useState(false);
 
   useEffect(() => {
     loadDeviceData();
@@ -161,6 +164,13 @@ const DeviceDetailPage = () => {
           <span className={getProtocolBadgeClass(device.protocol)}>{device.protocol}</span>
         </div>
         <div className="page-header__actions">
+          <button onClick={() => setEditOpen(true)} className="btn btn--secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+              <path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+            </svg>
+            修改配置
+          </button>
           <button
             onClick={handleTestConnection}
             disabled={testingConnection}
@@ -366,6 +376,14 @@ const DeviceDetailPage = () => {
           </div>
         )}
       </div>
+
+      <DeviceFormModal
+        open={editOpen}
+        deviceId={deviceId}
+        defaultProtocol={device.protocol}
+        onClose={() => setEditOpen(false)}
+        onSaved={loadDeviceData}
+      />
     </div>
   );
 };
