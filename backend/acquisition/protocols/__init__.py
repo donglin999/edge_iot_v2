@@ -20,6 +20,10 @@ from . import scada   # noqa: F401   scada (mqtt-based SCADA gateway)
 from . import opcua   # noqa: F401   opcua
 from . import s7      # noqa: F401   siemens_s7
 
+# 模拟设备:import 后并不自动注册,只有 EDGE_ENABLE_SIMULATOR=1 时才进注册表。
+# 生产环境的协议下拉里不该出现一个假协议。
+from . import simulator  # noqa: F401   simulator（默认关闭）
+
 __all__ = [
     "BaseProtocol",
     "ConnectionError",

@@ -475,6 +475,9 @@ def test_every_user_facing_protocol_has_a_script():
         # name == META.name 过滤掉别名(modbustcp / s7 / opc-ua ...)
         if klass.__module__ in prod_modules and name == klass.META.name
     }
+    # simulator 是开发用的假设备,只有 EDGE_ENABLE_SIMULATOR=1 才注册,
+    # 不属于要跑现场链路的协议。
+    exposed.discard("simulator")
     assert exposed == set(SCRIPTS), (
         f"缺剧本: {exposed - set(SCRIPTS)};多余剧本: {set(SCRIPTS) - exposed}"
     )
