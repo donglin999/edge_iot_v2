@@ -44,6 +44,8 @@ const IGNORED = [
   'Warning: An update to',
   'not wrapped in act',
   'There may be circular references',
+  // jsdom 没实现带伪元素的 getComputedStyle,antd 的动画会踩到,与被测行为无关
+  'Not implemented: window.getComputedStyle',
 ];
 const originalError = console.error;
 console.error = (...args: unknown[]) => {

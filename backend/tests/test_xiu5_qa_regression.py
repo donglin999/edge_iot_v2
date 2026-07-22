@@ -88,7 +88,7 @@ class TestH9TestConnectionTimeout:
         fake_async.get.side_effect = CeleryTimeoutError("probe timed out")
 
         with patch(
-            "acquisition.tasks.check_protocol_connection.apply_async",
+            "acquisition.tasks.trace_protocol_connection.apply_async",
             return_value=fake_async,
         ):
             resp = APIClient().post(
@@ -98,6 +98,10 @@ class TestH9TestConnectionTimeout:
         assert resp.status_code == 504
         assert resp.data["success"] is False
         assert resp.data["details"]["status"] == "timeout"
+        # 超时也要给出步骤清单：界面画的是过程，不能因为超时就空着一片
+        by_key = {s["key"]: s for s in resp.data["steps"]}
+        assert by_key["connect"]["status"] == "failed"
+        assert by_key["handshake"]["status"] == "skipped"
 
     def test_success_path_returns_200(self, create_device):
         """A healthy probe result still yields a normal 200 response."""
@@ -106,13 +110,26 @@ class TestH9TestConnectionTimeout:
         fake_async = MagicMock()
         fake_async.id = "fake-task-id"
         fake_async.get.return_value = {
-            "status": "success",
+            "success": True,
+            "protocol": "mock_modbus",
+            "device_code": device.code,
             "connected": True,
-            "healthy": True,
+            "steps": [
+                {"key": "config", "label": "检查设备配置", "status": "ok",
+                 "detail": "", "duration_ms": 0.1},
+                {"key": "connect", "label": "建立连接", "status": "ok",
+                 "detail": "已建立连接", "duration_ms": 1.0},
+                {"key": "handshake", "label": "握手/健康检查", "status": "ok",
+                 "detail": "设备响应正常", "duration_ms": 0.5},
+                {"key": "disconnect", "label": "断开连接", "status": "ok",
+                 "detail": "已释放", "duration_ms": 0.1},
+            ],
+            "summary": "连接正常",
+            "total_ms": 1.7,
         }
 
         with patch(
-            "acquisition.tasks.check_protocol_connection.apply_async",
+            "acquisition.tasks.trace_protocol_connection.apply_async",
             return_value=fake_async,
         ):
             resp = APIClient().post(
@@ -121,6 +138,8 @@ class TestH9TestConnectionTimeout:
 
         assert resp.status_code == 200
         assert resp.data["success"] is True
+        assert len(resp.data["steps"]) == 4
+        assert resp.data["summary"] == "连接正常"
 
 
 # --------------------------------------------------------------------------

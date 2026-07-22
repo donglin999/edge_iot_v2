@@ -34,6 +34,7 @@ import {
   ThunderboltOutlined,
 } from '@ant-design/icons';
 
+import ConnectionTestModal from '../components/ConnectionTestModal';
 import DeviceFormModal from '../components/DeviceFormModal';
 import { protocolsWithExcel } from '../protocols/registry';
 import { apiClient } from '../services/apiClient';
@@ -83,6 +84,8 @@ const DeviceListPage = () => {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | undefined>(undefined);
   const [defaultProtocol, setDefaultProtocol] = useState<string | undefined>();
+  // 「测试连接」立刻开弹窗展示过程,而不是等几秒蹦个 toast。
+  const [testing, setTesting] = useState<Device | undefined>();
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -230,15 +233,7 @@ const DeviceListPage = () => {
             <Button
               icon={<ThunderboltOutlined />}
               size="small"
-              onClick={async () => {
-                try {
-                  const res = await apiClient.post(`/config/devices/${row.id}/test-connection/`);
-                  if (res.data.success) message.success(res.data.message ?? '连接正常');
-                  else message.warning(res.data.message ?? '连接失败');
-                } catch {
-                  // interceptor already shown
-                }
-              }}
+              onClick={() => setTesting(row)}
             />
           </Tooltip>
           <Tooltip title="删除">
@@ -357,6 +352,13 @@ const DeviceListPage = () => {
           pagination={{ pageSize: 10, showSizeChanger: true }}
         />
       </Card>
+
+      <ConnectionTestModal
+        open={Boolean(testing)}
+        deviceId={testing?.id}
+        deviceName={testing?.name}
+        onClose={() => setTesting(undefined)}
+      />
 
       <DeviceFormModal
         open={modalOpen}

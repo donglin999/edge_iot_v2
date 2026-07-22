@@ -4,12 +4,12 @@ import {
   fetchDevice,
   fetchDevicePoints,
   fetchDeviceStats,
-  testDeviceConnection,
   deleteDevice,
   Device,
   Point,
   DeviceStats,
 } from '../services/deviceApi';
+import ConnectionTestModal from '../components/ConnectionTestModal';
 import DeviceFormModal from '../components/DeviceFormModal';
 import './DeviceDetailPage.css';
 
@@ -23,11 +23,11 @@ const DeviceDetailPage = () => {
   const [stats, setStats] = useState<DeviceStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [testingConnection, setTestingConnection] = useState(false);
-  const [connectionResult, setConnectionResult] = useState<{ success: boolean; message: string } | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   // 「修改配置」走的是和设备管理页同一个弹窗:按协议分发到各自的配置界面。
   const [editOpen, setEditOpen] = useState(false);
+  // 「测试连接」立刻开弹窗展示整个过程,不再是按下去干等几秒再出结果。
+  const [testOpen, setTestOpen] = useState(false);
 
   useEffect(() => {
     loadDeviceData();
@@ -56,19 +56,6 @@ const DeviceDetailPage = () => {
     }
   };
 
-  const handleTestConnection = async () => {
-    setTestingConnection(true);
-    setConnectionResult(null);
-
-    try {
-      const result = await testDeviceConnection(deviceId);
-      setConnectionResult({ success: result.success, message: result.message });
-    } catch (err) {
-      setConnectionResult({ success: false, message: (err as Error).message });
-    } finally {
-      setTestingConnection(false);
-    }
-  };
 
   const handleDelete = async () => {
     if (!window.confirm(`确定要删除设备 "${device?.name}" 吗？\n\n注意：删除设备将同时删除其所有测点！`)) {
@@ -171,25 +158,12 @@ const DeviceDetailPage = () => {
             </svg>
             修改配置
           </button>
-          <button
-            onClick={handleTestConnection}
-            disabled={testingConnection}
-            className="btn btn--secondary"
-          >
-            {testingConnection ? (
-              <>
-                <div className="loading__spinner" style={{ width: 16, height: 16 }} />
-                测试中...
-              </>
-            ) : (
-              <>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-                  <polyline points="22 4 12 14.01 9 11.01" />
-                </svg>
-                测试连接
-              </>
-            )}
+          <button onClick={() => setTestOpen(true)} className="btn btn--secondary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+              <polyline points="22 4 12 14.01 9 11.01" />
+            </svg>
+            测试连接
           </button>
           <button onClick={handleDelete} className="btn btn--danger">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -200,24 +174,6 @@ const DeviceDetailPage = () => {
           </button>
         </div>
       </div>
-
-      {/* Connection Result */}
-      {connectionResult && (
-        <div className={`connection-result ${connectionResult.success ? 'connection-result--success' : 'connection-result--error'}`}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            {connectionResult.success ? (
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14M22 4L12 14.01l-3-3" />
-            ) : (
-              <>
-                <circle cx="12" cy="12" r="10" />
-                <line x1="15" y1="9" x2="9" y2="15" />
-                <line x1="9" y1="9" x2="15" y2="15" />
-              </>
-            )}
-          </svg>
-          <span>{connectionResult.message}</span>
-        </div>
-      )}
 
       {/* Info Grid */}
       <div className="info-grid">
@@ -376,6 +332,13 @@ const DeviceDetailPage = () => {
           </div>
         )}
       </div>
+
+      <ConnectionTestModal
+        open={testOpen}
+        deviceId={deviceId}
+        deviceName={device.name}
+        onClose={() => setTestOpen(false)}
+      />
 
       <DeviceFormModal
         open={editOpen}

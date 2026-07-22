@@ -377,6 +377,22 @@ def acquire_once(task_id: int) -> Dict[str, Any]:
 
 
 @shared_task
+def trace_protocol_connection(
+    protocol_type: str,
+    device_config: Dict[str, Any],
+    device_code: str = "",
+) -> Dict[str, Any]:
+    """分步连接测试 —— 返回整个过程,而不只是成功/失败。
+
+    界面靠这份步骤清单把「检查配置 → 建立连接 → 握手 → 断开」画出来,失败时
+    一眼看出卡在哪一步。实现见 ``services/connection_trace.py``(协议无关)。
+    """
+    from acquisition.services.connection_trace import trace_connection
+
+    return trace_connection(protocol_type, device_config, device_code=device_code)
+
+
+@shared_task
 def check_protocol_connection(protocol_type: str, device_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Test connection to a device using specified protocol.

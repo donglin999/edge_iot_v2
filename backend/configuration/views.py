@@ -172,6 +172,31 @@ class ScadaGatewayViewSet(viewsets.ModelViewSet):
         return Response({**result, "errors": []}, status=code)
 
 
+def _trace_timeout_payload(device, task_id: str) -> dict:
+    """超时时也给出一份步骤清单 —— 界面要画的是过程,不能因为超时就空着。
+
+    超时说明连接那一步没在 5s 内回来,后面几步自然没发生。
+    """
+    return {
+        "success": False,
+        "message": "连接测试超时(>5s)，设备无响应或网络不可达",
+        "summary": "连接测试超时(>5s)，设备无响应或网络不可达",
+        "protocol": device.protocol,
+        "steps": [
+            {"key": "config", "label": "检查设备配置", "status": "ok",
+             "detail": "配置已下发", "duration_ms": 0.0},
+            {"key": "connect", "label": "建立连接", "status": "failed",
+             "detail": "超过 5s 无响应，设备不可达或网络不通", "duration_ms": 5000.0},
+            {"key": "handshake", "label": "握手/健康检查", "status": "skipped",
+             "detail": "未连接，跳过", "duration_ms": 0.0},
+            {"key": "disconnect", "label": "断开连接", "status": "skipped",
+             "detail": "未连接，无需断开", "duration_ms": 0.0},
+        ],
+        "total_ms": 5000.0,
+        "details": {"status": "timeout", "protocol": device.protocol, "task_id": task_id},
+    }
+
+
 def _xlsx_response(content: bytes, filename: str) -> HttpResponse:
     response = HttpResponse(
         content,
@@ -290,34 +315,40 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
         return Response(stats)
 
-    @extend_schema(summary="测试设备连接")
+    @extend_schema(summary="测试设备连接（返回分步过程）")
     @action(detail=True, methods=["post"], url_path="test-connection")
     def test_connection(self, request, pk=None):
-        """测试设备连接（H9：转 Celery ``short`` 队列，5s 超时即返回）。
+        """测试设备连接，返回**整个过程**而不只是成功/失败。
 
-        连接测试要做真实协议 I/O（开 TCP、发心跳、关 TCP）。过去它在 WSGI
-        请求线程里同步执行——设备无响应时会一直占住一个 web worker 线程。
-        现在改为派发到 Celery ``short`` 队列（与长跑采集任务的 ``acquisition``
-        队列隔离），WSGI 线程最多只阻塞 5s 等结果：超时则立即返回 504，真正的
-        阻塞 I/O 留在 Celery worker 上，不再拖垮 web 进程。
+        响应里的 ``steps`` 是「检查设备配置 → 建立连接 → 握手/健康检查 →
+        断开连接」四步各自的结果、耗时与说明，界面据此把过程画出来：失败时
+        一眼看得出卡在哪一步（配置不全 / TCP 不通 / 连上但设备不响应），
+        这三种情况的排障动作完全不同。
+
+        H9：真实协议 I/O 派发到 Celery ``short`` 队列（与长跑采集的
+        ``acquisition`` 队列隔离），WSGI 线程最多阻塞 5s；超时立即返回 504，
+        阻塞 I/O 留在 worker 上，不拖垮 web 进程。
         """
         from celery.exceptions import TimeoutError as CeleryTimeoutError
 
         from acquisition import tasks as acq_tasks
+        from acquisition.services.device_config import build_device_config
 
         device = self.get_object()
 
-        metadata = device.metadata or {}
-        device_config = {
-            "source_ip": device.ip_address,
-            "source_port": device.port or 502,
-            "slave_id": metadata.get("slave_id", 1),
-            "byte_order": metadata.get("byte_order", "big"),
-            "timeout": min(float(metadata.get("timeout", 5.0)), 5.0),
-        }
+        # 必须走 build_device_config：这里以前手搓了一份只有 modbus 字段的配置
+        # （source_ip/source_port/slave_id/byte_order/timeout），于是 MQTT 没有
+        # 账号密码、OPC-UA 没有 endpoint_url、S7 没有 rack/slot、scada 没有网关
+        # 参数——非 Modbus 协议测的根本不是它自己的配置，必然失败。
+        device_config = build_device_config(device)
+        # 连接测试是交互操作，超时上限压到 5s，别让人对着转圈干等。
+        try:
+            device_config["timeout"] = min(float(device_config.get("timeout", 5.0)), 5.0)
+        except (TypeError, ValueError):
+            device_config["timeout"] = 5.0
 
-        async_result = acq_tasks.check_protocol_connection.apply_async(
-            args=[device.protocol, device_config],
+        async_result = acq_tasks.trace_protocol_connection.apply_async(
+            args=[device.protocol, device_config, device.code],
             queue="short",
         )
         try:
@@ -327,44 +358,32 @@ class DeviceViewSet(viewsets.ModelViewSet):
             logger.warning("Test connection timed out for device %s (task %s)",
                             device.id, async_result.id)
             return Response(
-                {
-                    "success": False,
-                    "message": "连接测试超时(>5s)，设备无响应或网络不可达",
-                    "details": {
-                        "status": "timeout",
-                        "protocol": device.protocol,
-                        "task_id": async_result.id,
-                    },
-                },
+                _trace_timeout_payload(device, async_result.id),
                 status=status.HTTP_504_GATEWAY_TIMEOUT,
             )
         except Exception as e:  # noqa: BLE001 - task raised inside the worker
             logger.warning("Test connection failed for device %s: %s", device.id, e)
             return Response({
                 "success": False,
-                "message": f"连接测试失败: {str(e)}",
-                "details": {
-                    "status": "error",
-                    "protocol": device.protocol,
-                    "error": str(e),
-                },
+                "message": f"连接测试失败: {e}",
+                "summary": f"连接测试失败: {e}",
+                "protocol": device.protocol,
+                "steps": [],
+                "details": {"status": "error", "protocol": device.protocol, "error": str(e)},
             })
 
-        healthy = bool(result.get("healthy")) or result.get("status") == "success"
-        if result.get("status") == "error":
-            return Response({
-                "success": False,
-                "message": f"连接测试失败: {result.get('error', '未知错误')}",
-                "details": result,
-            })
         return Response({
-            "success": healthy,
-            "message": "连接测试成功" if healthy else "连接异常",
+            # message 保留旧字段名，老调用方（含 toast）不至于一起改。
+            "success": result["success"],
+            "message": result["summary"],
+            "summary": result["summary"],
+            "protocol": result["protocol"],
+            "steps": result["steps"],
+            "total_ms": result["total_ms"],
             "details": {
-                "status": result.get("status", "unknown"),
-                "protocol": device.protocol,
-                "connected": bool(result.get("connected")),
-                "healthy": healthy,
+                "status": "success" if result["success"] else "error",
+                "protocol": result["protocol"],
+                "connected": result["connected"],
             },
         })
 
