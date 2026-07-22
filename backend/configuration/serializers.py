@@ -24,7 +24,8 @@ class DeviceSerializer(serializers.ModelSerializer):
 
     site = serializers.PrimaryKeyRelatedField(queryset=models.Site.objects.all())
     # 由 DeviceViewSet 批量算好后放进 context(见 acquisition.services.device_status)。
-    # 拿不到 context 时回落到 "idle" —— 宁可说「没在采」,也不要凭空说「在线」。
+    # 只有 online / offline 两态;拿不到 context 时回落到 "offline" ——
+    # 宁可说拿不到数据,也不要凭空说「在线」。
     status = serializers.SerializerMethodField()
 
     class Meta:
@@ -47,8 +48,8 @@ class DeviceSerializer(serializers.ModelSerializer):
     def get_status(self, obj) -> str:
         statuses = self.context.get("device_statuses")
         if statuses is None:
-            return "idle"
-        return statuses.get(obj.id, "idle")
+            return "offline"
+        return statuses.get(obj.id, "offline")
 
 
 class ChannelSerializer(serializers.ModelSerializer):

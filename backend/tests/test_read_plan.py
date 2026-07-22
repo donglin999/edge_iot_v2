@@ -321,3 +321,75 @@ class TestModbusReadBatch:
         assert codes["A"].value == 5
         assert codes["Z"].quality == "bad"
         assert codes["Z"].value is None
+
+
+# ===========================================================================
+# 字符串地址不能被 int() 抹掉(S7 / OPC-UA)
+# ===========================================================================
+
+
+class _StrAddrPoint:
+    """带字符串地址的测点 —— S7 的 DB1.DBD0、OPC-UA 的 ns=2;s=Tag1。"""
+
+    def __init__(self, code, address, extra=None):
+        self.code = code
+        self.address = address
+        self.extra = extra or {}
+        self.template = None
+
+
+class TestStringAddressSurvivesThePlan:
+    """``PointMeta.address`` 是 Modbus 语义的整数线址,这些协议根本没有整数地址。
+
+    之前 ``_build_default_plan`` 直接 ``int(address)``,失败就落 0,原始地址就此
+    丢失:S7 每个测点都报「无法解析 S7 地址 '0'」,OPC-UA 去读一个叫 "0" 的节点。
+    两个协议在流水线里等于完全不工作 —— 而单测里手搓 point dict 的用例发现不了,
+    因为它们绕开了读计划。
+    """
+
+    def _plan(self, protocol, address, extra=None):
+        from types import SimpleNamespace
+
+        device = SimpleNamespace(protocol=protocol, metadata={})
+        groups = ReadPlanBuilder.build(
+            device, [_StrAddrPoint("pt", address, extra)]
+        )
+        return groups[0].points[0]
+
+    def test_s7_db_address_is_preserved(self):
+        meta = self._plan("siemens_s7", "DB1.DBD0", {"data_type": "float32"})
+        assert meta.extra["address"] == "DB1.DBD0"
+
+    def test_opcua_node_id_is_preserved(self):
+        meta = self._plan("opcua", "ns=2;s=Channel1.Device1.Tag1")
+        assert meta.extra["address"] == "ns=2;s=Channel1.Device1.Tag1"
+
+    def test_read_batch_hands_the_string_address_to_the_protocol(self):
+        """真正的验收点:协议 read_points 收到的 dict 里必须是原始地址。"""
+        from acquisition.protocols.base import BaseProtocol, ProtocolMeta
+
+        seen = {}
+
+        class _Spy(BaseProtocol):
+            META = ProtocolMeta(name="spy", label="Spy", category="other")
+
+            def connect(self): return True
+            def disconnect(self): return None
+            def health_check(self): return True
+            def read_points(self, points):
+                seen["points"] = points
+                return [{"code": p["code"], "value": 1, "quality": "good"} for p in points]
+
+        from types import SimpleNamespace
+
+        device = SimpleNamespace(protocol="siemens_s7", metadata={})
+        groups = ReadPlanBuilder.build(
+            device, [_StrAddrPoint("motor", "DB1.DBD0", {"data_type": "float32"})]
+        )
+        _Spy({}).read_batch(groups[0])
+        assert seen["points"][0]["address"] == "DB1.DBD0"
+
+    def test_numeric_address_still_becomes_an_int(self):
+        """别把 Modbus 的整数线址一起改坏。"""
+        meta = self._plan("mqtt", "40001")
+        assert meta.address == 40001

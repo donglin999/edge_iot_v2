@@ -357,17 +357,28 @@ def _build_default_plan(device, points: List[Any]) -> List[ReadGroup]:
         extra = getattr(point, "extra", None) or {}
         data_type = _resolve_data_type(point)
         num = _registers_for(data_type, extra.get("num"))
+        raw_address = getattr(point, "address", 0)
         try:
-            addr = int(getattr(point, "address", 0))
+            addr = int(raw_address)
         except (TypeError, ValueError):
             addr = 0
+
+        # ``PointMeta.address`` 是 Modbus 语义的整数线址,这些协议根本没有。
+        # 它们的地址是字符串 —— S7 的 ``DB1.DBD0``、OPC-UA 的 ``ns=2;s=Tag1`` ——
+        # 被上面的 int() 打成 0 之后就彻底丢了:S7 每个测点报「无法解析地址」,
+        # OPC-UA 去读一个叫 "0" 的节点。原样留一份到 extra 里,
+        # ``BaseProtocol.read_batch`` 组 point dict 时会优先用它。
+        point_extra = dict(extra)
+        if raw_address not in (None, "") and "address" not in point_extra:
+            point_extra["address"] = raw_address
+
         meta = PointMeta(
             code=getattr(point, "code"),
             address=addr,
             num_registers=num,
             data_type=data_type,
             function_code=None,
-            extra=dict(extra),
+            extra=point_extra,
         )
         out.append(
             ReadGroup(

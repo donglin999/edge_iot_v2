@@ -16,7 +16,6 @@ import pytest
 
 from acquisition import models as acq_models
 from acquisition.services.device_status import (
-    STATUS_IDLE,
     STATUS_OFFLINE,
     STATUS_ONLINE,
     compute_device_statuses,
@@ -39,10 +38,14 @@ def _connectivity_alarm(device, status=acq_models.Alarm.STATUS_FIRING, session=N
 
 
 @pytest.mark.django_db
-def test_device_without_any_task_is_idle_not_online(create_device):
-    """核心回归:没有任何采集任务的设备,绝不能显示「在线」。"""
+def test_device_without_any_task_is_offline_not_online(create_device):
+    """核心回归:没有任何采集任务的设备,绝不能显示「在线」。
+
+    采集设计上永远在重试,所以「没在采」不是一种正常中间态 —— 它和「连不上」
+    对操作员是同一件事:这台设备现在拿不到数据。
+    """
     device = create_device()
-    assert compute_device_statuses([device]) == {device.id: STATUS_IDLE}
+    assert compute_device_statuses([device]) == {device.id: STATUS_OFFLINE}
 
 
 @pytest.mark.django_db
@@ -65,12 +68,13 @@ def test_paused_session_still_counts_as_acquiring(create_point, create_task, cre
 
 
 @pytest.mark.django_db
-def test_stopped_session_falls_back_to_idle(create_point, create_task, create_session):
+def test_stopped_session_is_offline(create_point, create_task, create_session):
+    """会话停了就是拿不到数据,红的。"""
     point = create_point()
     task = create_task(points=[point])
     create_session(task=task, status=acq_models.AcquisitionSession.STATUS_STOPPED)
 
-    assert compute_device_statuses([point.device])[point.device.id] == STATUS_IDLE
+    assert compute_device_statuses([point.device])[point.device.id] == STATUS_OFFLINE
 
 
 @pytest.mark.django_db
@@ -172,11 +176,22 @@ def test_device_list_api_exposes_real_status(client, create_point, create_task, 
 
 
 @pytest.mark.django_db
-def test_device_list_api_reports_idle_for_unused_device(client, create_device):
-    """接口层的回归:凭空的设备必须是 idle,不能是 online。"""
+def test_device_list_api_reports_offline_for_unused_device(client, create_device):
+    """接口层的回归:凭空的设备必须是 offline,不能是 online。"""
     device = create_device()
 
     response = client.get("/api/config/devices/")
     rows = response.json().get("results", response.json())
     row = next(r for r in rows if r["id"] == device.id)
-    assert row["status"] == STATUS_IDLE
+    assert row["status"] == STATUS_OFFLINE
+
+
+@pytest.mark.django_db
+def test_only_two_states_exist(create_device, create_point, create_task, create_session):
+    """状态取值必须只有 online / offline —— 不许再冒出中间态。"""
+    idle_device = create_device(code="NO_TASK")
+    point = create_point()
+    create_session(task=create_task(points=[point]))
+
+    values = set(compute_device_statuses([idle_device, point.device]).values())
+    assert values <= {STATUS_ONLINE, STATUS_OFFLINE}

@@ -56,21 +56,20 @@ interface Device {
 }
 
 /**
- * 状态列的文案与配色。
+ * 状态列的文案与配色。只有在线/离线两态。
  *
  * 这一列以前是写死的绿色「在线」,不查任何数据 —— 一台从没连通过的设备也显示
  * 在线,比没有这一列还糟。现在的取值由后端从「连接告警 + 运行中的会话」推出来。
  *
- * 特别注意 `idle` 的措辞:后端不做主动探测,所以它的含义是「系统没在连它」,
- * 不是「连得上」。文案必须说「未采集」而不是「在线」,否则又变成骗人。
+ * 没有中间态:采集设计上永远在重试,所以「没在采」和「连不上」对操作员是同一
+ * 件事 —— 这台设备现在拿不到数据,都该是红的。
  */
 const DEVICE_STATUS: Record<
   DeviceStatus,
-  { badge: 'success' | 'error' | 'default'; label: string; hint: string }
+  { badge: 'success' | 'error'; label: string; hint: string }
 > = {
   online: { badge: 'success', label: '在线', hint: '采集运行中,连接正常' },
-  offline: { badge: 'error', label: '离线', hint: '采集在跑但连不上 —— 有未恢复的连接告警' },
-  idle: { badge: 'default', label: '未采集', hint: '没有运行中的采集任务,连通性未知' },
+  offline: { badge: 'error', label: '离线', hint: '拿不到数据 —— 连不上,或没有运行中的采集任务' },
 };
 
 const { Text, Title } = Typography;
@@ -202,7 +201,7 @@ const DeviceListPage = () => {
       title: '状态',
       width: 110,
       render: (_v, row) => {
-        const meta = DEVICE_STATUS[row.status ?? 'idle'] ?? DEVICE_STATUS.idle;
+        const meta = DEVICE_STATUS[row.status ?? 'offline'] ?? DEVICE_STATUS.offline;
         return (
           <Tooltip title={meta.hint}>
             <Badge status={meta.badge} text={meta.label} />

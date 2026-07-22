@@ -6,15 +6,16 @@ import { fetchAllPages, withLimitOffset } from './pagination';
 const API_BASE = '/api/config';
 
 /**
- * 设备状态,由后端从连接告警 + 运行中的会话推出来。
+ * 设备状态,由后端从连接告警 + 运行中的会话推出来。只有两态。
  *
- * - `online`  在跑,且没有未清除的连接告警
- * - `offline` 有未清除的连接告警 —— 采集在跑但连不上
- * - `idle`    不在任何运行中的会话里 —— 系统压根没在连它
+ * - `online`  在运行中的会话里,且没有未清除的连接告警
+ * - `offline` 其余一切 —— 连不上,或者压根没在采
  *
- * 后端不做主动探测,所以 `idle` 的含义是「不知道」而不是「连得上」。
+ * 没有「未采集」这种中间态:采集设计上永远在重试(连不上就退避后继续),
+ * 所以「没在采」本身就是不正常,对操作员而言和「连不上」是同一件事 ——
+ * 这台设备现在拿不到数据。
  */
-export type DeviceStatus = 'online' | 'offline' | 'idle';
+export type DeviceStatus = 'online' | 'offline';
 
 export interface Device {
   id: number;

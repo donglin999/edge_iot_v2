@@ -11,13 +11,19 @@
 * ``AcquisitionSession`` 记录哪个任务正在跑;设备通过 ``task.points.device``
   关联到会话。
 
-于是三态:
+**只有两态,没有「未采集」**:
 
 ===========  ==========================================================
 ``online``   设备在运行中的会话里,且没有未清除的连接告警
-``offline``  有未清除的连接告警 —— 采集在跑但连不上
-``idle``     不在任何运行中的会话里 —— 系统压根没在连它,谈不上在线
+``offline``  其余一切 —— 连不上,或者压根没在采
 ===========  ==========================================================
+
+为什么不设第三态:系统的前提是**采集永远在尝试**。``ReadWorker`` 连不上时
+并不放弃 —— 连续失败到 ``max_reconnect`` 后发一个 ``gave_up`` 事件(名字有
+误导性)、落一条连接告警、退避 ``reconnect_backoff`` 秒,然后把失败计数清零
+继续试,无限循环(见 ``pipeline.py::_run_loop``)。既然设备本来就该一直被
+尝试连接,「没在采」本身就不是正常状态,而且对操作员来说和「连不上」是同一
+件事:这台设备现在拿不到数据。多一个中间态只会让人以为那是正常的。
 
 **不做主动探测**:列表页渲染时去逐台开 TCP,一屏 50 台设备就是 50 次阻塞
 I/O,页面会卡死,而且探测本身还会打扰正在采集的连接。状态只反映采集链路的
@@ -29,7 +35,6 @@ from typing import Dict, Iterable, Sequence
 
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
-STATUS_IDLE = "idle"
 
 
 def compute_device_statuses(devices: Sequence) -> Dict[int, str]:
@@ -81,12 +86,9 @@ def compute_device_statuses(devices: Sequence) -> Dict[int, str]:
 
     statuses: Dict[int, str] = {}
     for device in devices:
-        if device.code in offline_codes:
-            statuses[device.id] = STATUS_OFFLINE
-        elif device.id in active_device_ids:
-            statuses[device.id] = STATUS_ONLINE
-        else:
-            statuses[device.id] = STATUS_IDLE
+        # 在跑 且 没有未清除的连接告警 —— 只有这一种情况算在线。
+        online = device.id in active_device_ids and device.code not in offline_codes
+        statuses[device.id] = STATUS_ONLINE if online else STATUS_OFFLINE
     return statuses
 
 
