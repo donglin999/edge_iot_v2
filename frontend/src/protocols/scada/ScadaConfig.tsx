@@ -33,17 +33,30 @@ import {
   Tag,
   Tooltip,
   Typography,
+  Upload,
   message,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { CopyOutlined, DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons';
+import {
+  CloudDownloadOutlined,
+  CloudUploadOutlined,
+  CopyOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  ExportOutlined,
+  PlusOutlined,
+} from '@ant-design/icons';
 
 import ScadaGatewayFormModal from '../../components/ScadaGatewayFormModal';
 import { apiClient } from '../../services/apiClient';
 import { unwrapList } from '../../services/pagination';
 import {
   SCADA_DATA_TYPES,
+  downloadScadaTemplate,
+  exportGateway,
+  extractImportErrors,
   extractProvisionErrors,
+  importScadaExcel,
   listGateways,
   provision,
   type ProvisionPayload,
@@ -94,7 +107,7 @@ const DATA_TYPE_OPTIONS = SCADA_DATA_TYPES.map((t) => ({ label: t, value: t }));
 const DEFAULT_POINTS_PER_DEVICE = 4;
 
 const ScadaConfig = forwardRef<ProtocolConfigHandle, ProtocolConfigProps>(
-  ({ mode, deviceId, device, onSaved }, ref) => {
+  ({ mode, deviceId, device, onSaved, onRequestClose }, ref) => {
     const isEdit = mode === 'edit';
 
     const [gateways, setGateways] = useState<ScadaGateway[]>([]);
@@ -108,6 +121,7 @@ const ScadaConfig = forwardRef<ProtocolConfigHandle, ProtocolConfigProps>(
     const [originalPointIds, setOriginalPointIds] = useState<number[]>([]);
     const [result, setResult] = useState<ProvisionResponse | null>(null);
     const [errors, setErrors] = useState<string[]>([]);
+    const [importing, setImporting] = useState(false);
     const [metaForm] = Form.useForm<MetaFormValues>();
 
     // 行 key 只用于 React 协调,不进 payload,简单自增即可。
@@ -392,6 +406,43 @@ const ScadaConfig = forwardRef<ProtocolConfigHandle, ProtocolConfigProps>(
       }
     };
 
+    /**
+     * 导入两表 Excel。一次就把网关 + 全部设备 + 全部测点写好(后端同一个事务,
+     * 校验失败不写任何数据),所以成功后直接关弹窗 —— 再让用户去按「保存」
+     * 只会撞上空表单校验。
+     *
+     * 返回 false 是给 antd Upload 的:阻止它自己发请求。
+     */
+    const handleImport = async (file: File): Promise<boolean> => {
+      setImporting(true);
+      setErrors([]);
+      try {
+        // 复用下方「同时创建采集任务」的填写结果,不再单开一套导入选项。
+        const meta = metaForm.getFieldsValue();
+        const response = await importScadaExcel(
+          file,
+          meta.task_enabled && meta.task_code?.trim()
+            ? {
+                task_code: meta.task_code.trim(),
+                task_name: (meta.task_name || meta.task_code).trim(),
+                sample_rate_hz: meta.sample_rate_hz ?? 1,
+              }
+            : {},
+        );
+        message.success(
+          `导入完成:${response.devices.length} 台设备,新建 ${response.created.devices} 台 / ${response.created.points} 个测点`,
+        );
+        onSaved?.();
+        onRequestClose?.();
+      } catch (error) {
+        setResult(null);
+        setErrors(extractImportErrors(error));
+      } finally {
+        setImporting(false);
+      }
+      return false;
+    };
+
     useImperativeHandle(ref, () => ({
       async submit() {
         if (!selected) {
@@ -502,6 +553,32 @@ const ScadaConfig = forwardRef<ProtocolConfigHandle, ProtocolConfigProps>(
 
     return (
       <>
+        {/*
+          Excel 通道。设备管理页那个「下载 Excel 模板」是 40 列的通用单表,
+          scada 用它得逐行重复 broker/账号/密码 —— 配 scada 一律走这里的两表格式。
+        */}
+        <Space size="small" wrap style={{ marginBottom: 12 }}>
+          <Text type="secondary">批量:</Text>
+          <Button size="small" icon={<CloudDownloadOutlined />} onClick={downloadScadaTemplate}>
+            下载 Excel 模板
+          </Button>
+          <Upload accept=".xlsx" showUploadList={false} beforeUpload={handleImport}>
+            <Button size="small" icon={<CloudUploadOutlined />} loading={importing}>
+              导入 Excel
+            </Button>
+          </Upload>
+          <Tooltip title={selected ? '导出格式与模板一致,改完可直接再导入' : '请先选择网关'}>
+            <Button
+              size="small"
+              icon={<ExportOutlined />}
+              disabled={!selected}
+              onClick={() => selected && exportGateway(selected.id, selected.code)}
+            >
+              导出当前网关
+            </Button>
+          </Tooltip>
+        </Space>
+
         <Card
           size="small"
           type="inner"

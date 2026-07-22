@@ -35,6 +35,7 @@ import {
 } from '@ant-design/icons';
 
 import DeviceFormModal from '../components/DeviceFormModal';
+import { protocolsWithExcel } from '../protocols/registry';
 import { apiClient } from '../services/apiClient';
 import { fetchAllPages } from '../services/pagination';
 import { downloadTemplate, listProtocols, type ProtocolDescriptor } from '../services/protocolApi';
@@ -249,6 +250,26 @@ const DeviceListPage = () => {
     [protocols],
   );
 
+  /**
+   * 模板下拉:通用单表模板 + 各协议在注册表里声明的专属模板。
+   *
+   * 通用模板是一张 40 列的大宽表,scada 用它得逐行重复 broker/账号/密码 ——
+   * 那正是网关模型要消掉的重复,所以 scada 必须给出自己的两表模板。
+   */
+  const templateMenu = useMemo(
+    () => ({
+      items: [
+        { key: 'generic', label: '通用模板(全部协议 · 单表)' },
+        ...protocolsWithExcel().map((e) => ({ key: e.protocol, label: e.label })),
+      ],
+      onClick: ({ key }: { key: string }) => {
+        const custom = protocolsWithExcel().find((e) => e.protocol === key);
+        (custom ? custom.download() : downloadTemplate()).catch(() => undefined);
+      },
+    }),
+    [],
+  );
+
   const segOptions = useMemo(
     () => [
       { label: `全部 (${devices.length})`, value: 'all' },
@@ -274,9 +295,9 @@ const DeviceListPage = () => {
             <Button icon={<ReloadOutlined />} onClick={refresh}>
               刷新
             </Button>
-            <Button icon={<CloudDownloadOutlined />} onClick={() => downloadTemplate()}>
-              下载 Excel 模板
-            </Button>
+            <Dropdown menu={templateMenu} trigger={['click']}>
+              <Button icon={<CloudDownloadOutlined />}>下载 Excel 模板</Button>
+            </Dropdown>
             <Dropdown menu={addMenu} trigger={['click']}>
               <Button type="primary" icon={<PlusOutlined />}>
                 添加设备

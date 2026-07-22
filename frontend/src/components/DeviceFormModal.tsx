@@ -166,6 +166,7 @@ const DeviceFormModal: React.FC<Props> = ({ open, deviceId, defaultProtocol, onC
               device={device}
               form={form}
               onSaved={onSaved}
+              onRequestClose={onClose}
             />
           )}
         </Form>

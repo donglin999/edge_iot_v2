@@ -58,7 +58,7 @@ jobs:
 
   # ── 前端：React + Vite ───────────────────────────────────────────────
   frontend:
-    name: 前端检查与构建 (eslint + build)
+    name: 前端检查、测试与构建 (eslint + vitest + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -83,6 +83,14 @@ jobs:
       # 代码风格检查（package.json 里的 lint 脚本，--max-warnings 0 即零容忍）
       - name: Lint
         run: npm run lint
+
+      # 单元测试（vitest + jsdom + testing-library）
+      #
+      # 这一步是有来历的：把「保存」按钮彻底堵死的两个 bug——协议从下拉选好了
+      # 表单里却是空值、scada 任务编码必填却默认开启——lint 和 build 全都是绿的，
+      # 只有把组件真渲染起来点一遍才暴露。所以测的是「用户点下去会发生什么」。
+      - name: 单元测试 (vitest)
+        run: npm run test
 
       # 构建（tsc 类型检查 + vite build），能 build 过才算前端没坏
       - name: 构建

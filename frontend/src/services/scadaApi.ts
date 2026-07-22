@@ -11,7 +11,7 @@
  */
 import type { AxiosRequestConfig } from 'axios';
 
-import { apiClient } from './apiClient';
+import { apiClient, downloadFile } from './apiClient';
 import { fetchAllPages } from './pagination';
 
 /** 测点数据类型(与后端 Point.data_type 取值一致)。 */
@@ -153,6 +153,76 @@ export async function provision(
     { silent: true } as AxiosRequestConfig & { silent: boolean },
   );
   return response.data;
+}
+
+/**
+ * 下载两表 Excel 模板(「网关服务」一行 + 「设备与测点」每行一个测点)。
+ *
+ * 注意别和设备管理页那个通用模板搞混:通用模板是 40 列的单表大宽表,scada
+ * 设备要在每一行重复填 broker/账号/密码/product_key —— 正是网关模型要消掉的
+ * 重复。配 scada 一律用这份。
+ */
+export async function downloadScadaTemplate(): Promise<void> {
+  await downloadFile(`${BASE}template/`, 'scada_template.xlsx');
+}
+
+/** 导出某个网关的完整配置(格式与模板一致,改完可直接再导入)。 */
+export async function exportGateway(gatewayId: number, code: string): Promise<void> {
+  const safe = code.replace(/[/\s]/g, '_');
+  await downloadFile(`${BASE}${gatewayId}/export/`, `scada_${safe}.xlsx`);
+}
+
+/** 导入 Excel 时可选的「顺带建采集任务」参数。 */
+export interface ScadaImportOptions {
+  task_code?: string;
+  task_name?: string;
+  sample_rate_hz?: number;
+}
+
+/**
+ * 导入两表 Excel。按 code 幂等(重复导入是更新),校验失败返回 400 且
+ * **不写入任何数据**,所以失败时界面上什么都不用回滚。
+ *
+ * 同样带 `silent`:逐行错误由调用方渲染成列表,比全局 message 有用得多。
+ */
+export async function importScadaExcel(
+  file: File,
+  options: ScadaImportOptions = {},
+): Promise<ProvisionResponse> {
+  const body = new FormData();
+  body.append('file', file);
+  if (options.task_code) {
+    body.append('task_code', options.task_code);
+    if (options.task_name) body.append('task_name', options.task_name);
+    if (options.sample_rate_hz !== undefined) {
+      body.append('sample_rate_hz', String(options.sample_rate_hz));
+    }
+  }
+  const response = await apiClient.post<ProvisionResponse>(`${BASE}import/`, body, {
+    silent: true,
+    // apiClient 实例默认 Content-Type: application/json,直接发 FormData 会被
+    // DRF 的 MultiPartParser 拒成 415。这里把默认头去掉,让 axios/浏览器按
+    // FormData 自己生成 multipart/form-data 并带上 boundary。
+    headers: { 'Content-Type': undefined },
+  } as AxiosRequestConfig & { silent: boolean });
+  return response.data;
+}
+
+/**
+ * 导入接口的错误是逐行的 `{row, column, message}`,和 provision 的嵌套
+ * serializer 错误不是一个形状,单独压平成「第 N 行 · 列名:说明」。
+ */
+export function extractImportErrors(error: unknown): string[] {
+  const data = (error as { response?: { data?: { errors?: unknown } } })?.response?.data;
+  const rows = data?.errors;
+  if (Array.isArray(rows) && rows.length > 0) {
+    return rows.map((e) => {
+      const { row, column, message } = e as { row?: number; column?: string; message?: string };
+      const where = [row ? `第 ${row} 行` : '', column || ''].filter(Boolean).join(' · ');
+      return where ? `${where}:${message ?? '格式有误'}` : message ?? '格式有误';
+    });
+  }
+  return extractProvisionErrors(error);
 }
 
 /**

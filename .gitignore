@@ -343,3 +343,7 @@ Temporary Items
 
 # 离线构建中间产物
 deploy/offline/wheelhouse/
+
+# Playwright 冒烟脚本的本地产物
+frontend/e2e/.artifacts/
+frontend/playwright-report/

@@ -33,6 +33,7 @@ import type { ForwardRefExoticComponent, RefAttributes } from 'react';
 import type { FormInstance } from 'antd';
 
 import type { ProtocolDescriptor } from '../services/protocolApi';
+import { downloadScadaTemplate } from '../services/scadaApi';
 import GenericProtocolConfig from './GenericProtocolConfig';
 import ScadaConfig from './scada/ScadaConfig';
 
@@ -62,6 +63,13 @@ export interface ProtocolConfigProps {
   form: FormInstance;
   /** 保存成功后通知宿主刷新列表。 */
   onSaved?: () => void;
+  /**
+   * 请求宿主关闭弹窗。
+   *
+   * 给「保存按钮之外也能完成配置」的界面用 —— scada 的 Excel 导入一次就把
+   * 网关/设备/测点全写好了,此时再让用户去按「保存」既多余又会撞上空表单校验。
+   */
+  onRequestClose?: () => void;
 }
 
 export interface ProtocolConfigHandle {
@@ -80,6 +88,15 @@ export interface ProtocolConfigEntry {
   /** 组件是否自带「设备名称 / 站点 ID」。 */
   ownsBaseFields: boolean;
   hint?: string;
+  /**
+   * 该协议自带的 Excel 模板。设备管理页那个「下载 Excel 模板」给的是 40 列的
+   * 通用单表,对 scada 这种「一份共享网关 + N 台设备」的协议是错的格式,
+   * 所以协议可以在这里声明自己的模板,由设备管理页一并列出来。
+   */
+  excel?: {
+    label: string;
+    download: () => Promise<void>;
+  };
 }
 
 /** 未登记专属界面的协议一律用它 —— 通用 FieldSpec 表单。 */
@@ -96,8 +113,23 @@ const REGISTRY: Record<string, ProtocolConfigEntry> = {
     width: 1040,
     ownsBaseFields: true,
     hint: 'MQTT 连接参数由网关共享,配一次即可;这里只填设备名和测点。',
+    excel: {
+      label: 'SCADA 两表模板(网关服务 + 设备与测点)',
+      download: downloadScadaTemplate,
+    },
   },
 };
+
+/** 声明了专属 Excel 模板的协议 —— 供设备管理页把它们列进模板下拉。 */
+export function protocolsWithExcel(): Array<{
+  protocol: string;
+  label: string;
+  download: () => Promise<void>;
+}> {
+  return Object.entries(REGISTRY).flatMap(([protocol, entry]) =>
+    entry.excel ? [{ protocol, label: entry.excel.label, download: entry.excel.download }] : [],
+  );
+}
 
 /** 取协议的配置界面;没登记则返回通用表单。 */
 export function getProtocolConfig(protocol?: string): ProtocolConfigEntry {
