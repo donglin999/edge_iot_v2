@@ -275,9 +275,19 @@ def _coerce_enum(value: Any, choices: Optional[Sequence[Any]]) -> Any:
         candidates.append(float(s))
     except ValueError:
         pass
+    # Return the CHOICE, not the candidate that matched it — the choice carries
+    # the type the protocol library actually needs.
+    #
+    # This matters more than it looks: pandas reads every integer cell in an
+    # Excel sheet as float64, so an imported `mqtt_qos` arrives as 0.0. Since
+    # `0.0 in (0, 1, 2)` is True, returning the candidate handed paho a float
+    # qos, which survives every validation and then blows up with
+    # "'float' object cannot be interpreted as an integer" only when the
+    # SUBSCRIBE packet is assembled — i.e. after a successful connect, on site.
     for cand in candidates:
-        if cand in choices:
-            return cand
+        for choice in choices:
+            if cand == choice:
+                return choice
     return s  # fall through, validator will flag
 
 

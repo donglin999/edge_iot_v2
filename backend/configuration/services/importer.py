@@ -82,9 +82,25 @@ class ImportSummary:
 # ---------------------------------------------------------------------------
 
 
+def _code_part(value: Any) -> str:
+    """Render one identity value for a device code.
+
+    pandas reads every integer cell as float64, so a port of 502 arrives as
+    502.0 and used to produce ``modbus_tcp-192.168.1.100-502.0-1.0`` — while the
+    same device added through the UI gets ``modbus_tcp-192.168.1.100-502-1``.
+    Two codes for one device means the importer creates a duplicate instead of
+    updating it. Integral floats therefore render as integers.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def _device_code(protocol: str, identity: Tuple[Any, ...]) -> str:
     """Stable, human-recognisable Device.code, max 255 chars (model limit)."""
-    base = f"{protocol}-" + "-".join(str(v) for v in identity if v is not None and v != "")
+    base = f"{protocol}-" + "-".join(
+        _code_part(v) for v in identity if v is not None and v != ""
+    )
     if len(base) <= 255:
         # Replace characters that would confuse URLs / shells.
         return base.replace("/", "_").replace(":", "_").replace(" ", "_")
