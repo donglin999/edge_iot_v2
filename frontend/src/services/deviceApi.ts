@@ -5,6 +5,17 @@ import { fetchAllPages, withLimitOffset } from './pagination';
 
 const API_BASE = '/api/config';
 
+/**
+ * 设备状态,由后端从连接告警 + 运行中的会话推出来。
+ *
+ * - `online`  在跑,且没有未清除的连接告警
+ * - `offline` 有未清除的连接告警 —— 采集在跑但连不上
+ * - `idle`    不在任何运行中的会话里 —— 系统压根没在连它
+ *
+ * 后端不做主动探测,所以 `idle` 的含义是「不知道」而不是「连得上」。
+ */
+export type DeviceStatus = 'online' | 'offline' | 'idle';
+
 export interface Device {
   id: number;
   site: number;
@@ -14,6 +25,7 @@ export interface Device {
   port: number | null;
   name: string;
   code: string;
+  status?: DeviceStatus;
   created_at: string;
   updated_at: string;
 }

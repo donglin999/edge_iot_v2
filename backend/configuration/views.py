@@ -208,6 +208,24 @@ class DeviceViewSet(viewsets.ModelViewSet):
     queryset = models.Device.objects.select_related("site").order_by("protocol", "ip_address", "port")
     serializer_class = serializers.DeviceSerializer
 
+    def get_serializer(self, *args, **kwargs):
+        """把整页设备的状态一次算好塞进 context。
+
+        状态是从连接告警 + 运行中的会话推出来的(见
+        ``acquisition.services.device_status``)。在这里批量算,固定 2 条查询,
+        列表页不会因为设备变多而多出几十次查询。
+        """
+        instance = args[0] if args else None
+        if instance is not None and not isinstance(instance, dict):
+            from acquisition.services.device_status import compute_device_statuses
+
+            devices = list(instance) if kwargs.get("many") else [instance]
+            # 只对 Device 实例算;写操作传进来的是 data=... 而不是实例。
+            if devices and hasattr(devices[0], "code"):
+                context = kwargs.setdefault("context", self.get_serializer_context())
+                context["device_statuses"] = compute_device_statuses(devices)
+        return super().get_serializer(*args, **kwargs)
+
     def list(self, request, *args, **kwargs):
         if request.query_params.get("distinct"):
             site_code = request.query_params.get("site_code", "default")

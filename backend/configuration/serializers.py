@@ -23,6 +23,9 @@ class DeviceSerializer(serializers.ModelSerializer):
     """采集连接端点序列化：包含协议、IP、端口等信息。"""
 
     site = serializers.PrimaryKeyRelatedField(queryset=models.Site.objects.all())
+    # 由 DeviceViewSet 批量算好后放进 context(见 acquisition.services.device_status)。
+    # 拿不到 context 时回落到 "idle" —— 宁可说「没在采」,也不要凭空说「在线」。
+    status = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Device
@@ -35,10 +38,17 @@ class DeviceSerializer(serializers.ModelSerializer):
             "ip_address",
             "port",
             "metadata",
+            "status",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ("id", "created_at", "updated_at")
+        read_only_fields = ("id", "created_at", "updated_at", "status")
+
+    def get_status(self, obj) -> str:
+        statuses = self.context.get("device_statuses")
+        if statuses is None:
+            return "idle"
+        return statuses.get(obj.id, "idle")
 
 
 class ChannelSerializer(serializers.ModelSerializer):
