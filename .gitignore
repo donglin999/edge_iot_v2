@@ -347,3 +347,7 @@ deploy/offline/wheelhouse/
 # Playwright 冒烟脚本的本地产物
 frontend/e2e/.artifacts/
 frontend/playwright-report/
+
+# 团队协作 prompt(仅本地,不进 git)
+team-prompts/
+.scratch/

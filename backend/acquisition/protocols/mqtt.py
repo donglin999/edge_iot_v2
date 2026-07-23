@@ -101,8 +101,30 @@ class MQTTProtocol(BaseProtocol):
         self.data_queue = queue.Queue(maxsize=1000)
         self.is_running = False
 
+        # Set by the on_connect wrapper installed in connect(); used to block
+        # briefly for the broker's CONNACK before reporting success (see the
+        # comment in connect() for why this matters).
+        self._connect_event: Optional[threading.Event] = None
+        self._connect_rc: Optional[int] = None
+
     def connect(self) -> bool:
         """Connect to MQTT broker and subscribe to topics."""
+        # Guard against a stray live client from a previous connect() call on
+        # this same instance (e.g. an explicit reconnect after a broker
+        # outage). Without this, the old client's background network thread
+        # keeps running and its callbacks — bound to this same protocol
+        # instance — can fire after the new client's, flipping is_connected
+        # back and forth unpredictably (e.g. old client's delayed
+        # auto-reconnect succeeding, then losing the connection again, right
+        # after the new client already reported success).
+        if self.client is not None:
+            try:
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self.client = None
+
         try:
             self.client = mqtt.Client(protocol=self.protocol_version)
 
@@ -115,20 +137,104 @@ class MQTTProtocol(BaseProtocol):
                 context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
                 self.client.tls_set_context(context)
 
-            # Set callbacks
-            self.client.on_connect = self._on_connect
+            # Set callbacks. on_connect is wrapped (rather than assigned
+            # self._on_connect directly) so that subclasses which override
+            # _on_connect for their own subscription logic (e.g. SCADAProtocol)
+            # still get the CONNACK-confirmation signalling below for free.
+            self._connect_event = threading.Event()
+            self._connect_rc = None
+
+            def _on_connect_wrapper(client, userdata, flags, rc, properties=None):
+                self._connect_rc = rc
+                try:
+                    self._on_connect(client, userdata, flags, rc, properties)
+                finally:
+                    self._connect_event.set()
+
+            self.client.on_connect = _on_connect_wrapper
             self.client.on_message = self._on_message
             self.client.on_disconnect = self._on_disconnect
 
-            # Connect
+            # Track SUBSCRIBE acknowledgements too (see the note near
+            # confirm_timeout below for why: CONNACK alone isn't enough).
+            # client.subscribe is intercepted here — rather than only tracking
+            # calls made from _on_connect directly — so it also covers
+            # SCADAProtocol's overridden _on_connect without touching scada.py.
+            pending_sub_mids: set = set()
+            subs_done = threading.Event()
+            _orig_subscribe = self.client.subscribe
+
+            def _tracked_subscribe(topic, qos=0):
+                result = _orig_subscribe(topic, qos)
+                try:
+                    _, mid = result
+                    pending_sub_mids.add(mid)
+                except (TypeError, ValueError):
+                    pass
+                return result
+
+            self.client.subscribe = _tracked_subscribe
+
+            def _on_subscribe(client, userdata, mid, granted_qos, properties=None):
+                pending_sub_mids.discard(mid)
+                if not pending_sub_mids:
+                    subs_done.set()
+
+            self.client.on_subscribe = _on_subscribe
+
+            # paho's connect() only does the TCP handshake and sends the
+            # CONNECT packet; it does NOT wait for the broker's CONNACK. That
+            # is processed asynchronously by the network thread started by
+            # loop_start(), which is when on_connect actually fires and
+            # subscriptions get sent.
             self.client.connect(self.broker_ip, self.broker_port, keepalive=60)
             self.client.loop_start()
+
+            # Block briefly for that CONNACK confirmation instead of
+            # declaring victory on the socket connect alone. Without this,
+            # is_connected/health_check() report success before the broker
+            # has actually acknowledged the session — callers that immediately
+            # follow connect() with health_check() (e.g. the device
+            # connection-test diagnostic in connection_trace.py) would race
+            # the background thread and almost always see a false "connected
+            # but unhealthy" on the very first check.
+            confirm_timeout = max(3.0, min(self.read_timeout, 10.0))
+            if not self._connect_event.wait(confirm_timeout):
+                self.is_connected = False
+                msg = (
+                    f"MQTT connect to {self.broker_ip}:{self.broker_port} timed out "
+                    f"waiting for CONNACK after {confirm_timeout}s"
+                )
+                self.logger.error(msg)
+                raise ConnectionError(msg)
+            if self._connect_rc != 0:
+                self.is_connected = False
+                msg = f"MQTT broker rejected connection, rc={self._connect_rc}"
+                self.logger.error(msg)
+                raise ConnectionError(msg)
+
+            # CONNACK only confirms the session — the SUBSCRIBE requests sent
+            # from _on_connect are themselves acknowledged asynchronously
+            # (SUBACK), also via the network thread. A message published right
+            # after connect() returns can otherwise be silently missed forever
+            # (non-retained messages aren't redelivered) if the SUBACK hasn't
+            # landed yet. Best-effort: wait briefly, but don't fail connect()
+            # over it — a broker that never SUBACKs is unusual enough that
+            # refusing to proceed would be the wrong tradeoff.
+            if pending_sub_mids and not subs_done.wait(max(2.0, min(self.read_timeout, 5.0))):
+                self.logger.warning(
+                    "MQTT SUBSCRIBE not fully acknowledged before connect() returned "
+                    "(topics=%s) — messages published in this window may be missed",
+                    self.topics,
+                )
 
             self.is_connected = True
             self.is_running = True
             self.logger.info(f"Connected to MQTT broker {self.broker_ip}:{self.broker_port}")
             return True
 
+        except ConnectionError:
+            raise
         except Exception as e:
             self.is_connected = False
             self.logger.error(f"Failed to connect to MQTT broker: {e}")
@@ -223,11 +329,24 @@ class MQTTProtocol(BaseProtocol):
         self.logger.warning(f"MQTT disconnected with code: {rc}")
         self.is_connected = False
 
+    #: Sentinel distinguishing "field not found" from "field found, value None".
+    _MISSING = object()
+
     def _parse_message(
         self, message: Dict[str, Any], points: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
         Parse MQTT message and map to point readings.
+
+        Per point (in declared POINT_FIELDS order):
+        1. ``topic_filter`` — if set, the message's topic must match it
+           (MQTT wildcard semantics) or the point is skipped for this message.
+        2. ``payload_path`` — if set, follow the dotted path (e.g.
+           ``"data.value"``) into the parsed JSON payload.
+        3. Otherwise: JSON object payload → ``payload[code]``, falling back to
+           ``payload["value"]``; non-JSON/scalar payload → the raw payload
+           applied to every matching point.
+        4. The resolved value is coerced to the point's declared ``data_type``.
 
         Args:
             message: Raw message from queue
@@ -237,45 +356,94 @@ class MQTTProtocol(BaseProtocol):
             List of parsed readings.
         """
         results = []
+        topic = message.get("topic", "") or ""
+        raw_payload = message["payload"]
 
         try:
-            # Try to parse payload as JSON
-            payload = json.loads(message["payload"])
-
-            # If payload is a dict, create readings for matching points
-            if isinstance(payload, dict):
-                for point in points:
-                    point_code = point["code"]
-                    if point_code in payload:
-                        results.append({
-                            "code": point_code,
-                            "value": payload[point_code],
-                            "timestamp": message["timestamp"],
-                            "quality": "good",
-                            "topic": message["topic"],
-                        })
-            else:
-                # If not a dict, create single reading
-                if points:
-                    results.append({
-                        "code": points[0]["code"],
-                        "value": payload,
-                        "timestamp": message["timestamp"],
-                        "quality": "good",
-                        "topic": message["topic"],
-                    })
-
+            payload = json.loads(raw_payload)
         except json.JSONDecodeError:
-            # If not JSON, treat as string
-            if points:
+            payload = None  # not JSON — handled as a raw scalar/string below
+
+        for point in points:
+            try:
+                point_code = point["code"]
+                topic_filter = point.get("topic_filter") or ""
+                if topic_filter and not mqtt.topic_matches_sub(topic_filter, topic):
+                    continue
+
+                payload_path = point.get("payload_path") or ""
+                value = self._MISSING
+                if payload_path:
+                    resolved = self._follow_path(
+                        payload if payload is not None else raw_payload, payload_path
+                    )
+                    if resolved is not None:
+                        value = resolved
+                elif payload is None:
+                    # Non-JSON payload: treat as a raw string/scalar shared by
+                    # every point whose topic_filter (if any) matched above.
+                    value = raw_payload
+                elif isinstance(payload, dict):
+                    if point_code in payload:
+                        value = payload[point_code]
+                    elif "value" in payload:
+                        value = payload["value"]
+                else:
+                    # Bare JSON scalar (number/bool/string/list).
+                    value = payload
+
+                if value is self._MISSING:
+                    continue
+
                 results.append({
-                    "code": points[0]["code"],
-                    "value": message["payload"],
+                    "code": point_code,
+                    "value": self._coerce_value(value, point.get("data_type", "float")),
                     "timestamp": message["timestamp"],
                     "quality": "good",
-                    "topic": message["topic"],
+                    "topic": topic,
                 })
-        except Exception as e:
-            self.logger.error(f"Error parsing MQTT message: {e}")
+            except Exception as e:
+                self.logger.error(f"Error parsing MQTT message for point {point.get('code')}: {e}")
 
         return results
+
+    @staticmethod
+    def _follow_path(payload: Any, path: str) -> Any:
+        """Follow a dotted path (dict keys, list indices) into ``payload``.
+
+        ``payload`` may be a decoded JSON value or a raw string; a raw string
+        only resolves a path that immediately fails, returning ``None``.
+        """
+        cur = payload
+        for part in path.split("."):
+            if not part:
+                continue
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            elif isinstance(cur, list) and part.lstrip("-").isdigit():
+                idx = int(part)
+                if -len(cur) <= idx < len(cur):
+                    cur = cur[idx]
+                else:
+                    return None
+            else:
+                return None
+        return cur
+
+    @staticmethod
+    def _coerce_value(value: Any, data_type: str) -> Any:
+        """Best-effort coercion by declared data_type; leave as-is on failure."""
+        try:
+            if data_type == "int":
+                return int(float(value))
+            if data_type == "float":
+                return float(value)
+            if data_type == "bool":
+                if isinstance(value, str):
+                    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+                return bool(value)
+            if data_type == "string":
+                return str(value)
+        except (TypeError, ValueError):
+            return value
+        return value
