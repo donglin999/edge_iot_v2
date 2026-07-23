@@ -50,7 +50,13 @@ class MQTTProtocol(BaseProtocol):
         FieldSpec("mqtt_read_timeout", "读取超时(秒)", kind="float", default=5.0,
                   help_text="采集循环从消息队列拉数据时的最长等待时间;队列空闲超过该值即结束本轮读取"),
     )
-    IDENTITY_FIELDS = ("source_ip", "source_port", "mqtt_client_id")
+    # mqtt_client_id defaults to "" (auto-generated at connect time), so it
+    # must not be part of device identity: two devices on the same broker
+    # that both leave ClientID blank would collapse to the same identity
+    # tuple (ip, port, "") and get de-duplicated into one device on import.
+    # mqtt_topics is what actually distinguishes independent subscriptions on
+    # the same broker (mirrors the scada.py product_key+device_name pattern).
+    IDENTITY_FIELDS = ("source_ip", "source_port", "mqtt_topics")
 
     POINT_FIELDS = (
         FieldSpec("code", "测点编码", required=True,

@@ -259,9 +259,11 @@ class TestH4S7PartialFailure:
     def _make_proto(self, monkeypatch, bad_bytes):
         # Map address "N" -> start_byte N so the fake client can fail a
         # specific point; data_type uint16 -> 2-byte read.
+        # _parse_s7_address 现在多接一个可选 data_type 提示(用于把 DBD/MD 等
+        # double 类型读宽到 8 字节),mock 需跟着接受它。
         monkeypatch.setattr(
             s7_mod, "_parse_s7_address",
-            lambda addr: (0, 0, int(addr), 0, 2),
+            lambda addr, data_type=None: (0, 0, int(addr), 0, 2),
         )
 
         class _FakeClient:

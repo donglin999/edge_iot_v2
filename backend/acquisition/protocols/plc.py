@@ -6,7 +6,18 @@ import struct
 import time
 from typing import Any, Dict, List
 
-from .base import BaseProtocol, ConnectionError, ProtocolRegistry, ReadError
+from .base import (
+    BaseProtocol,
+    ConnectionError,
+    FieldSpec,
+    ProtocolMeta,
+    ProtocolRegistry,
+    ReadError,
+)
+
+#: Data types actually handled by ``_group_by_type`` -> ``_read_*`` dispatch
+#: below. Note the string branch key is ``"str"``, not ``"string"``.
+_MC_DATA_TYPES = ("int16", "int32", "float", "bool", "str")
 
 
 @ProtocolRegistry.register("mc")
@@ -19,10 +30,42 @@ class MitsubishiPLCProtocol(BaseProtocol):
     Implements batch reading for continuous registers.
     """
 
+    META = ProtocolMeta(
+        name="mc",
+        label="三菱 MC",
+        category="industrial-ethernet",
+        description="三菱 PLC MC 协议(Qna 兼容 3E 帧),以太网直连;按软元件地址(D/M/X/Y 等)读取。",
+    )
+
+    DEVICE_FIELDS = (
+        FieldSpec("source_ip", "PLC IP", required=True, example="192.168.1.10"),
+        FieldSpec("source_port", "端口", kind="int", default=6000, example=6000,
+                  help_text="需与 PLC 侧 MC 协议端口设置一致,常见 6000/5000/8000"),
+        FieldSpec("network_no", "网络号", kind="int", default=0,
+                  help_text="MC 协议网络号,单机直连一般为 0"),
+        FieldSpec("station_no", "站号", kind="int", default=0,
+                  help_text="MC 协议站号,单机直连一般为 0"),
+    )
+    IDENTITY_FIELDS = ("source_ip", "source_port")
+
+    POINT_FIELDS = (
+        FieldSpec("code", "测点编码", required=True, example="temperature"),
+        FieldSpec("address", "软元件地址", required=True, example="D100",
+                  help_text="D/M 等软元件地址为十进制;X/Y 为八进制,如 X20、Y1A0"),
+        FieldSpec("type", "数据类型", kind="enum", choices=_MC_DATA_TYPES, default="int16",
+                  help_text="int16/int32/float/bool/str"),
+        FieldSpec("num", "数量", kind="int", default=1,
+                  help_text="寄存器/字符数量;str 类型表示读取的字(word)长度"),
+        FieldSpec("coefficient", "系数", kind="float", default=1.0),
+        FieldSpec("precision", "精度(小数位)", kind="int", default=0),
+    )
+
     def __init__(self, device_config: Dict[str, Any]) -> None:
         super().__init__(device_config)
         self.ip = device_config.get("source_ip")
         self.port = device_config.get("source_port", 6000)
+        self.network_no = int(device_config.get("network_no", 0) or 0)
+        self.station_no = int(device_config.get("station_no", 0) or 0)
         self.plc = None
 
     def connect(self) -> bool:
@@ -32,6 +75,13 @@ class MitsubishiPLCProtocol(BaseProtocol):
             from lib.HslCommunication import MelsecMcNet
 
             self.plc = MelsecMcNet(self.ip, self.port)
+            # network_no/station_no are best-effort: HslCommunication's
+            # MelsecMcNet exposes them as plain attributes on some builds and
+            # not others, so guard with hasattr rather than assuming the API.
+            if hasattr(self.plc, "NetworkNumber"):
+                self.plc.NetworkNumber = self.network_no
+            if hasattr(self.plc, "NetworkStationNumber"):
+                self.plc.NetworkStationNumber = self.station_no
             result = self.plc.ConnectServer()
             if result.IsSuccess:
                 self.is_connected = True

@@ -38,7 +38,13 @@ except ImportError:  # pragma: no cover - graceful fallback
 
 
 _PLC_TYPES = ("S7-200", "S7-300", "S7-400", "S7-1200", "S7-1500")
-_S7_DATA_TYPES = ("bool", "byte", "int16", "uint16", "int32", "uint32", "float32", "string")
+_S7_DATA_TYPES = (
+    "bool", "byte", "int16", "uint16", "int32", "uint32",
+    "float32", "float64", "lreal", "string",
+)
+#: data_type spellings that mean the 8-byte IEEE-754 double (LReal on
+#: S7-1200/1500). Both are accepted since engineers commonly say "LReal".
+_DOUBLE_TYPES = ("float64", "lreal")
 
 
 _AREA_RE = re.compile(
@@ -52,11 +58,17 @@ _AREA_RE = re.compile(
 )
 
 
-def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
+def _parse_s7_address(address: str, data_type: str = "") -> Tuple[str, int, int, int, int]:
     """Return ``(area, db_number, start_byte, bit_offset, length)``.
 
     ``area`` is the snap7 ``Area`` enum value.  ``length`` is in bytes for
     everything except booleans (which read 1 byte and mask the bit).
+
+    ``data_type`` is an optional hint used only for the 32-bit "D" (double
+    word) address forms — ``DBD``/``MD``/``ID``/``QD``. Normally these are
+    4-byte reads (int32/uint32/float32), but when ``data_type`` names an
+    8-byte double (``float64``/``lreal``, e.g. S7-1200/1500 LReal) the read
+    length is widened to 8 bytes at the same start byte.
     """
     if not _SNAP7_AVAILABLE:
         raise RuntimeError("python-snap7 not installed")
@@ -76,6 +88,8 @@ def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
     if bit > 7:
         raise ValueError(f"S7 位偏移 {bit} 超出范围 0-7: {address!r}")
 
+    dword_len = 8 if (data_type or "").lower() in _DOUBLE_TYPES else 4
+
     # Map area → snap7.Area + size
     if code in ("DBX",):
         return Area.DB, db, byte, bit, 1
@@ -84,7 +98,7 @@ def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
     if code in ("DBW",):
         return Area.DB, db, byte, 0, 2
     if code in ("DBD",):
-        return Area.DB, db, byte, 0, 4
+        return Area.DB, db, byte, 0, dword_len
     if code in ("M", "MX"):
         return Area.MK, 0, byte, bit, 1
     if code == "MB":
@@ -92,7 +106,7 @@ def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
     if code == "MW":
         return Area.MK, 0, byte, 0, 2
     if code == "MD":
-        return Area.MK, 0, byte, 0, 4
+        return Area.MK, 0, byte, 0, dword_len
     if code in ("I", "IX"):
         return Area.PE, 0, byte, bit, 1
     if code == "IB":
@@ -100,7 +114,7 @@ def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
     if code == "IW":
         return Area.PE, 0, byte, 0, 2
     if code == "ID":
-        return Area.PE, 0, byte, 0, 4
+        return Area.PE, 0, byte, 0, dword_len
     if code in ("Q", "QX"):
         return Area.PA, 0, byte, bit, 1
     if code == "QB":
@@ -108,7 +122,7 @@ def _parse_s7_address(address: str) -> Tuple[str, int, int, int, int]:
     if code == "QW":
         return Area.PA, 0, byte, 0, 2
     if code == "QD":
-        return Area.PA, 0, byte, 0, 4
+        return Area.PA, 0, byte, 0, dword_len
     raise ValueError(f"未识别的 S7 区域 {code}")
 
 
@@ -126,6 +140,8 @@ def _decode(buf: bytes, data_type: str, bit: int) -> Any:
         return struct.unpack(">I", buf)[0]
     if dt in ("float32", "real"):
         return struct.unpack(">f", buf)[0]
+    if dt in _DOUBLE_TYPES:
+        return struct.unpack(">d", buf)[0]
     if dt == "byte":
         return buf[0]
     if dt == "string":
@@ -153,7 +169,9 @@ class SiemensS7Protocol(BaseProtocol):
                   help_text="S7-1200/1500 一般为 0"),
         FieldSpec("slot", "Slot 号", kind="int", default=1,
                   help_text="S7-1200/1500 一般为 1, S7-300/400 一般为 2"),
-        FieldSpec("plc_type", "PLC 型号", kind="enum", choices=_PLC_TYPES, default="S7-1200"),
+        FieldSpec("plc_type", "PLC 型号", kind="enum", choices=_PLC_TYPES, default="S7-1200",
+                  help_text="S7-200 经典款走 TSAP 而非 rack/slot;当前 rack/slot 连接方式主要适配 "
+                            "S7-300/400/1200/1500"),
         FieldSpec("timeout", "超时(秒)", kind="float", default=5.0),
     )
     IDENTITY_FIELDS = ("source_ip", "rack", "slot")
@@ -163,7 +181,10 @@ class SiemensS7Protocol(BaseProtocol):
         FieldSpec("address", "地址", required=True,
                   help_text="DB1.DBD0 / DB10.DBX2.3 / MW100 / I0.0 / QW20", example="DB1.DBD0"),
         FieldSpec("data_type", "数据类型", kind="enum", choices=_S7_DATA_TYPES,
-                  default="float32"),
+                  default="float32",
+                  help_text="float64/lreal 用于 S7-1200/1500 的 LReal(8 字节,地址仍填 DBD 起始字节); "
+                            "string 当前按地址区域固定长度读取(如 DBB=1/DBW=2/DBD=4 字节),暂不支持自定义 "
+                            "字符串长度,超长字符串会被截断"),
         FieldSpec("unit", "单位", default=""),
         FieldSpec("description", "中文名称", default=""),
         FieldSpec("coefficient", "系数", kind="float", default=1.0),
@@ -214,9 +235,12 @@ class SiemensS7Protocol(BaseProtocol):
         errors: List[str] = []
         for point in points:
             try:
-                area, db, byte, bit, length = _parse_s7_address(str(point.get("address", "")))
+                data_type = point.get("data_type", "uint16")
+                area, db, byte, bit, length = _parse_s7_address(
+                    str(point.get("address", "")), data_type
+                )
                 buf = self.client.read_area(area, db, byte, length)
-                value = _decode(bytes(buf), point.get("data_type", "uint16"), bit)
+                value = _decode(bytes(buf), data_type, bit)
                 results.append({
                     "code": point["code"],
                     "value": value,

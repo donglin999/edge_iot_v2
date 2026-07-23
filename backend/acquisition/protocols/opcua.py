@@ -32,12 +32,12 @@ except ImportError:  # pragma: no cover
     _OPCUA_AVAILABLE = False
 
 
-_SECURITY_POLICIES = (
-    "None",
-    "Basic256Sha256",
-    "Aes128Sha256RsaOaep",
-    "Aes256Sha256RsaPss",
-)
+# NOTE: encrypted policies are intentionally NOT exposed as choices yet.
+# ``_async_connect`` below calls ``set_security_string(f"{security},Sign,,")``
+# with empty cert/key paths — asyncua requires a client certificate + private
+# key for any non-"None" policy, so selecting one here can never actually
+# connect. Re-add the encrypted options once cert/key upload is wired in.
+_SECURITY_POLICIES = ("None",)
 
 
 class _AsyncRunner:
@@ -74,7 +74,8 @@ class OPCUAProtocol(BaseProtocol):
                   example="opc.tcp://192.168.1.50:4840",
                   help_text="OPC-UA 服务端点,以 opc.tcp:// 开头"),
         FieldSpec("security_policy", "安全策略", kind="enum",
-                  choices=_SECURITY_POLICIES, default="None"),
+                  choices=_SECURITY_POLICIES, default="None",
+                  help_text="当前仅支持无加密(None);加密策略需要客户端证书/私钥支持,后续版本再加"),
         FieldSpec("opcua_username", "用户名", default=""),
         FieldSpec("opcua_password", "密码", kind="secret", default=""),
         FieldSpec("timeout", "超时(秒)", kind="float", default=5.0),

@@ -49,8 +49,12 @@ class SimulatorProtocol(BaseProtocol):
     )
 
     DEVICE_FIELDS = (
-        FieldSpec("source_ip", "标识", required=True, default="sim-1",
-                  help_text="仅用于区分不同模拟设备,不会真的去连",
+        # required=False: base.py's validator only flags "missing" when BOTH
+        # required=True and default is None — with a non-empty default set,
+        # required=True was already a no-op here while still drawing a
+        # misleading required-field asterisk in the frontend form.
+        FieldSpec("source_ip", "标识", required=False, default="sim-1",
+                  help_text="仅用于区分不同模拟设备,不会真的去连;留空则用默认值 sim-1",
                   example="sim-1"),
         FieldSpec("sim_waveform", "波形", kind="enum", choices=_WAVEFORMS,
                   default="sine", help_text="sine 正弦 / ramp 锯齿 / random 随机 / constant 恒定 / step 阶跃"),

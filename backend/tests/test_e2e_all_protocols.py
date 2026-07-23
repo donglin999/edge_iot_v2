@@ -478,6 +478,11 @@ def test_every_user_facing_protocol_has_a_script():
     # simulator 是开发用的假设备,只有 EDGE_ENABLE_SIMULATOR=1 才注册,
     # 不属于要跑现场链路的协议。
     exposed.discard("simulator")
+    # 三菱 MC(plc.py)刻意不接入生产协议下拉 —— 没在 protocols/__init__.py 里
+    # import,所以对用户不可见。但别的测试(test_plc_protocol_fields)会 import
+    # 该模块,Python 会把 plc 挂到父包属性上污染 prod_modules,导致 'mc' 冒出来。
+    # 它本就不是现场协议,排除掉;若将来真把 mc 接进 __init__,应同时补 SCRIPTS 项。
+    exposed.discard("mc")
     assert exposed == set(SCRIPTS), (
         f"缺剧本: {exposed - set(SCRIPTS)};多余剧本: {set(SCRIPTS) - exposed}"
     )

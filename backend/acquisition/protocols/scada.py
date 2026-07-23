@@ -106,10 +106,16 @@ class SCADAProtocol(MQTTProtocol):
         FieldSpec("scada_device_name", "设备名", required=True,
                   example="A0201010001150403",
                   help_text="话题中的 {device_name} 段"),
-        FieldSpec("scada_topic_template", "话题模板", required=True,
+        # required=False: base.py's validator only flags a field as "missing"
+        # when BOTH required=True and default is None — with a non-empty
+        # default set, required=True here was a no-op (never actually
+        # enforced) while still drawing a misleading required-field asterisk
+        # in the frontend form. This has a sane default, so it isn't required.
+        FieldSpec("scada_topic_template", "话题模板", required=False,
                   default=DEFAULT_TOPIC_TEMPLATE,
                   example=DEFAULT_TOPIC_TEMPLATE,
-                  help_text="支持 {product_key} {device_name} {code} 占位符;{code} 为逐测点编码"),
+                  help_text="支持 {product_key} {device_name} {code} 占位符;{code} 为逐测点编码;"
+                            "留空则使用默认模板"),
     )
     IDENTITY_FIELDS = ("source_ip", "source_port", "scada_product_key", "scada_device_name")
 
