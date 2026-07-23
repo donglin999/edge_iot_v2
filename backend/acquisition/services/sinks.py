@@ -338,16 +338,24 @@ class InfluxDBSink(Sink):
             )
             return
 
-        # Write succeeded — remove exactly the points we wrote. Other
-        # consume() calls may have appended new points concurrently;
-        # those stay in the buffer for the next flush.
+        # write() returning without raising means the batch was *accepted*
+        # for writing — buffer management (removing it so it isn't retried)
+        # is correct to do here regardless of storage backend. It does NOT
+        # mean the batch is durably written: under InfluxDBStorage's async
+        # batching write_api, write() only enqueues, and success/failure is
+        # decided later on a library thread. See total_written's docstring
+        # below for where the actual confirmed count comes from.
         with self._lock:
             del self._buffer[: len(batch)]
             self._last_flush = now
             recovered_from = self._fail_count
             self._fail_count = 0
             self._next_flush_at = 0.0
-            # Only count points that actually made it to storage.
+            # Fallback counter for storage backends that do NOT self-report
+            # a confirmed-write count (see total_written property) — e.g.
+            # synchronous mocks/test doubles where write() returning True
+            # already means the data landed. Ignored by the property when
+            # the live storage does track its own confirmed count.
             self._total_written += len(batch)
             self._flush_in_progress = False
         if recovered_from:
@@ -359,7 +367,38 @@ class InfluxDBSink(Sink):
 
     @property
     def total_written(self) -> int:
-        """Cumulative successful-write count since sink construction."""
+        """Cumulative count of points *confirmed* written to storage.
+
+        total_written = 已确认落库点数. Enqueuing (in-flight/undecided) does
+        NOT advance it; a batch that fails and spills to disk does NOT
+        advance it; a spilled batch that later replays successfully DOES
+        advance it, at replay time.
+
+        Storage backends that track their own confirmed-write count expose
+        it as an int ``confirmed_written`` attribute (see
+        ``storage.influxdb.InfluxDBStorage`` — needed because its write()
+        only enqueues under the async batching write_api, so write()
+        returning without raising is not proof of a durable write; see that
+        module's docstring for the full accounting). When present and an
+        int, this property defers to it entirely instead of the ``flush()``
+        bookkeeping above. ``getattr(..., None)`` + ``isinstance(..., int)``
+        (rather than ``hasattr``) deliberately treats a bare
+        ``unittest.mock.MagicMock`` storage — which auto-vivifies *any*
+        attribute access as a non-int Mock — as "does not track its own
+        count", so existing tests built against synchronous mock storages
+        (where write() returning True already means success) keep reading
+        the flush()-side ``_total_written`` fallback unchanged.
+        """
+        # getattr(self, "_storage", ...) rather than self._storage: some
+        # existing tests construct a bare InfluxDBSink via __new__ and only
+        # set _total_written, without ever setting _storage (see
+        # tests/test_pipeline_watchdog.py). That's a legitimate use of this
+        # property in isolation from the rest of the sink, so it must not
+        # require _storage to exist.
+        storage = getattr(self, "_storage", None)
+        confirmed = getattr(storage, "confirmed_written", None)
+        if isinstance(confirmed, int):
+            return confirmed
         return self._total_written
 
     def close(self) -> None:

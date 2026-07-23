@@ -20,9 +20,13 @@ backend/influx_spill.sqlite3。
 """
 from __future__ import annotations
 
+import shutil
 import socket
+import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from types import SimpleNamespace
 
 import pytest
@@ -108,6 +112,77 @@ def _bounded_disconnect(storage, timeout: float = 5.0) -> None:
     t = threading.Thread(target=lambda: (storage.disconnect(), done.set()), daemon=True)
     t.start()
     done.wait(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Agent G addition: a real, reachable InfluxDB for the positive total_written
+# case (see TestTotalWrittenConfirmedCounting below). Everything else in this
+# file deliberately points at dead ports; this is the one place a genuine
+# backend is needed to prove the confirmed-count path actually reaches N, not
+# just that it never over-counts. Own throwaway container on the G port band
+# (15590) — NEVER the shared edge-test-influx (8099) — created and removed
+# entirely inside the test that uses it.
+# ---------------------------------------------------------------------------
+
+_INFLUX_G_CONTAINER = "edge-test-influx-g"
+_INFLUX_G_PORT = 15590
+_INFLUX_G_ORG = "edge-g"
+_INFLUX_G_BUCKET = "telemetry-g"
+_INFLUX_G_TOKEN = "edge-test-token-g-0123456789"
+
+
+def _docker_available() -> bool:
+    return shutil.which("docker") is not None
+
+
+def _start_real_influx_container() -> None:
+    """Start a throwaway InfluxDB 2.x container for a single test.
+
+    Image (``influxdb:2.7``) is expected to already be present locally
+    (same image the shared edge-test-influx/ac_test_influxdb containers use)
+    — this deliberately does not attempt a pull, which may be unavailable
+    in this environment.
+    """
+    # Defensive: remove any same-named container leaked by a previous
+    # aborted run before starting a fresh one.
+    subprocess.run(
+        ["docker", "rm", "-f", _INFLUX_G_CONTAINER], capture_output=True, check=False,
+    )
+    subprocess.run(
+        [
+            "docker", "run", "-d", "--name", _INFLUX_G_CONTAINER,
+            "-p", f"{_INFLUX_G_PORT}:8086",
+            "-e", "DOCKER_INFLUXDB_INIT_MODE=setup",
+            "-e", "DOCKER_INFLUXDB_INIT_USERNAME=edge",
+            "-e", "DOCKER_INFLUXDB_INIT_PASSWORD=edge12345678",
+            "-e", f"DOCKER_INFLUXDB_INIT_ORG={_INFLUX_G_ORG}",
+            "-e", f"DOCKER_INFLUXDB_INIT_BUCKET={_INFLUX_G_BUCKET}",
+            "-e", f"DOCKER_INFLUXDB_INIT_ADMIN_TOKEN={_INFLUX_G_TOKEN}",
+            "influxdb:2.7",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+
+    deadline = time.monotonic() + 30.0
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{_INFLUX_G_PORT}/health", timeout=1.0
+            ) as resp:
+                if resp.status == 200:
+                    return
+        except (urllib.error.URLError, OSError) as exc:  # noqa: PERF203
+            last_err = exc
+        time.sleep(0.5)
+    _stop_real_influx_container()
+    raise RuntimeError(f"{_INFLUX_G_CONTAINER} did not become healthy in time: {last_err}")
+
+
+def _stop_real_influx_container() -> None:
+    subprocess.run(
+        ["docker", "rm", "-f", _INFLUX_G_CONTAINER], capture_output=True, check=False,
+    )
 
 
 # ===========================================================================
@@ -402,7 +477,8 @@ class TestReadLoopNotBlockedByUnreachableInflux:
 
 
 # ===========================================================================
-# 4. 入库堵塞:spill 真实触发 + total_written 语义缺口(已知问题,未修 —— 见汇报)
+# 4. 入库堵塞:spill 真实触发 + total_written 语义(Agent G 已修 —— 见
+#    storage/influxdb.py 的 confirmed_written)
 # ===========================================================================
 
 
@@ -433,30 +509,27 @@ class TestInfluxSpillOnRealUnreachableBackend:
         finally:
             _bounded_disconnect(storage)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG (found, NOT fixed — see report): InfluxDBSink.flush() treats "
-            "storage.write() not raising as a confirmed success and immediately "
-            "increments total_written + drops the batch from _buffer. Under the "
-            "async batching write_api (C2 design, storage/influxdb.py) write() "
-            "only means 'enqueued for a background HTTP attempt' — the actual "
-            "success/failure is resolved later via _on_write_success/"
-            "_on_write_error on a different thread. So total_written is "
-            "inflated for batches that end up failing and spilling to disk: "
-            "the documented invariant in acquisition_service.py ('total_"
-            "points_read 来自 InfluxDBSink.total_written,只在写成功时递增') "
-            "does not hold once the backend is unreachable. Data itself is "
-            "NOT lost (the spill queue still gets it), only the *count* lies. "
-            "Left as xfail(strict) rather than fixed: closing this gap needs "
-            "InfluxDBSink.total_written to be driven by InfluxDBStorage's "
-            "success callback instead of write()'s return value, which "
-            "changes a counting contract several other agents' tests assert "
-            "on synchronously against mocked storages — too invasive for this "
-            "agent's scope without coordination."
-        ),
-    )
-    def test_total_written_is_not_inflated_by_batches_that_end_up_failing(self, tmp_path):
+    def test_total_written_stays_zero_while_spill_grows_against_dead_port(self, tmp_path):
+        """FIXED (was xfail — see storage/influxdb.py's confirmed_written):
+        InfluxDBSink.flush() used to treat storage.write() not raising as a
+        confirmed success and immediately increment total_written + drop the
+        batch from _buffer. Under the async batching write_api (C2 design,
+        storage/influxdb.py) write() only means 'enqueued for a background
+        HTTP attempt' — the actual success/failure is resolved later via
+        _on_write_success/_on_write_error on a different thread. So
+        total_written was inflated for batches that ended up failing and
+        spilling to disk, breaking the documented invariant in
+        acquisition_service.py ('total_points_read 来自 InfluxDBSink.
+        total_written,只在写成功时递增').
+
+        Fix: InfluxDBSink.total_written now defers to InfluxDBStorage.
+        confirmed_written, which only advances on a confirmed success
+        (async success_callback / docker-exec sync success / spill replay
+        success) — never on write() merely being accepted. This test
+        asserts (a) total_written reads 0 at every point during the run,
+        not just eventually, and (b) the spill queue genuinely received the
+        failed batch (proving the failure path really executed, not that
+        nothing happened yet)."""
         port = _free_port()
         storage = _make_unreachable_storage(
             tmp_path, port, batch_size=50, flush_interval=200,
@@ -484,17 +557,90 @@ class TestInfluxSpillOnRealUnreachableBackend:
 
             for i in range(_INFLUX_BATCH_SIZE):  # exactly crosses the flush trigger once
                 sink.consume(_reading("p1", value=i))
+                # Sampled on every iteration, not just at the end: must
+                # never read positive at any point, "恒 0" not "eventually 0".
+                assert sink.total_written == 0
 
-            # Give the async writer a moment; regardless of outcome the sink
-            # already (wrongly) counted the batch as written the instant
-            # write() returned without raising.
-            time.sleep(0.5)
+            # Wait for the async writer to actually give up and spill —
+            # proves the failure path really ran to completion.
+            spilled = _wait_until(lambda: storage.spill_pending > 0, timeout=15.0, interval=0.2)
+            assert spilled, (
+                "spill queue never received a batch from a genuinely "
+                "unreachable backend within 15s"
+            )
+            assert storage.spill_pending >= 1
+
+            # Even after the batch is confirmed-failed and durably spilled,
+            # total_written must still read 0 — nothing was ever written.
             assert sink.total_written == 0, (
                 f"total_written={sink.total_written} but nothing was durably "
-                f"confirmed written yet (backend unreachable)"
+                f"confirmed written (backend unreachable, batch spilled)"
             )
+            assert storage.confirmed_written == 0
         finally:
             _bounded_disconnect(storage)
+
+    def test_total_written_reaches_n_once_confirmed_by_a_real_reachable_influxdb(self, tmp_path):
+        """Positive case for the same fix: against a real, reachable
+        InfluxDB (own throwaway container, edge-test-influx-g on 15590 —
+        never the shared edge-test-influx), N points written through the
+        sink must eventually make total_written == N once the async batching
+        writer actually confirms them. Proves the fix advances the counter
+        for real successes, not just that it stays at 0 for failures."""
+        if not _docker_available():
+            pytest.skip("docker not available in this environment")
+
+        _start_real_influx_container()
+        storage = None
+        try:
+            cfg = {
+                "url": f"http://127.0.0.1:{_INFLUX_G_PORT}",
+                "token": _INFLUX_G_TOKEN,
+                "org": _INFLUX_G_ORG,
+                "bucket": _INFLUX_G_BUCKET,
+                "spill_db_path": str(tmp_path / "g_confirm_spill.sqlite3"),
+                "batch_size": 20,
+                "flush_interval": 200,
+            }
+            storage = InfluxDBStorage(cfg)
+            storage.connect()
+
+            sink = InfluxDBSink.__new__(InfluxDBSink)
+            sink.session = SimpleNamespace(id=7)
+            sink.device_groups = {}
+            sink._lock = threading.Lock()
+            sink._buffer = []
+            sink._last_flush = time.time()
+            sink._storage = storage
+            sink._total_written = 0
+            sink._fail_count = 0
+            sink._next_flush_at = 0.0
+            sink._dropped_total = 0
+            sink._flush_in_progress = False
+            sink._storage_reinit_next_at = 0.0
+            sink._storage_reinit_attempts = 0
+            sink._storage_reinit_in_progress = False
+            sink._point_meta = {"p1": {
+                "device": SimpleNamespace(code="d1", site=SimpleNamespace(code="s1"), metadata={}),
+                "coefficient": 1.0, "precision": 2, "template_name": "", "template_unit": "",
+            }}
+
+            n = 45  # below the batch trigger (50) -> exercises the flush() tail too
+            for i in range(n):
+                sink.consume(_reading("p1", value=float(i)))
+            sink.flush()  # force the tail batch out instead of waiting for the timeout
+
+            reached = _wait_until(lambda: sink.total_written == n, timeout=20.0, interval=0.2)
+            assert reached, (
+                f"total_written={sink.total_written} did not reach {n} against "
+                f"a live, reachable InfluxDB within 20s"
+            )
+            assert storage.confirmed_written == n
+            assert storage.spill_pending == 0
+        finally:
+            if storage is not None:
+                _bounded_disconnect(storage)
+            _stop_real_influx_container()
 
 
 # ===========================================================================

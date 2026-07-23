@@ -96,16 +96,20 @@ class SpillQueue:
             finally:
                 conn.close()
 
-    def peek_batch(self, limit: int) -> List[Tuple[int, str]]:
-        """Return up to ``limit`` oldest rows as ``(id, payload)`` without
-        removing them — callers delete only after a successful replay."""
+    def peek_batch(self, limit: int) -> List[Tuple[int, str, int]]:
+        """Return up to ``limit`` oldest rows as ``(id, payload, points)``
+        without removing them — callers delete only after a successful
+        replay. ``points`` (added for total_written confirmation counting —
+        see storage/influxdb.py's ``_drain_spill_once``) is whatever was
+        recorded at ``push()`` time; existing 2-tuple unpacking of the first
+        two elements (``r[0]``, ``r[1]``) keeps working unchanged."""
         if limit <= 0:
             return []
         with self._lock:
             conn = self._connect()
             try:
                 cur = conn.execute(
-                    "SELECT id, payload FROM spill ORDER BY id ASC LIMIT ?",
+                    "SELECT id, payload, points FROM spill ORDER BY id ASC LIMIT ?",
                     (int(limit),),
                 )
                 return cur.fetchall()

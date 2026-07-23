@@ -199,3 +199,99 @@ class TestOutageRecovery:
         # Replay failed -> nothing deleted, data still safe on disk.
         assert s._spill.count() == 1
         assert s._consecutive_failures == 1
+
+
+# ---------------------------------------------------------------------------
+# confirmed_written (total_written counting fix — see storage/influxdb.py's
+# module docstring and InfluxDBSink.total_written in
+# acquisition/services/sinks.py for the full accounting rules)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmedWritten:
+    """confirmed_written must advance ONLY from a confirmed success — the
+    async batching success_callback, a successful spill replay, or a
+    successful docker-exec sync write — never from write()/write_api.write()
+    merely being accepted (that only means "enqueued", per C2's async
+    batching design)."""
+
+    def test_starts_at_zero(self, tmp_path):
+        s = _make_storage(tmp_path)
+        assert s.confirmed_written == 0
+
+    def test_error_callback_does_not_advance_it(self, tmp_path):
+        s = _make_storage(tmp_path)
+        s._on_write_error(("b", "o", "ns"), _BATCH_A, RuntimeError("down"))
+        s._on_write_error(("b", "o", "ns"), _BATCH_B, RuntimeError("down"))
+        # 2 batches spilled (1 + 5 points) but NOTHING confirmed written.
+        assert s._spill.pending_points() == 6
+        assert s.confirmed_written == 0
+
+    def test_success_callback_counts_lines_in_the_confirmed_payload(self, tmp_path):
+        s = _make_storage(tmp_path)
+        s._on_write_success(("b", "o", "ns"), _BATCH_A)  # 1 line
+        assert s.confirmed_written == 1
+        s._on_write_success(("b", "o", "ns"), _BATCH_B)  # 5 newline-joined lines
+        assert s.confirmed_written == 6
+
+    def test_success_callback_accepts_bytes_payload(self, tmp_path):
+        """The real influxdb-client library passes ``data`` as bytes to the
+        success callback (matching what _on_write_error already handles for
+        the spill path) — must decode, not just accept str."""
+        s = _make_storage(tmp_path)
+        s._on_write_success(("b", "o", "ns"), _BATCH_B.encode())
+        assert s.confirmed_written == 5
+
+    def test_spill_replay_success_advances_confirmed_written_by_the_batchs_points(
+        self, tmp_path,
+    ):
+        """The case task item 3 calls out explicitly: a batch that failed
+        and spilled, then later replayed successfully, DOES count — at
+        replay time, not at the original (failed) write() call."""
+        s = _make_storage(tmp_path)
+        s._on_write_error(("b", "o", "ns"), _BATCH_A, RuntimeError("down"))  # 1 point spilled
+        s._on_write_error(("b", "o", "ns"), _BATCH_B, RuntimeError("down"))  # 5 points spilled
+        assert s.confirmed_written == 0  # nothing confirmed yet, only spilled
+
+        s.is_connected = True
+        s._consecutive_failures = 0
+        s.replay_api = _FakeReplayApi()
+        s._drain_spill_once()
+
+        assert s._spill.count() == 0
+        # Both spilled batches (1 + 5 points) replayed successfully -> now
+        # confirmed. This mirrors _spill.pending_points() before the drain.
+        assert s.confirmed_written == 6
+
+    def test_spill_replay_failure_does_not_advance_confirmed_written(self, tmp_path):
+        s = _make_storage(tmp_path)
+        s._on_write_error(("b", "o", "ns"), _BATCH_A, RuntimeError("down"))
+        s.is_connected = True
+        s._consecutive_failures = 0
+        s.replay_api = _FakeReplayApi(fail_times=1)  # still down
+
+        s._drain_spill_once()
+
+        assert s._spill.count() == 1  # retained, not replayed
+        assert s.confirmed_written == 0
+
+    def test_confirmed_written_is_thread_safe_under_concurrent_success_callbacks(self, tmp_path):
+        """_on_write_success runs on a library callback thread; concurrent
+        callbacks (e.g. two in-flight batches resolving close together)
+        must not lose increments to a lost-update race."""
+        import threading
+
+        s = _make_storage(tmp_path)
+        line = "m,site=s1 v=1 1700000000000000000"  # 1 point per callback
+
+        def fire():
+            for _ in range(200):
+                s._on_write_success(("b", "o", "ns"), line)
+
+        threads = [threading.Thread(target=fire) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert s.confirmed_written == 8 * 200

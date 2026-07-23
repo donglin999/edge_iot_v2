@@ -18,6 +18,18 @@ Throughput & reliability design (issue XIU-3):
 
 * **M5 — cardinality** is handled by the producer (``InfluxDBSink``): only
   low-cardinality tags reach this layer.
+
+* **total_written counting (XIU follow-up).** Because the batching
+  ``write()`` above only *enqueues*, it must never be read as "written".
+  ``confirmed_written`` is the durable counter: it advances only from
+  ``_on_write_success`` (async batch confirmed), a successful
+  ``_write_via_docker`` call (synchronous — return code IS the confirmation),
+  or a successful spill-queue replay in ``_drain_spill_once`` (a batch that
+  failed and was spilled, replayed later, confirmed then). Enqueuing,
+  in-flight/undecided batches, and batches that fail and spill (until they
+  replay) do NOT advance it. ``InfluxDBSink.total_written`` (see
+  ``acquisition/services/sinks.py``) reads this counter instead of bumping
+  its own the instant ``write()`` returns without raising.
 """
 from __future__ import annotations
 
@@ -94,6 +106,27 @@ class InfluxDBStorage(BaseStorage):
         self._consecutive_failures = 0
         self._last_success_time = 0.0
         self._last_failure_time = 0.0
+
+        # --- total_written counting fix -------------------------------------
+        # ``confirmed_written`` is the count of points *durably confirmed*
+        # written to InfluxDB — as opposed to merely accepted for a
+        # background write attempt. Under the batching write_api (C2), the
+        # public write() method only enqueues; success or failure is decided
+        # later, asynchronously, on a library thread via
+        # _on_write_success/_on_write_error. Counting on write()'s return
+        # (as InfluxDBSink.flush() used to) therefore counted batches that
+        # went on to fail and spill — inflating the "rows written" reading.
+        #
+        # This counter is incremented ONLY from confirmed-success points:
+        #   * _on_write_success (async batching callback)
+        #   * a successful docker-exec synchronous write (_write_via_docker)
+        #   * a successful spill-queue replay write (_drain_spill_once)
+        # It is never incremented merely because write()/write_api.write()
+        # returned without raising. Mutated from multiple threads (library
+        # callback thread, replay thread, docker-exec caller thread), hence
+        # its own lock separate from anything sink-side.
+        self._confirmed_lock = threading.Lock()
+        self._confirmed_written = 0
 
         # Durable spill queue is created eagerly so failed batches can be
         # persisted even if a later connect() attempt fails.
@@ -238,7 +271,14 @@ class InfluxDBStorage(BaseStorage):
 
     # --------------------------------------------------------- write callbacks
     def _on_write_success(self, conf: Any, data: Any) -> None:
-        """Batching api success callback — clears the circuit breaker."""
+        """Batching api success callback — clears the circuit breaker.
+
+        This is the *only* confirmation that a batch enqueued via the async
+        batching write_api actually landed in InfluxDB, so it is also where
+        ``confirmed_written`` advances for that path. ``data`` is the line
+        protocol payload the library just wrote — count its lines the same
+        way ``_on_write_error`` already does for the spill queue.
+        """
         if self._consecutive_failures:
             self.logger.info(
                 "InfluxDB write recovered after %d consecutive failure(s)",
@@ -246,6 +286,9 @@ class InfluxDBStorage(BaseStorage):
             )
         self._consecutive_failures = 0
         self._last_success_time = time.time()
+        line_protocol = data.decode() if isinstance(data, (bytes, bytearray)) else str(data or "")
+        if line_protocol:
+            self._add_confirmed(self._count_lines(line_protocol))
 
     def _on_write_error(self, conf: Any, data: Any, exception: Exception) -> None:
         """Batching api error callback — spill the failed batch (M4)."""
@@ -328,6 +371,16 @@ class InfluxDBStorage(BaseStorage):
             self._consecutive_failures = 0
             self._last_success_time = time.time()
             replayed += len(rows)
+            # A batch that was spilled (because the async writer's error
+            # callback fired) and has now replayed successfully via the
+            # SYNCHRONOUS replay_api IS a confirmed write — count it here.
+            # ``r[2]`` is the per-row point count SpillQueue recorded at
+            # push() time (falls back to a line count if a row predates
+            # that column being populated, e.g. points=0 default).
+            replayed_points = sum(
+                (r[2] if len(r) > 2 and r[2] else self._count_lines(r[1])) for r in rows
+            )
+            self._add_confirmed(replayed_points)
 
         if replayed:
             self.logger.info(
@@ -351,6 +404,25 @@ class InfluxDBStorage(BaseStorage):
         if not line_protocol:
             return 0
         return line_protocol.count("\n") + 1
+
+    def _add_confirmed(self, n: int) -> None:
+        """Advance the confirmed-write counter. Thread-safe — called from
+        the library's callback thread, the replay thread, and (docker_mode)
+        whatever thread called write()."""
+        if n <= 0:
+            return
+        with self._confirmed_lock:
+            self._confirmed_written += n
+
+    @property
+    def confirmed_written(self) -> int:
+        """Cumulative count of points durably confirmed written to
+        InfluxDB by this storage instance — see the definition and
+        increment sites documented on ``self._confirmed_written`` in
+        ``__init__``. This is what ``InfluxDBSink.total_written`` reads
+        for this storage backend instead of trusting write()'s return."""
+        with self._confirmed_lock:
+            return self._confirmed_written
 
     @property
     def spill_pending(self) -> int:
@@ -595,6 +667,10 @@ class InfluxDBStorage(BaseStorage):
                 self.logger.debug(f"Successfully wrote {len(points)} points via docker exec")
                 self._consecutive_failures = 0
                 self._last_success_time = time.time()
+                # docker_mode is a synchronous write path (subprocess.run
+                # already blocked for the result) — a 0 return code IS a
+                # confirmed write, unlike the async batching write() path.
+                self._add_confirmed(len(points))
                 return True
             else:
                 self._consecutive_failures += 1
