@@ -208,9 +208,10 @@ class FakeS7Client:
     def set_connection_type(self, value) -> None:
         self.connection_type = value
 
-    def connect(self, ip, rack, slot) -> None:
+    def connect(self, ip, rack, slot, tcp_port: int = 102) -> None:
         if FakeS7Client.fail:
             raise OSError("模拟:PLC 不可达")
+        self.tcp_port = tcp_port
         self._connected = True
 
     def get_connected(self) -> bool:

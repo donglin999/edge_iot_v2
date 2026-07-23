@@ -195,6 +195,7 @@ class SiemensS7Protocol(BaseProtocol):
         self.ip = device_config.get("source_ip")
         self.rack = int(device_config.get("rack", 0))
         self.slot = int(device_config.get("slot", 1))
+        self.port = int(device_config.get("source_port", 102) or 102)
         self.timeout = float(device_config.get("timeout", 5.0))
         self.client = None
 
@@ -204,10 +205,16 @@ class SiemensS7Protocol(BaseProtocol):
         try:
             self.client = snap7.client.Client()
             self.client.set_connection_type(3)  # OP connection (default for HMI)
-            self.client.connect(self.ip, self.rack, self.slot)
+            # NOTE: source_port is device-configurable (FieldSpec default 102)
+            # but was never actually threaded through here — every connect()
+            # silently hit the hardcoded snap7 default (102) regardless of
+            # what the device row said. Real PLCs almost always sit on 102,
+            # but simulators / NAT port-forwards that expose a different
+            # port were unreachable with no error explaining why.
+            self.client.connect(self.ip, self.rack, self.slot, self.port)
             self.is_connected = self.client.get_connected()
             if self.is_connected:
-                self.logger.info("Connected to S7 PLC %s rack=%d slot=%d", self.ip, self.rack, self.slot)
+                self.logger.info("Connected to S7 PLC %s:%d rack=%d slot=%d", self.ip, self.port, self.rack, self.slot)
             return self.is_connected
         except Exception as exc:  # noqa: BLE001
             self.is_connected = False
