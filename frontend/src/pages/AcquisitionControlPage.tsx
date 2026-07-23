@@ -3,6 +3,7 @@ import type { AcqTask, AcquisitionSession } from '../services/acquisitionApi';
 import { fetchTasks, fetchActiveSessions } from '../services/acquisitionApi';
 import { isAbortError } from '../services/http';
 import TaskControlPanel from '../components/acquisition/TaskControlPanel';
+import TaskFormModal from '../components/acquisition/TaskFormModal';
 import { useWebSocket, WebSocketStatus, WebSocketMessage } from '../hooks/useWebSocket';
 import './AcquisitionControlPage.css';
 
@@ -16,6 +17,9 @@ const AcquisitionControlPage = () => {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [useWebSocketUpdates, setUseWebSocketUpdates] = useState(true);
+  // 任务管理并进本页:新建 / 编辑弹窗。editingTaskId===undefined 且 modalOpen 为新建。
+  const [taskModalOpen, setTaskModalOpen] = useState(false);
+  const [editingTaskId, setEditingTaskId] = useState<number | undefined>(undefined);
 
   const loadData = useCallback(async (signal?: AbortSignal) => {
     setRefreshing(true);
@@ -156,6 +160,18 @@ const AcquisitionControlPage = () => {
             </svg>
             刷新
           </button>
+          <button
+            onClick={() => {
+              setEditingTaskId(undefined);
+              setTaskModalOpen(true);
+            }}
+            className="btn btn--primary"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            新建任务
+          </button>
         </div>
       </div>
 
@@ -244,6 +260,10 @@ const AcquisitionControlPage = () => {
                 task={task}
                 activeSession={getSessionForTask(task.id)}
                 onStatusChange={loadData}
+                onEdit={() => {
+                  setEditingTaskId(task.id);
+                  setTaskModalOpen(true);
+                }}
               />
             ))}
           </div>
@@ -266,11 +286,22 @@ const AcquisitionControlPage = () => {
                 task={task}
                 activeSession={getSessionForTask(task.id)}
                 onStatusChange={loadData}
+                onEdit={() => {
+                  setEditingTaskId(task.id);
+                  setTaskModalOpen(true);
+                }}
               />
             ))}
           </div>
         </details>
       )}
+
+      <TaskFormModal
+        open={taskModalOpen}
+        taskId={editingTaskId}
+        onClose={() => setTaskModalOpen(false)}
+        onSaved={loadData}
+      />
     </div>
   );
 };

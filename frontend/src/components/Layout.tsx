@@ -75,7 +75,7 @@ interface NavItem {
 const navItems: NavItem[] = [
   { path: '/', label: '任务总览', icon: <DashboardIcon />, end: true },
   { path: '/acquisition', label: '采集控制', icon: <AcquisitionIcon /> },
-  { path: '/devices', label: '连接与测点', icon: <DeviceIcon /> },
+  { path: '/devices', label: '设备管理', icon: <DeviceIcon /> },
   { path: '/data', label: '数据可视化', icon: <DataIcon /> },
   { path: '/import', label: '导入作业', icon: <ImportIcon /> },
   { path: '/alarms', label: '告警中心', icon: <AlarmIcon /> },
@@ -85,7 +85,7 @@ const navItems: NavItem[] = [
 const routeTitles: Record<string, string> = {
   '/': '任务总览',
   '/acquisition': '采集控制',
-  '/devices': '连接与测点',
+  '/devices': '设备管理',
   '/data': '数据可视化',
   '/import': '导入作业',
   '/alarms': '告警中心',

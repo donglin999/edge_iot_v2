@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, InputNumber, message } from 'antd';
+import { Button, InputNumber, Modal, message } from 'antd';
 import type { AcqTask, AcquisitionSession } from '../../services/acquisitionApi';
 import {
   startTask,
   stopSession,
   updateTaskSampleRate,
 } from '../../services/acquisitionApi';
+import { deleteTask } from '../../services/taskApi';
 import { useWebSocket, WebSocketMessage } from '../../hooks/useWebSocket';
 import { buildWebSocketUrl } from '../../services/apiClient';
 import './TaskControlPanel.css';
@@ -14,6 +15,8 @@ interface TaskControlPanelProps {
   task: AcqTask;
   activeSession?: AcquisitionSession;
   onStatusChange: () => void;
+  /** 打开「编辑任务」弹窗(改名 / 测点增删改 / 频率)。 */
+  onEdit?: () => void;
 }
 
 interface LogEntry {
@@ -108,6 +111,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   task,
   activeSession,
   onStatusChange,
+  onEdit,
 }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -387,6 +391,30 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
     }
   };
 
+  const handleDelete = () => {
+    Modal.confirm({
+      title: `删除任务「${task.name}」?`,
+      content: isRunning
+        ? '该任务正在采集中,会先停止再删除。任务下的测点会一并删除,但不影响设备本身。'
+        : '任务下的测点会一并删除,但不影响设备本身。此操作不可撤销。',
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          if (isRunning && activeSession) {
+            await stopSession(activeSession.id, '删除任务前停止').catch(() => undefined);
+          }
+          await deleteTask(task.id);
+          message.success('任务已删除');
+          onStatusChange();
+        } catch (err) {
+          message.error(`删除失败: ${(err as Error).message}`);
+        }
+      },
+    });
+  };
+
   const formatDuration = (seconds: number | null) => {
     if (!seconds) return '-';
     const hours = Math.floor(seconds / 3600);
@@ -537,6 +565,20 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
               <line x1="16" y1="13" x2="8" y2="13" />
               <line x1="16" y1="17" x2="8" y2="17" />
               <polyline points="10 9 9 9 8 9" />
+            </svg>
+          </button>
+          {onEdit && (
+            <button onClick={onEdit} className="btn btn--secondary btn--icon" title="编辑任务(改名/测点/频率)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+                <path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+              </svg>
+            </button>
+          )}
+          <button onClick={handleDelete} className="btn btn--secondary btn--icon" title="删除任务">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ color: 'var(--color-error, #ff4d4f)' }}>
+              <polyline points="3 6 5 6 21 6" />
+              <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
             </svg>
           </button>
         </div>

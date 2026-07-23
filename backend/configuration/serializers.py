@@ -77,6 +77,11 @@ class PointSerializer(serializers.ModelSerializer):
 
     device = serializers.PrimaryKeyRelatedField(queryset=models.Device.objects.all())
     channel = serializers.PrimaryKeyRelatedField(queryset=models.Channel.objects.all(), allow_null=True, required=False)
+    template = serializers.PrimaryKeyRelatedField(queryset=models.PointTemplate.objects.all(), allow_null=True, required=False)
+    # address 对 MQTT / simulator / scada 这类推送协议没有意义,导入器也一直用
+    # 空串创建这类测点(走 ORM 绕过了序列化器的 blank=False)。这里放开与之对齐,
+    # 否则从 UI 新建推送型测点会被「该字段不能为空」挡住。
+    address = serializers.CharField(required=False, allow_blank=True, default="", max_length=128)
     template_detail = PointTemplateSerializer(source="template", read_only=True)
 
     class Meta:
