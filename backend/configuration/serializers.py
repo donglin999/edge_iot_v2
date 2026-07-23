@@ -155,6 +155,21 @@ class AcqTaskSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
 
+        # 一个采集任务最多绑一台设备 —— 这样删设备能干净地连带删掉它的所有任务
+        # (级联信号见 configuration/signals.py)。设备与任务是多对一:一台设备可有
+        # 多个任务,一个任务只能属于一台设备。跨设备的测点集合直接拒绝。
+        incoming_points = attrs.get("points")
+        if incoming_points:
+            device_ids = set(
+                models.Point.objects
+                .filter(pk__in=[p.pk for p in incoming_points])
+                .values_list("device_id", flat=True)
+            )
+            if len(device_ids) > 1:
+                raise serializers.ValidationError({
+                    "points": "一个采集任务只能绑定一台设备的测点;跨设备请拆成多个任务。",
+                })
+
         # Determine the requested rate. On PATCH/PUT we compare against the
         # incoming value if present, else fall back to the existing instance.
         rate = attrs.get("sample_rate_hz")

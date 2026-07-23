@@ -100,37 +100,24 @@ def _restart_on_rate_change(sender, instance, created, **kwargs):
 
 @receiver(pre_delete, sender=models.Device)
 def delete_owned_tasks(sender, instance: models.Device, **kwargs) -> None:
-    """Delete acquisition tasks whose points all live on the device being deleted.
+    """删设备时,连带删掉绑定这台设备的所有采集任务。
 
-    Without this, deleting a device would cascade-delete its points, but the
-    auto-imported task that referenced those points would remain as an empty
-    "ghost" task in the UI. We only delete tasks that are exclusively bound
-    to this device — tasks that span multiple devices are kept intact.
+    约定:一个采集任务最多绑一台设备(见 AcqTaskSerializer.validate)。所以删设备
+    时,凡是引用了它测点的任务都属于它,全部删掉 —— 否则删了设备、测点被级联清掉,
+    任务却留下变成空壳。
+
+    (历史遗留的跨设备任务在这个规则下也会被删:删其中任一设备就删掉整个任务。这与
+    「删设备删掉其所有任务」的语义一致,且新数据不会再产生跨设备任务。)
     """
-    # M2: resolve orphans with two set queries instead of an N+1 ``.exists()``
-    # loop. ``candidate`` = tasks referencing this device; ``multi_device`` =
-    # the subset that also has at least one point on a *different* device.
-    # Orphans = candidate − multi_device.
-    candidate_task_ids = set(
+    task_ids = sorted(
         models.AcqTask.objects
         .filter(points__device_id=instance.pk)
         .values_list("id", flat=True)
         .distinct()
     )
-
-    multi_device_task_ids = set(
-        models.TaskPoint.objects
-        .filter(task_id__in=candidate_task_ids)
-        .exclude(point__device_id=instance.pk)
-        .values_list("task_id", flat=True)
-        .distinct()
-    )
-
-    orphan_ids = sorted(candidate_task_ids - multi_device_task_ids)
-
-    if orphan_ids:
-        deleted, _ = models.AcqTask.objects.filter(id__in=orphan_ids).delete()
+    if task_ids:
+        deleted, _ = models.AcqTask.objects.filter(id__in=task_ids).delete()
         logger.info(
-            "Cascade-deleted %d orphan task(s) for device %s: %s",
-            deleted, instance.code, orphan_ids,
+            "Cascade-deleted %d task(s) bound to device %s: %s",
+            deleted, instance.code, task_ids,
         )

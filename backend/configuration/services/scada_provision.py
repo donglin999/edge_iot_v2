@@ -68,7 +68,8 @@ def provision(gateway: models.ScadaGateway, data: Dict[str, Any]) -> Dict[str, A
     created_devices = 0
     created_points = 0
     device_payloads: List[Dict[str, Any]] = []
-    all_points: List[models.Point] = []
+    # 一设备一任务:按设备分别收集测点,下面为每台设备各建一个任务。
+    per_device_points: List[tuple] = []  # [(device, [points])]
 
     for device_data in data["devices"]:
         device_name = device_data["device_name"]
@@ -108,6 +109,7 @@ def provision(gateway: models.ScadaGateway, data: Dict[str, Any]) -> Dict[str, A
             device.save()
 
         point_payloads: List[Dict[str, Any]] = []
+        device_points: List[models.Point] = []
         for point_data in device_data.get("points") or []:
             point_code = point_data["code"]
             point, point_created = models.Point.objects.update_or_create(
@@ -129,9 +131,10 @@ def provision(gateway: models.ScadaGateway, data: Dict[str, Any]) -> Dict[str, A
             )
             if point_created:
                 created_points += 1
-            all_points.append(point)
+            device_points.append(point)
             point_payloads.append({"id": point.id, "code": point.code})
 
+        per_device_points.append((device, device_points))
         device_payloads.append({
             "id": device.id,
             "device_name": device_name,
@@ -139,34 +142,50 @@ def provision(gateway: models.ScadaGateway, data: Dict[str, Any]) -> Dict[str, A
             "points": point_payloads,
         })
 
-    task_payload = _provision_task(data.get("task"), all_points)
+    # 一设备一任务:任务模板里的 code/name 作前缀,每台设备派生出自己的任务
+    # (task-{模板}-{设备名}),各自只绑本设备的测点。这样删设备能干净带走任务。
+    task_payloads = _provision_tasks(data.get("task"), gateway, per_device_points)
 
     return {
         "gateway": gateway.id,
         "site": site.id,
         "devices": device_payloads,
-        "task": task_payload,
+        "tasks": task_payloads,
+        # 兼容旧字段:单设备时给回第一个任务,多设备时为 None。
+        "task": task_payloads[0] if len(task_payloads) == 1 else None,
         "created": {"devices": created_devices, "points": created_points},
     }
 
 
-def _provision_task(
+def _provision_tasks(
     task_data: Optional[Dict[str, Any]],
-    points: List[models.Point],
-) -> Optional[Dict[str, Any]]:
-    """Create/update the AcqTask and bind it to every provisioned point."""
-    if not task_data:
-        return None
+    gateway: models.ScadaGateway,
+    per_device_points: List[tuple],
+) -> List[Dict[str, Any]]:
+    """为每台设备各建/更新一个采集任务(一设备一任务)。
 
-    task, _ = models.AcqTask.objects.update_or_create(
-        code=task_data["code"],
-        defaults={
-            "name": task_data.get("name") or task_data["code"],
-            "sample_rate_hz": task_data.get("sample_rate_hz") or Decimal("1.00"),
-            "is_active": task_data.get("is_active", True),
-        },
-    )
-    # ``set`` (not ``add``): the payload is the full desired state, so points
-    # dropped from a re-provision get unbound from the task too.
-    task.points.set(points)
-    return {"id": task.id, "code": task.code}
+    任务模板的 code 作前缀,加设备名派生出每台设备唯一的任务编码,避免多台设备
+    抢同一个 task code。只有一台设备时任务编码就用模板 code 本身,保持简单。
+    """
+    if not task_data:
+        return []
+
+    base_code = task_data["code"]
+    base_name = task_data.get("name") or base_code
+    rate = task_data.get("sample_rate_hz") or Decimal("1.00")
+    is_active = task_data.get("is_active", True)
+    single = len(per_device_points) == 1
+
+    payloads: List[Dict[str, Any]] = []
+    for device, points in per_device_points:
+        device_name = (device.metadata or {}).get("scada_device_name") or device.code
+        code = base_code if single else f"{base_code}-{device_name}"
+        name = base_name if single else f"{base_name} · {device_name}"
+        task, _ = models.AcqTask.objects.update_or_create(
+            code=code,
+            defaults={"name": name, "sample_rate_hz": rate, "is_active": is_active},
+        )
+        # ``set``:全量期望状态,重复 provision 时被移除的测点会解绑。
+        task.points.set(points)
+        payloads.append({"id": task.id, "code": task.code, "device_id": device.id})
+    return payloads

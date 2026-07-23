@@ -215,9 +215,23 @@ const TaskFormModal: React.FC<Props> = ({ open, taskId, onClose, onSaved }) => {
     ]);
   };
 
+  // 一个任务只能绑一台设备:已有测点后,把设备锁定成第一行的设备。
+  const lockedDevice = rows.length > 0 ? rows[0].device : undefined;
+
+  // 锁定后,把「添加测点」的目标设备同步成锁定设备,让纳入/新建都作用在它上面。
+  useEffect(() => {
+    if (lockedDevice !== undefined && addDevice !== lockedDevice) {
+      setAddDevice(lockedDevice);
+    }
+  }, [lockedDevice, addDevice]);
+
   const validate = (): string[] => {
     const problems: string[] = [];
     if (rows.length === 0) problems.push('至少需要一个测点');
+    // 单设备约束(与后端一致):所有测点必须属于同一台设备。
+    if (new Set(rows.map((r) => r.device)).size > 1) {
+      problems.push('一个任务只能绑定一台设备的测点;跨设备请拆成多个任务');
+    }
     const seen = new Set<string>();
     rows.forEach((r, i) => {
       if (!r.code.trim()) problems.push(`第 ${i + 1} 行:测点编码不能为空`);
@@ -398,12 +412,20 @@ const TaskFormModal: React.FC<Props> = ({ open, taskId, onClose, onSaved }) => {
         测点 {rows.length > 0 && <Text type="secondary">（{rows.length} 个）</Text>}
       </Divider>
 
+      {lockedDevice !== undefined && (
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+          ⓘ 一个任务只能绑一台设备（{deviceName(lockedDevice)}）。要采别的设备,请另建任务。
+        </Text>
+      )}
+
       {/* 添加测点工具条 */}
       <Space wrap style={{ marginBottom: 12 }}>
         <Select
           placeholder="选择设备"
           style={{ width: 220 }}
-          value={addDevice}
+          // 已有测点后锁定成该设备:一个任务只能绑一台设备。
+          value={lockedDevice ?? addDevice}
+          disabled={lockedDevice !== undefined}
           showSearch
           optionFilterProp="label"
           onChange={setAddDevice}

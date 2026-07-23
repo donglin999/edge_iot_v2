@@ -185,10 +185,15 @@ class TestM1SessionMetadataLock:
 # --------------------------------------------------------------------------
 @pytest.mark.django_db
 class TestM2DeleteOwnedTasks:
-    def test_orphan_task_deleted_multidevice_task_kept(
+    def test_deleting_device_removes_all_tasks_bound_to_it(
         self, create_site, create_device, create_point
     ):
-        """Deleting a device drops its solo tasks, keeps shared ones."""
+        """删设备 → 删掉引用它的所有任务;别的设备的任务不受影响。
+
+        新约定「一个任务只能绑一台设备」下,删设备就该带走它的全部任务。历史遗留的
+        跨设备任务(shared)在这个规则下也会被删 —— 删其中任一设备即删整个任务,
+        这与「删设备删掉其所有任务」一致。
+        """
         site = create_site()
         device_a = create_device(site=site)
         device_b = create_device(site=site)
@@ -196,20 +201,23 @@ class TestM2DeleteOwnedTasks:
         point_a = create_point(device=device_a, code="PT_A")
         point_b = create_point(device=device_b, code="PT_B")
 
-        # Task bound only to device_a -> orphaned when device_a goes away.
+        # 只绑 device_a 的任务
         solo = config_models.AcqTask.objects.create(code="SOLO", name="solo")
         solo.points.set([point_a])
 
-        # Task spanning device_a and device_b -> must survive.
-        shared = config_models.AcqTask.objects.create(
-            code="SHARED", name="shared"
-        )
+        # 遗留的跨设备任务(引用了 device_a)
+        shared = config_models.AcqTask.objects.create(code="SHARED", name="shared")
         shared.points.set([point_a, point_b])
 
-        device_a.delete()  # fires post_delete -> delete_owned_tasks
+        # 只绑 device_b 的任务 —— 删 device_a 不应波及它
+        untouched = config_models.AcqTask.objects.create(code="KEEP", name="keep")
+        untouched.points.set([point_b])
+
+        device_a.delete()
 
         assert not config_models.AcqTask.objects.filter(pk=solo.pk).exists()
-        assert config_models.AcqTask.objects.filter(pk=shared.pk).exists()
+        assert not config_models.AcqTask.objects.filter(pk=shared.pk).exists()
+        assert config_models.AcqTask.objects.filter(pk=untouched.pk).exists()
 
     def test_query_count_is_constant_not_n_plus_1(
         self, create_site, create_device, create_point

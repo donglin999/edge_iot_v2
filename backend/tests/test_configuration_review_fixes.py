@@ -151,19 +151,21 @@ class TestScadaExcelToIntToleratesFloats:
 @pytest.mark.django_db
 class TestAcqTaskSerializerProtocolCheckIsNotNPlusOne:
 
-    def _points(self, create_point, n):
-        return [create_point() for _ in range(n)]
+    def _points(self, create_point, create_device, n):
+        # 一个任务只能绑一台设备,所以全部测点放同一台设备上。
+        device = create_device()
+        return [create_point(device=device, code=f"p{i}") for i in range(n)]
 
     def test_validate_query_count_does_not_scale_with_point_count(
-        self, create_point, django_assert_max_num_queries
+        self, create_point, create_device, django_assert_max_num_queries
     ):
-        points = self._points(create_point, 12)
+        points = self._points(create_point, create_device, 12)
         attrs = {"sample_rate_hz": Decimal("10.0"), "points": points}
 
         serializer = AcqTaskSerializer()
-        # One aggregate query for the protocol set, regardless of how many
-        # points were assigned — the old code did one query *per point*.
-        with django_assert_max_num_queries(1):
+        # 两个聚合查询(单设备校验 + 协议 cap 校验),都不随测点数增长 ——
+        # 老代码是每个测点各查一次 device。
+        with django_assert_max_num_queries(2):
             serializer.validate(attrs)
 
     def test_validate_still_enforces_protocol_rate_cap(

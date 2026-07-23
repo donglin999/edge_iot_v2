@@ -177,17 +177,26 @@ def test_import_with_task_code_creates_and_binds_task(api_client, db):
     )
 
     assert resp.status_code == status.HTTP_201_CREATED
-    task = config_models.AcqTask.objects.get(code="zs-acq")
-    assert resp.json()["task"] == {"id": task.id, "code": "zs-acq"}
-    assert task.name == "中山采集"
-    assert float(task.sample_rate_hz) == 2.5
-    # Every point from this import is bound to the task.
-    assert task.points.count() == 3
+    # 一设备一任务:2 台设备 → 2 个任务(zs-acq-<设备名>),各绑本设备测点。
+    tasks = list(config_models.AcqTask.objects.filter(code__startswith="zs-acq-"))
+    assert len(tasks) == 2
+    assert config_models.AcqTask.objects.filter(code="zs-acq").count() == 0
+    for t in tasks:
+        assert t.name.startswith("中山采集")
+        assert float(t.sample_rate_hz) == 2.5
+    # 两个任务的测点合计 = 本次导入的全部测点
+    assert sum(t.points.count() for t in tasks) == 3
+    # 多设备时响应的单数 task 字段为 None,tasks 列表给全量
+    assert resp.json()["task"] is None
+    assert len(resp.json()["tasks"]) == 2
 
 
 def test_import_task_name_defaults_to_task_code(api_client, db):
     post_import(api_client, build_workbook(), task_code="zs-acq")
-    assert config_models.AcqTask.objects.get(code="zs-acq").name == "zs-acq"
+    # 一设备一任务:任务名默认用 task_code 作前缀,再缀设备名。
+    tasks = config_models.AcqTask.objects.filter(code__startswith="zs-acq-")
+    assert tasks.count() == 2
+    assert all(t.name.startswith("zs-acq") for t in tasks)
 
 
 def test_import_is_idempotent(api_client, db):

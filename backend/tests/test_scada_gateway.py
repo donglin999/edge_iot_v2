@@ -377,7 +377,14 @@ class TestProvision:
         assert [p["code"] for p in body["devices"][0]["points"]] == [
             "N270400150027", "N270400150028",
         ]
-        assert body["task"]["code"] == "task-zhongshan"
+        # 一设备一任务:2 台设备 → 2 个任务,任务编码由模板 code 加设备名派生。
+        task_codes = sorted(t["code"] for t in body["tasks"])
+        assert task_codes == [
+            "task-zhongshan-A0201010001150403",
+            "task-zhongshan-A0201010001150404",
+        ]
+        # 多设备时 body["task"](单数,旧兼容字段)为 None
+        assert body["task"] is None
 
         device = config_models.Device.objects.get(code="scada-gw1-A0201010001150403")
         assert device.protocol == "scada"
@@ -389,9 +396,11 @@ class TestProvision:
         assert device.ip_address == gateway.source_ip
         assert device.port == gateway.source_port
 
-        task = config_models.AcqTask.objects.get(code="task-zhongshan")
-        assert task.points.count() == 3
+        # 一设备一任务:这台设备(2 个测点)有自己的任务,只绑本设备测点。
+        task = config_models.AcqTask.objects.get(code="task-zhongshan-A0201010001150403")
+        assert task.points.count() == 2
         assert task.is_active is True
+        assert all(p.device == device for p in task.points.all())
 
     def test_point_stores_data_type_the_importer_way(self, api_client, site, gateway):
         """extra['data_type'] is what read_plan._resolve_data_type reads."""
@@ -415,11 +424,17 @@ class TestProvision:
         # no duplicates anywhere
         assert config_models.Device.objects.filter(gateway=gateway).count() == 2
         assert config_models.Point.objects.filter(device__gateway=gateway).count() == 3
-        assert config_models.AcqTask.objects.filter(code="task-zhongshan").count() == 1
-        assert config_models.AcqTask.objects.get(code="task-zhongshan").points.count() == 3
+        # 一设备一任务:2 台设备 → 恰好 2 个任务,不重复
+        gw_tasks = config_models.AcqTask.objects.filter(code__startswith="task-zhongshan-")
+        assert gw_tasks.count() == 2
+        assert config_models.AcqTask.objects.filter(code="task-zhongshan").count() == 0
+        # 每个任务只绑本设备的测点(2 + 1 = 3)
+        assert sorted(t.points.count() for t in gw_tasks) == [1, 2]
         # stable ids across runs
         assert first.data["devices"][0]["id"] == second.data["devices"][0]["id"]
-        assert first.data["task"]["id"] == second.data["task"]["id"]
+        first_tasks = sorted(t["id"] for t in first.data["tasks"])
+        second_tasks = sorted(t["id"] for t in second.data["tasks"])
+        assert first_tasks == second_tasks
 
     def test_reprovision_updates_in_place(self, api_client, site, gateway):
         _provision(api_client, gateway, site=site)

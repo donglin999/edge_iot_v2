@@ -87,6 +87,9 @@ export interface ProvisionResponse {
   gateway: number;
   site: number | null;
   devices: ProvisionedDevice[];
+  // 一设备一任务:每台设备各派生一个任务。多设备时 task(单数,旧兼容字段)为 null,
+  // 完整列表在 tasks 里。
+  tasks: Array<{ id: number; code: string; device_id: number }>;
   task: { id: number; code: string } | null;
   created: { devices: number; points: number };
 }
