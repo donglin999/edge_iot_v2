@@ -17,6 +17,7 @@ file is round-trip compatible with the importer.
 from __future__ import annotations
 
 import io
+import logging
 from typing import Any, Dict, Iterable, List, Optional
 
 from openpyxl import Workbook
@@ -27,10 +28,24 @@ from acquisition.protocols import FieldSpec, ProtocolRegistry
 from acquisition.services.templates import _column_specs
 from configuration import models
 
+logger = logging.getLogger(__name__)
 
 _HEADER_FILL = PatternFill("solid", fgColor="FFE3F2FD")
 _HEADER_FONT = Font(bold=True)
 _REQUIRED_FILL = PatternFill("solid", fgColor="FFFFF59D")
+
+# SCADA devices are provisioned through ScadaGateway: their MQTT broker/
+# credentials live on the gateway row, not device.metadata (see
+# Device.gateway's docstring), so a generic export row would come out missing
+# required connection fields. SCADA already has its own round-trippable
+# two-sheet export (ScadaGatewayViewSet.export) — always exclude it here
+# rather than emit an Excel row that can't be re-imported.
+SCADA_PROTOCOL = "scada"
+
+# Above this many exported rows, note it in the log — openpyxl direct-write
+# stays fine well past this, but it's a useful signal that a device list this
+# large might be worth revisiting (streaming, pagination, ...).
+_LARGE_EXPORT_ROW_THRESHOLD = 2000
 
 
 def _base_specs() -> List[FieldSpec]:
@@ -94,6 +109,53 @@ def _write_row(ws, row_num: int, columns: List[FieldSpec], values: Dict[str, Any
         ws.cell(row=row_num, column=col_idx, value=v)
 
 
+def _device_point_row_values(point, columns: List[FieldSpec]) -> Dict[str, Any]:
+    """Reconstruct one importer-shaped row from a live ``Point`` + its ``Device``.
+
+    Same precedence rule as the importer's own round-trip: device.metadata
+    wins over point.extra on key collisions (device.metadata is the field
+    the importer actually persists as authoritative connection config).
+    """
+    device = point.device
+    device_meta = device.metadata or {}
+    point_extra = point.extra or {}
+    merged: Dict[str, Any] = {}
+    merged.update(point_extra)
+    merged.update(device_meta)
+
+    row_values: Dict[str, Any] = {
+        "protocol_type": device.protocol,
+        "device_name": device.name,
+        "device_a_tag": device_meta.get("a_tag", "") or "",
+    }
+    for spec in columns:
+        if spec.name in row_values:
+            continue
+        if spec.name in merged and merged[spec.name] is not None:
+            row_values[spec.name] = merged[spec.name]
+
+    row_values["code"] = point.code
+    row_values["address"] = point.address
+    if point.description:
+        row_values["description"] = point.description
+    return row_values
+
+
+def _write_device_rows(ws, device_qs, columns: List[FieldSpec]) -> int:
+    """Write one row per point of ``device_qs`` starting at row 2. Returns row count."""
+    points_qs = (
+        models.Point.objects
+        .select_related("device", "device__site", "channel", "template")
+        .filter(device__in=device_qs)
+        .order_by("device__protocol", "device__code", "code")
+    )
+    row_num = 2
+    for point in points_qs:
+        _write_row(ws, row_num, columns, _device_point_row_values(point, columns))
+        row_num += 1
+    return row_num - 2
+
+
 class ExcelExportService:
     """Exports current DB state or a single ``ConfigVersion.payload`` to .xlsx."""
 
@@ -117,45 +179,53 @@ class ExcelExportService:
         ws = wb.active
         ws.title = "采集点配置"
         _write_header(ws, columns)
+        _write_device_rows(ws, device_qs, columns)
+        _write_protocol_ref_sheet(wb)
 
-        points_qs = (
-            models.Point.objects
-            .select_related("device", "device__site", "channel", "template")
-            .filter(device__in=device_qs)
-            .order_by("device__protocol", "device__code", "code")
-        )
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
 
-        row_num = 2
-        for point in points_qs:
-            device = point.device
-            device_meta = device.metadata or {}
-            point_extra = point.extra or {}
-            # Device fields take priority over point.extra when keys collide.
-            merged: Dict[str, Any] = {}
-            merged.update(point_extra)
-            merged.update(device_meta)
+    # ------------------------------------------------------------------
+    # current DB, filtered by protocol (SCADA excluded) → .xlsx
+    # ------------------------------------------------------------------
+    def export_devices(self, protocols: Optional[List[str]] = None) -> bytes:
+        """Export devices/points across an explicit protocol allowlist.
 
-            row_values: Dict[str, Any] = {
-                "protocol_type": device.protocol,
-                "device_name": device.name,
-                "device_a_tag": device_meta.get("a_tag", "") or "",
+        Layout matches :meth:`export_current_config` (and therefore the
+        importer template) exactly — this is the read side of the same
+        round-trip, scoped by protocol rather than by site. SCADA is always
+        excluded (see :data:`SCADA_PROTOCOL`); it has its own two-sheet
+        gateway export.
+        """
+        device_qs = models.Device.objects.exclude(protocol=SCADA_PROTOCOL)
+
+        if protocols:
+            normalized = {
+                p.strip().lower() for p in protocols if p and p.strip()
             }
-            # Per-protocol columns from merged metadata + extras.
-            for spec in columns:
-                if spec.name in row_values:
-                    continue
-                if spec.name in merged and merged[spec.name] is not None:
-                    row_values[spec.name] = merged[spec.name]
+            normalized.discard(SCADA_PROTOCOL)
+            device_qs = device_qs.filter(protocol__in=normalized)
 
-            # Native point columns.
-            row_values["code"] = point.code
-            row_values["address"] = point.address
-            if point.description:
-                row_values["description"] = point.description
+        resolved_protocols = sorted({p for p in device_qs.values_list("protocol", flat=True) if p})
+        if not resolved_protocols:
+            # Nothing matched (or nothing to match against) — still emit a
+            # well-formed file whose columns cover every non-scada protocol,
+            # so an empty result is still a usable template.
+            resolved_protocols = [p for p in ProtocolRegistry.list_protocols() if p != SCADA_PROTOCOL]
 
-            _write_row(ws, row_num, columns, row_values)
-            row_num += 1
+        columns = _resolve_columns(resolved_protocols)
 
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "采集点配置"
+        _write_header(ws, columns)
+        row_count = _write_device_rows(ws, device_qs, columns)
+        if row_count > _LARGE_EXPORT_ROW_THRESHOLD:
+            logger.info(
+                "设备导出行数较多: %d 行(协议=%s),openpyxl 直出未做流式优化，如后续常态化建议评估流式写入",
+                row_count, ",".join(resolved_protocols),
+            )
         _write_protocol_ref_sheet(wb)
 
         buf = io.BytesIO()

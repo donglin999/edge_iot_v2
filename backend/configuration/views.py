@@ -274,6 +274,39 @@ class DeviceViewSet(viewsets.ModelViewSet):
         serializer = serializers.PointSerializer(points, many=True, context={"request": request})
         return Response(serializer.data)
 
+    @extend_schema(
+        summary="导出设备配置为 Excel(通用协议,与导入模板同格式)",
+        description=(
+            "按 /acquisition/protocols/template/ 同款列头逐测点导出,可直接改完通过 "
+            "/import-jobs/ 导回。protocols 查询参数按逗号分隔筛选协议,缺省导出除 "
+            "scada 外的全部协议 —— SCADA 网关设备的连接参数挂在网关而非 "
+            "device.metadata 上,恒被排除,请改用 "
+            "/config/scada-gateways/{id}/export/。"
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="protocols",
+                description="协议 code,逗号分隔(如 modbus_tcp,mqtt);缺省=除 scada 外全部",
+                required=False,
+                type=str,
+            ),
+        ],
+        responses={200: OpenApiTypes.BINARY},
+    )
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        protos_param = request.query_params.get("protocols", "")
+        protocols = [p.strip() for p in protos_param.split(",") if p.strip()] or None
+        content = ExcelExportService().export_devices(protocols=protocols)
+        ts = timezone.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"devices_{ts}.xlsx"
+        response = HttpResponse(
+            content,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
     @extend_schema(summary="获取设备统计信息")
     @action(detail=True, methods=["get"], url_path="stats")
     def stats(self, request, pk=None):

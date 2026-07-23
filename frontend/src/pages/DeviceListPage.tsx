@@ -39,7 +39,13 @@ import DeviceFormModal from '../components/DeviceFormModal';
 import { protocolsWithExcel } from '../protocols/registry';
 import { apiClient } from '../services/apiClient';
 import { fetchAllPages } from '../services/pagination';
-import { downloadTemplate, listProtocols, protocolTagColor, type ProtocolDescriptor } from '../services/protocolApi';
+import {
+  downloadDeviceExport,
+  downloadTemplate,
+  listProtocols,
+  protocolTagColor,
+  type ProtocolDescriptor,
+} from '../services/protocolApi';
 import type { DeviceStatus } from '../services/deviceApi';
 
 interface Device {
@@ -267,23 +273,38 @@ const DeviceListPage = () => {
   );
 
   /**
-   * 模板下拉:通用单表模板 + 各协议在注册表里声明的专属模板。
+   * 模板下拉:通用单表模板 + 各协议在注册表里声明的专属模板 + 导出当前设备。
    *
    * 通用模板是一张 40 列的大宽表,scada 用它得逐行重复 broker/账号/密码 ——
    * 那正是网关模型要消掉的重复,所以 scada 必须给出自己的两表模板。
+   *
+   * 「导出当前设备」按当前协议筛选(Segmented 选中的 filterProtocol)传给后端
+   * /config/devices/export/;后端恒排除 scada(连接参数挂在网关而非
+   * device.metadata,通用格式装不下),所以筛到 scada 时改为提示去网关页导出。
    */
   const templateMenu = useMemo(
     () => ({
       items: [
         { key: 'generic', label: '通用模板(全部协议 · 单表)' },
         ...protocolsWithExcel().map((e) => ({ key: e.protocol, label: e.label })),
+        { type: 'divider' as const },
+        { key: 'export-current-devices', label: '导出当前设备(Excel)' },
       ],
       onClick: ({ key }: { key: string }) => {
+        if (key === 'export-current-devices') {
+          if (filterProtocol === 'scada') {
+            message.warning('SCADA 设备请在「SCADA 网关」页导出(网关两表格式)。');
+            return;
+          }
+          const protocols = filterProtocol === 'all' ? undefined : [filterProtocol];
+          downloadDeviceExport(protocols).catch(() => undefined);
+          return;
+        }
         const custom = protocolsWithExcel().find((e) => e.protocol === key);
         (custom ? custom.download() : downloadTemplate()).catch(() => undefined);
       },
     }),
-    [],
+    [filterProtocol],
   );
 
   const segOptions = useMemo(

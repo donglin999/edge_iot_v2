@@ -50,6 +50,21 @@ export async function downloadTemplate(protocols?: string[]): Promise<void> {
 }
 
 /**
+ * Export the current devices/points to an .xlsx with the same column layout
+ * as the import template — edit it and re-upload via the import flow.
+ *
+ * SCADA devices are always excluded (their connection config lives on the
+ * gateway, not device.metadata) — use the gateway's own export for those.
+ */
+export async function downloadDeviceExport(protocols?: string[]): Promise<void> {
+  await downloadFile(
+    '/config/devices/export/',
+    'edge_iot_devices_export.xlsx',
+    protocols && protocols.length > 0 ? { protocols: protocols.join(',') } : undefined,
+  );
+}
+
+/**
  * AntD Tag color for a protocol's category. Shared by every place that
  * renders a protocol badge (device list, device detail, ...) so they can't
  * drift into showing different colors for the same protocol.
