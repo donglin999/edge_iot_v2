@@ -34,7 +34,7 @@ function open(props = {}) {
 describe('打开的瞬间', () => {
   it('请求还没回来,四个步骤就已经列出来了 —— 不能干等', () => {
     // 永远不 resolve:模拟一个很慢的设备
-    vi.mocked(apiClient.post).mockReturnValue(new Promise(() => {}));
+    vi.mocked(apiClient.post).mockReturnValue(new Promise(() => undefined));
     open();
 
     for (const label of ['检查设备配置', '建立连接', '握手/健康检查', '断开连接']) {
@@ -44,7 +44,7 @@ describe('打开的瞬间', () => {
   });
 
   it('结果没回来之前,后面的步骤只能是「等待中」,不许假装点亮', () => {
-    vi.mocked(apiClient.post).mockReturnValue(new Promise(() => {}));
+    vi.mocked(apiClient.post).mockReturnValue(new Promise(() => undefined));
     open();
 
     const handshake = screen.getByText('握手/健康检查').closest('div')?.parentElement;
@@ -54,7 +54,7 @@ describe('打开的瞬间', () => {
   });
 
   it('弹窗标题带上设备名,免得同时开几个分不清', () => {
-    vi.mocked(apiClient.post).mockReturnValue(new Promise(() => {}));
+    vi.mocked(apiClient.post).mockReturnValue(new Promise(() => undefined));
     open();
     expect(screen.getByText('连接测试 · 1号空压机')).toBeInTheDocument();
   });

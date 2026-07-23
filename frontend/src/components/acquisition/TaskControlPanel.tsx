@@ -140,6 +140,15 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
 
   const isRunning = !!(activeSession && activeSession.status === 'running');
 
+  // 实际入库频率 —— 后端用 InfluxDBSink.total_written 在时间窗内算出的点/秒,
+  // 只计**写成功**的量。它和左边设定的采样频率是两回事:采样频率是「打算多快
+  // 采」,这个是「实际多快真的落到 InfluxDB」。InfluxDB 写不进去时它就是 0。
+  const actualIngestRate =
+    isRunning && activeSession?.metadata &&
+    typeof activeSession.metadata.ingest_points_per_sec === 'number'
+      ? (activeSession.metadata.ingest_points_per_sec as number)
+      : null;
+
   const sampleRateDirty =
     sampleRateValue !== null &&
     !Number.isNaN(sampleRateValue) &&
@@ -558,10 +567,25 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
           </Button>
           <span className="sample-rate__hint">
             {isRunning
-              ? '※ 修改后将重启采集会话'
+              ? '※ 保存后立即以新频率重启采集'
               : '※ 修改后将影响新启动的会话'}
           </span>
         </div>
+        {isRunning && (
+          <div className="sample-rate__actual">
+            <span className="sample-rate__actual-label">实际入库</span>
+            <span className="sample-rate__actual-value">
+              {actualIngestRate === null
+                ? '统计中…'
+                : `${actualIngestRate} 点/秒`}
+            </span>
+            {actualIngestRate === 0 && (
+              <span className="sample-rate__actual-warn">
+                （数据未落库 —— 检查 InfluxDB 连接）
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {activeSession && (

@@ -353,7 +353,15 @@ class DeviceViewSet(viewsets.ModelViewSet):
         )
         try:
             # WSGI 线程在此最多阻塞 5s。
-            result = async_result.get(timeout=5.0, propagate=True)
+            #
+            # disable_sync_subtasks=False:我们是在一个 Web 请求里刻意同步等这一个
+            # 探针任务。默认情况下 Celery 在「任务上下文中调用 .get()」会抛
+            # "Never call result.get() within a task!" —— 这本是防止 worker 里
+            # 嵌套阻塞等待的护栏,而 eager 模式下整个链路都算「任务内」,连这种
+            # 正当的同步等待也会被误杀。这里明确关掉该断言。
+            result = async_result.get(
+                timeout=5.0, propagate=True, disable_sync_subtasks=False
+            )
         except CeleryTimeoutError:
             logger.warning("Test connection timed out for device %s (task %s)",
                             device.id, async_result.id)

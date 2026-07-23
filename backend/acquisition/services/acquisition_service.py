@@ -410,6 +410,23 @@ class AcquisitionService:
 
             self.session.refresh_from_db(fields=["metadata"])
             meta = self.session.metadata or {}
+
+            # 真实入库速率 —— 在覆盖旧值之前,用「累计写入量」和上一次写元数据的
+            # 时间戳算出这段窗口内的平均点/秒。total_points_read 来自
+            # InfluxDBSink.total_written,只在**写成功**时递增,所以这是真正落到
+            # InfluxDB 的频率,而不是采集尝试的频率:InfluxDB 写不进去时它就是 0,
+            # 这恰恰是要如实告诉操作员的。
+            pipeline = getattr(self, "pipeline", None)
+            new_total = pipeline.total_points_read if pipeline is not None else \
+                int(meta.get("total_points_read", 0))
+            prev_total = int(meta.get("total_points_read", 0))
+            prev_ts = meta.get("last_health_update")
+            if isinstance(prev_ts, (int, float)) and timestamp > prev_ts:
+                dt = timestamp - prev_ts
+                delta = max(new_total - prev_total, 0)
+                meta["ingest_points_per_sec"] = round(delta / dt, 2)
+                meta["ingest_measured_at"] = timestamp
+
             meta["device_health"] = health_summary
             meta["last_health_update"] = timestamp
             # Pick the most recent successful read across devices as a
@@ -419,9 +436,7 @@ class AcquisitionService:
                 meta["last_read_time"] = max(last_reads)
             # Surface cumulative successful-write count to the API. Pulled
             # straight from the pipeline (= InfluxDBSink.total_written).
-            pipeline = getattr(self, "pipeline", None)
-            if pipeline is not None:
-                meta["total_points_read"] = pipeline.total_points_read
+            meta["total_points_read"] = new_total
             self.session.metadata = meta
             self.session.save(update_fields=["metadata", "updated_at"])
         except Exception as exc:  # noqa: BLE001

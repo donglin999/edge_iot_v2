@@ -73,17 +73,14 @@ const AcquisitionControlPage = () => {
     enabled: useWebSocketUpdates,
   });
 
-  // Single update-source effect: poll only when the WebSocket is NOT the
-  // active realtime channel (toggle off, or socket not connected). This
-  // avoids the previous double WS + polling updates. Each tick uses an
-  // AbortController so a re-run/unmount cancels the in-flight request.
+  // 每 3s 轮询一次活跃会话。
+  //
+  // 以前这里在 WS 连接时会 return 掉、完全不轮询 —— 因为 WS 的 session_status
+  // 已经能把状态变更即时推过来。但 WS 只在**状态变化**时推,而「实际入库频率」
+  // (session.metadata.ingest_points_per_sec)是后端每 10s 刷一次的持续量,
+  // 状态不变时 WS 根本不会带它过来。所以这个轮询要一直跑,才能让实时速率读数
+  // 保持新鲜;WS 仍然负责状态变更的即时反馈,两者都写 activeSessions,幂等无害。
   useEffect(() => {
-    const wsActive =
-      useWebSocketUpdates && wsStatus === WebSocketStatus.CONNECTED;
-    if (wsActive) {
-      return;
-    }
-
     let aborter: AbortController | null = null;
     const poll = () => {
       aborter?.abort();
@@ -100,7 +97,7 @@ const AcquisitionControlPage = () => {
       clearInterval(interval);
       aborter?.abort();
     };
-  }, [useWebSocketUpdates, wsStatus]);
+  }, []);
 
   const getSessionForTask = (taskId: number) => {
     return activeSessions.find((s) => s.task === taskId);

@@ -33,6 +33,7 @@ Coverage that used to live here has been re-homed:
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -403,3 +404,60 @@ class TestInfluxDBSinkInitialization:
             sink = InfluxDBSink(session, service.device_groups)
 
         assert sink._storage is None
+
+
+@pytest.mark.django_db
+class TestIngestRateMetadata:
+    """实际入库速率 —— 前端「实际入库 X 点/秒」读的就是这个。
+
+    速率 = 累计写入量在一个统计窗口内的增量 / 窗口时长。累计量来自
+    InfluxDBSink.total_written(**只在写成功时递增**),所以这是真正落到
+    InfluxDB 的频率,而不是采集尝试的频率 —— InfluxDB 写不进去时它就是 0,
+    这正是要如实告诉操作员的。
+    """
+
+    def _service_with_pipeline(self, task, session, total_written):
+        service = AcquisitionService(task, session)
+        service.pipeline = SimpleNamespace(total_points_read=total_written)
+        return service
+
+    def test_rate_is_delta_over_window(self, create_task, create_session):
+        task = create_task()
+        session = create_session(task=task)
+
+        # 第一次:建立基线(t=1000, 累计=100)
+        svc = self._service_with_pipeline(task, session, 100)
+        svc._update_sqlite_metadata({}, timestamp=1000.0)
+
+        # 第二次:10 秒后累计到 250 → (250-100)/10 = 15 点/秒
+        svc.pipeline.total_points_read = 250
+        svc._update_sqlite_metadata({}, timestamp=1010.0)
+
+        session.refresh_from_db()
+        assert session.metadata["ingest_points_per_sec"] == 15.0
+        assert session.metadata["total_points_read"] == 250
+
+    def test_zero_when_nothing_written(self, create_task, create_session):
+        """InfluxDB 写不进去时累计量不涨,速率必须是 0 —— 不能假装在采。"""
+        task = create_task()
+        session = create_session(task=task)
+
+        svc = self._service_with_pipeline(task, session, 100)
+        svc._update_sqlite_metadata({}, timestamp=1000.0)
+        # 累计量原地不动(写入一直失败)
+        svc._update_sqlite_metadata({}, timestamp=1010.0)
+
+        session.refresh_from_db()
+        assert session.metadata["ingest_points_per_sec"] == 0.0
+
+    def test_first_window_has_no_rate_yet(self, create_task, create_session):
+        """第一次写元数据没有上一个时间戳可比,不该凭空造一个速率。"""
+        task = create_task()
+        session = create_session(task=task)
+
+        svc = self._service_with_pipeline(task, session, 100)
+        svc._update_sqlite_metadata({}, timestamp=1000.0)
+
+        session.refresh_from_db()
+        assert "ingest_points_per_sec" not in session.metadata
+        assert session.metadata["total_points_read"] == 100
