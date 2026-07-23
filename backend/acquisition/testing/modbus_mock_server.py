@@ -13,7 +13,7 @@ from __future__ import annotations
 import struct
 import threading
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import modbus_tk.defines as cst
 from modbus_tk import modbus_tcp
@@ -28,6 +28,59 @@ def _f32_regs(value: float) -> Tuple[int, int]:
 def _i32_regs(value: int) -> Tuple[int, int]:
     hi, lo = struct.unpack(">HH", struct.pack(">i", value))
     return hi, lo
+
+
+# ---------------------------------------------------------------------------
+# Generic scalar -> wire-register encoder (full-datatype test support)
+#
+# Deliberately independent of ``acquisition.protocols.modbus._combine_registers``
+# / ``_apply_byte_order`` — this is the "device" side of the wire, and reusing
+# the decoder-under-test's helpers here would let a symmetric bug in both
+# cancel itself out silently. Every byte-order transform is reimplemented
+# from scratch against ``struct`` so it acts as an independent oracle.
+# ---------------------------------------------------------------------------
+
+#: struct format char for each multi-register (2 or 4 word) scalar type.
+_ENCODE_FMT = {
+    "uint32": "I", "int32": "i", "float32": "f", "float": "f", "real": "f",
+    "uint64": "Q", "int64": "q", "float64": "d", "double": "d",
+}
+_BYTE_SWAP_ORDERS = frozenset({"big-swap", "little-swap"})
+_LITTLE_ENDIAN_ORDERS = frozenset({"little", "little-swap"})
+
+
+def encode_scalar(value, data_type: str, byte_order: str = "big") -> List[int]:
+    """Encode ``value`` into the list of 16-bit registers a real device would
+    put on the wire for ``data_type`` / ``byte_order``.
+
+    ``bool``/``int16``/``uint16`` occupy a single register (byte order does
+    not apply to a lone word — mirrors how the decoder treats ``num <= 1``).
+    Multi-register types are packed with ``struct`` at the requested
+    endianness, then the inner-word byte swap is applied for the ``*-swap``
+    orders (BADC / CDAB).
+    """
+    dt = (data_type or "").strip().lower()
+    if dt == "bool":
+        return [1 if value else 0]
+    if dt in ("int16", "uint16", "short", "word"):
+        return [int(value) & 0xFFFF]
+
+    fmt = _ENCODE_FMT.get(dt)
+    if fmt is None:
+        raise ValueError(f"encode_scalar: unsupported data_type {data_type!r}")
+
+    bo = (byte_order or "big").strip().lower()
+    pfx = "<" if bo in _LITTLE_ENDIAN_ORDERS else ">"
+    raw = struct.pack(pfx + fmt, value)
+    if bo in _BYTE_SWAP_ORDERS:
+        words = [raw[i : i + 2] for i in range(0, len(raw), 2)]
+        raw = b"".join(bytes(reversed(w)) for w in words)
+    return [int.from_bytes(raw[i : i + 2], "big") for i in range(0, len(raw), 2)]
+
+
+#: Modbus function code -> block name registered on each slave (see
+#: ``ModbusMockServer.__init__``).
+_BLOCK_NAME_BY_FC = {1: "coils", 2: "discrete", 3: "holding", 4: "input"}
 
 
 class ModbusMockServer:
@@ -53,17 +106,29 @@ class ModbusMockServer:
         host: str = "127.0.0.1",
         port: int = 15020,
         slave_ids: List[int] | None = None,
+        holding_size: int = 128,
+        input_size: int = 64,
+        coil_size: int = 64,
+        discrete_size: int = 64,
     ) -> None:
         self.host = host
         self.port = port
         self.slave_ids = slave_ids or [1]
         self._server = modbus_tcp.TcpServer(address=host, port=port)
         self._slaves = []
+        self._slave_by_id: Dict[int, object] = {}
         for sid in self.slave_ids:
             slave = self._server.add_slave(sid)
-            # 保持寄存器区,覆盖到 int32 计数所在的 22 个字。
-            slave.add_block("holding", cst.HOLDING_REGISTERS, 0, 32)
+            # 保持寄存器区,覆盖到 int32 计数所在的 22 个字(默认 128,给全数据
+            # 类型/多点合并测试留够地址空间)。
+            slave.add_block("holding", cst.HOLDING_REGISTERS, 0, holding_size)
+            # 功能码 4/1/2 各自独立地址空间 —— 供 Agent A 全功能码测试使用,
+            # _update_loop 只写 holding,不touch 这几个区。
+            slave.add_block("input", cst.ANALOG_INPUTS, 0, input_size)
+            slave.add_block("coils", cst.COILS, 0, coil_size)
+            slave.add_block("discrete", cst.DISCRETE_INPUTS, 0, discrete_size)
             self._slaves.append(slave)
+            self._slave_by_id[sid] = slave
         self._stop = threading.Event()
         self._updater: threading.Thread | None = None
 
@@ -79,6 +144,43 @@ class ModbusMockServer:
             self._server.stop()
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------------ writes
+    def _slave(self, slave_id: Optional[int]):
+        if slave_id is None:
+            return self._slaves[0]
+        return self._slave_by_id[slave_id]
+
+    def write_registers(
+        self, function_code: int, address: int, values: List[int], slave_id: Optional[int] = None
+    ) -> None:
+        """Raw write into the block matching ``function_code`` (1/2/3/4)."""
+        fc = int(function_code)
+        block_name = _BLOCK_NAME_BY_FC.get(fc)
+        if block_name is None:
+            raise ValueError(f"unsupported function_code {function_code!r}")
+        self._slave(slave_id).set_values(block_name, address, list(values))
+
+    def write_value(
+        self,
+        function_code: int,
+        address: int,
+        value,
+        data_type: str,
+        byte_order: str = "big",
+        slave_id: Optional[int] = None,
+    ) -> None:
+        """Encode ``value`` as a real device would and write it at ``address``.
+
+        For fc 1/2 (coils/discrete inputs) ``value`` is treated as a single
+        bool bit regardless of ``data_type``. For fc 3/4 ``value`` is packed
+        per :func:`encode_scalar`.
+        """
+        fc = int(function_code)
+        if fc in (1, 2):
+            self.write_registers(fc, address, [1 if value else 0], slave_id=slave_id)
+            return
+        self.write_registers(fc, address, encode_scalar(value, data_type, byte_order), slave_id=slave_id)
 
     # ------------------------------------------------------------------
     def _update_loop(self) -> None:

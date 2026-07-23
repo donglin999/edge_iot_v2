@@ -103,7 +103,18 @@ def _combine_registers(registers, data_type: str, num: int, byte_order: str = "b
     if num <= 1:
         if not registers:
             return 0
-        return bool(registers[0]) if (data_type or "").lower() == "bool" else registers[0]
+        dt0 = (data_type or "").strip().lower()
+        raw0 = int(registers[0])
+        if dt0 == "bool":
+            return bool(raw0)
+        if dt0 in ("int16", "short", "int"):
+            # modbus-tk decodes every holding/input register with struct
+            # format ">H" (unsigned) — a device-side int16 arrives as its
+            # 16-bit two's-complement bit pattern (e.g. -1 -> 65535) and
+            # must be sign-extended here, or every negative single-register
+            # reading silently comes back as a large positive uint16.
+            return raw0 - 0x10000 if raw0 >= 0x8000 else raw0
+        return raw0
 
     dt = (data_type or "").strip().lower()
     word_bytes = b"".join(
