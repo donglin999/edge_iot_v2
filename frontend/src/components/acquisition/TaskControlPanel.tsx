@@ -1,5 +1,27 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, InputNumber, Modal, Tag, Tooltip, message } from 'antd';
+import {
+  Alert,
+  App,
+  Badge,
+  Button,
+  Card,
+  Descriptions,
+  InputNumber,
+  List,
+  Space,
+  Tag,
+  Tooltip,
+  Typography,
+} from 'antd';
+import {
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  ExclamationCircleOutlined,
+  FileTextOutlined,
+  InfoCircleOutlined,
+} from '@ant-design/icons';
 import type { AcqTask, AcquisitionSession } from '../../services/acquisitionApi';
 import {
   startTask,
@@ -9,7 +31,8 @@ import {
 import { deleteTask } from '../../services/taskApi';
 import { useWebSocket, WebSocketMessage } from '../../hooks/useWebSocket';
 import { buildWebSocketUrl } from '../../services/apiClient';
-import './TaskControlPanel.css';
+
+const { Text } = Typography;
 
 interface TaskControlPanelProps {
   task: AcqTask;
@@ -113,6 +136,10 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   onStatusChange,
   onEdit,
 }) => {
+  // antd5:静态 message/Modal.confirm 拿不到 ConfigProvider 的自定义 theme,
+  // 会在控制台刷 "Static function can not consume context" 警告 —— 改用
+  // App.useApp() 拿 context-aware 的实例(App.tsx 的 <AntdApp> 已经包了)。
+  const { message, modal } = App.useApp();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -418,7 +445,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   };
 
   const handleDelete = () => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除任务「${task.name}」?`,
       content: isRunning
         ? '该任务正在采集中,会先停止再删除。任务下的测点会一并删除,但不影响设备本身。'
@@ -459,24 +486,25 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
 
   const deviceHealth = getDeviceHealth();
 
-  const getStatusClass = (status: string) => {
+  // 会话状态 → antd Badge 的 status 语义色(带小圆点,和原 .status-badge__dot
+  // 是同一个视觉意图)。running 沿用原设计的琥珀色,不是常见的"运行=绿色"。
+  const getStatusBadge = (status: string): 'success' | 'error' | 'warning' | 'default' => {
     switch (status.toLowerCase()) {
       case 'running':
-        return 'status-badge status-badge--running';
+        return 'warning';
       case 'success':
       case 'succeeded':
       case 'completed':
-        return 'status-badge status-badge--success';
+        return 'success';
       case 'error':
       case 'failed':
-        return 'status-badge status-badge--error';
+        return 'error';
       case 'starting':
       case 'paused':
-        return 'status-badge status-badge--warning';
       case 'stopping':
-        return 'status-badge status-badge--warning';
+        return 'warning';
       default:
-        return 'status-badge status-badge--stopped';
+        return 'default';
     }
   };
 
@@ -498,57 +526,35 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   };
   const getStatusLabel = (status: string) => SESSION_STATUS_LABEL[status?.toLowerCase()] ?? status;
 
-  const getHealthBadgeClass = (status: string) => {
+  const getHealthTagColor = (status: string) => {
     switch (status) {
       case 'healthy':
-        return 'badge badge--success';
+        return 'success';
       case 'error':
-        return 'badge badge--error';
+        return 'error';
       case 'timeout':
-        return 'badge badge--warning';
+        return 'warning';
       default:
-        return 'badge badge--muted';
+        return 'default';
     }
   };
 
-  const getLogIcon = (level: LogEntry['level']) => {
-    switch (level) {
-      case 'error':
-        return (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="12" y1="8" x2="12" y2="12" />
-            <line x1="12" y1="16" x2="12.01" y2="16" />
-          </svg>
-        );
-      case 'warning':
-        return (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-            <line x1="12" y1="9" x2="12" y2="13" />
-            <line x1="12" y1="17" x2="12.01" y2="17" />
-          </svg>
-        );
-      case 'success':
-        return (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-            <polyline points="22 4 12 14.01 9 11.01" />
-          </svg>
-        );
-      default:
-        return (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="12" y1="16" x2="12" y2="12" />
-            <line x1="12" y1="8" x2="12.01" y2="8" />
-          </svg>
-        );
-    }
+  const LOG_ICON: Record<LogEntry['level'], React.ReactNode> = {
+    error: <CloseCircleOutlined style={{ color: 'var(--error, #ef4444)' }} />,
+    warning: <ExclamationCircleOutlined style={{ color: 'var(--warning, #f59e0b)' }} />,
+    success: <CheckCircleOutlined style={{ color: 'var(--success, #22c55e)' }} />,
+    info: <InfoCircleOutlined style={{ color: 'var(--info, #3b82f6)' }} />,
+  };
+
+  const logLevelColor: Record<LogEntry['level'], string | undefined> = {
+    error: 'var(--error, #ef4444)',
+    warning: 'var(--warning, #f59e0b)',
+    success: undefined,
+    info: undefined,
   };
 
   return (
-    <div className="task-panel">
+    <Card size="small">
       {isRunning && activeSession && (
         <SessionEventSubscriber
           key={`ws-${activeSession.id}`}
@@ -558,80 +564,67 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
           onConnectionEvent={handleWsConnectionEvent}
         />
       )}
-      <div className="task-panel__header">
-        <div className="task-panel__info">
-          <div className="task-panel__title-row">
-            <h3 className="task-panel__title">
-              <span className={`status-dot ${isRunning ? 'status-dot--running' : 'status-dot--stopped'}`} />
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 20 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 8 }}>
+            <Text strong style={{ fontSize: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Badge status={isRunning ? 'success' : 'default'} />
               {task.name}
-            </h3>
-            <div className="task-panel__badges">
-              <span className={task.is_active ? 'badge badge--active' : 'badge badge--muted'}>
-                {task.is_active ? '启用' : '停用'}
-              </span>
+            </Text>
+            <Space size={4}>
+              <Tag color={task.is_active ? 'success' : 'default'}>{task.is_active ? '启用' : '停用'}</Tag>
               {deviceHealth && (
-                <span className={getHealthBadgeClass(deviceHealth.status)}>
+                <Tag color={getHealthTagColor(deviceHealth.status)}>
                   设备: {deviceHealth.status === 'healthy' ? '正常' :
                          deviceHealth.status === 'error' ? '错误' :
                          deviceHealth.status === 'timeout' ? '超时' : '断开'}
-                </span>
+                </Tag>
               )}
-            </div>
+            </Space>
           </div>
-          <p className="task-panel__code">{task.code}</p>
-          <p className="task-panel__description">{task.description}</p>
+          <Text type="secondary" style={{ fontFamily: 'monospace', fontSize: 13, display: 'block' }}>
+            {task.code}
+          </Text>
+          <Text type="secondary" style={{ fontSize: 14 }}>{task.description}</Text>
         </div>
-        <div className="task-panel__actions">
+        <Space>
           {isRunning ? (
-            <button
-              onClick={handleStop}
-              disabled={loading}
-              className="btn btn--danger"
-            >
+            <Button danger loading={loading} onClick={handleStop}>
               {loading ? '停止中...' : '停止'}
-            </button>
+            </Button>
           ) : (
-            <button
+            <Button
+              type="primary"
+              loading={loading}
+              disabled={!task.is_active}
               onClick={handleStart}
-              disabled={loading || !task.is_active}
-              className="btn btn--success"
             >
               {loading ? '启动中...' : '启动'}
-            </button>
+            </Button>
           )}
-          <button
-            onClick={() => setShowLogs(!showLogs)}
-            className={`btn btn--secondary btn--icon ${showLogs ? 'btn--active' : ''}`}
-            title="查看日志"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-              <polyline points="14 2 14 8 20 8" />
-              <line x1="16" y1="13" x2="8" y2="13" />
-              <line x1="16" y1="17" x2="8" y2="17" />
-              <polyline points="10 9 9 9 8 9" />
-            </svg>
-          </button>
+          <Tooltip title="查看日志">
+            <Button
+              type={showLogs ? 'primary' : 'default'}
+              icon={<FileTextOutlined />}
+              onClick={() => setShowLogs(!showLogs)}
+            />
+          </Tooltip>
           {onEdit && (
-            <button onClick={onEdit} className="btn btn--secondary btn--icon" title="编辑任务(改名/测点/频率)">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
-                <path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
-              </svg>
-            </button>
+            <Tooltip title="编辑任务(改名/测点/频率)">
+              <Button icon={<EditOutlined />} onClick={onEdit} />
+            </Tooltip>
           )}
-          <button onClick={handleDelete} className="btn btn--secondary btn--icon" title="删除任务">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ color: 'var(--color-error, #ff4d4f)' }}>
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
-            </svg>
-          </button>
-        </div>
+          <Tooltip title="删除任务">
+            <Button danger icon={<DeleteOutlined />} onClick={handleDelete} />
+          </Tooltip>
+        </Space>
       </div>
 
-      <div className="task-panel__sample-rate">
-        <div className="sample-rate__row">
-          <span className="sample-rate__label">采样频率</span>
+      <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-primary, #e5e7eb)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <Text type="secondary" style={{ fontSize: 13, fontWeight: 500, minWidth: 72 }}>
+            采样频率
+          </Text>
           <InputNumber
             min={0.1}
             max={100}
@@ -652,17 +645,17 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
           >
             保存
           </Button>
-          <span className="sample-rate__hint">
+          <Text type="secondary" style={{ fontSize: 12 }}>
             {isRunning
               ? '※ 保存后立即以新频率重启采集'
               : '※ 修改后将影响新启动的会话'}
-          </span>
+          </Text>
         </div>
         {isRunning && (
-          <div className="sample-rate__actual">
-            <span className="sample-rate__actual-label">入库速率</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, paddingLeft: 84, flexWrap: 'wrap' }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>入库速率</Text>
             {actualIngestRate === null ? (
-              <span className="sample-rate__actual-value">统计中…</span>
+              <Text style={{ fontSize: 14, fontWeight: 600 }}>统计中…</Text>
             ) : (
               <Tooltip
                 title={
@@ -688,10 +681,10 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
                 }
               >
                 <span style={{ cursor: 'help' }}>
-                  <span className="sample-rate__actual-value">
+                  <Text style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
                     实际 {actualIngestRate}
                     {targetIngestRate !== null && ` / 目标 ${targetIngestRate}`} 点/秒
-                  </span>
+                  </Text>
                   {ingestGrade === 'ok' && (
                     <Tag color="success" style={{ marginLeft: 8 }}>
                       达标{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
@@ -720,95 +713,71 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
       </div>
 
       {activeSession && (
-        <div className="task-panel__session">
-          <div className="session-grid">
-            <div className="session-item">
-              <span className="session-item__label">会话状态</span>
-              <span className={getStatusClass(activeSession.status)}>
-                <span className="status-badge__dot" />
-                {getStatusLabel(activeSession.status)}
-              </span>
-            </div>
-            <div className="session-item">
-              <span className="session-item__label">会话ID</span>
-              <span className="session-item__value">#{activeSession.id}</span>
-            </div>
-            <div className="session-item">
-              <span className="session-item__label">开始时间</span>
-              <span className="session-item__value">
-                {activeSession.started_at
-                  ? new Date(activeSession.started_at).toLocaleString('zh-CN')
-                  : '-'}
-              </span>
-            </div>
-            <div className="session-item">
-              <span className="session-item__label">运行时长</span>
-              <span className="session-item__value">{formatDuration(activeSession.duration_seconds)}</span>
-            </div>
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-primary, #e5e7eb)' }}>
+          <Descriptions size="small" column={{ xs: 1, sm: 2, md: 4 }}>
+            <Descriptions.Item label="会话状态">
+              <Badge status={getStatusBadge(activeSession.status)} text={getStatusLabel(activeSession.status)} />
+            </Descriptions.Item>
+            <Descriptions.Item label="会话ID">#{activeSession.id}</Descriptions.Item>
+            <Descriptions.Item label="开始时间">
+              {activeSession.started_at
+                ? new Date(activeSession.started_at).toLocaleString('zh-CN')
+                : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="运行时长">
+              {formatDuration(activeSession.duration_seconds)}
+            </Descriptions.Item>
             {activeSession.error_message && (
-              <div className="session-item session-item--error">
-                <span className="session-item__label">错误信息</span>
-                <span className="session-item__value session-item__value--error">{activeSession.error_message}</span>
-              </div>
+              <Descriptions.Item label="错误信息" span={2}>
+                <Text type="danger">{activeSession.error_message}</Text>
+              </Descriptions.Item>
             )}
-          </div>
+          </Descriptions>
         </div>
       )}
 
       {/* Logs Panel */}
       {showLogs && (
-        <div className="task-panel__logs">
-          <div className="logs-header">
-            <span className="logs-title">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <polyline points="14 2 14 8 20 8" />
-              </svg>
-              操作日志
-            </span>
-            <button onClick={clearLogs} className="logs-clear">
-              清空
-            </button>
-          </div>
-          <div className="logs-list">
-            {logs.length === 0 ? (
-              <div className="logs-empty">暂无日志记录</div>
-            ) : (
-              logs.map((log, index) => (
-                <div key={index} className={`log-entry log-entry--${log.level}`}>
-                  <span className="log-icon">{getLogIcon(log.level)}</span>
-                  <span className="log-time">
+        <div style={{ marginTop: 16 }}>
+          <List
+            size="small"
+            bordered
+            header={
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Text strong style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+                  <FileTextOutlined /> 操作日志
+                </Text>
+                <Button size="small" type="text" onClick={clearLogs}>清空</Button>
+              </div>
+            }
+            dataSource={logs}
+            locale={{ emptyText: '暂无日志记录' }}
+            style={{ maxHeight: 240, overflowY: 'auto' }}
+            renderItem={(log, index) => (
+              <List.Item key={index}>
+                <Space align="start" size={8} style={{ width: '100%' }}>
+                  {LOG_ICON[log.level]}
+                  <Text type="secondary" style={{ fontSize: 11, fontFamily: 'monospace', whiteSpace: 'nowrap' }}>
                     {new Date(log.timestamp).toLocaleTimeString('zh-CN')}
-                  </span>
-                  <span className="log-message">{log.message}</span>
-                </div>
-              ))
+                  </Text>
+                  <Text style={{ fontSize: 13, color: logLevelColor[log.level], wordBreak: 'break-word' }}>
+                    {log.message}
+                  </Text>
+                </Space>
+              </List.Item>
             )}
-          </div>
+          />
         </div>
       )}
 
       {error && (
-        <div className="task-panel__alert task-panel__alert--error">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="12" y1="8" x2="12" y2="12" />
-            <line x1="12" y1="16" x2="12.01" y2="16" />
-          </svg>
-          <span>{error}</span>
-        </div>
+        <Alert type="error" showIcon message={error} style={{ marginTop: 16 }} />
       )}
 
       {success && (
-        <div className="task-panel__alert task-panel__alert--success">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-            <polyline points="22 4 12 14.01 9 11.01" />
-          </svg>
-          <span>{success}</span>
-        </div>
+        <Alert type="success" showIcon message={success} style={{ marginTop: 16 }} />
       )}
-    </div>
+    </Card>
   );
 };
 

@@ -133,7 +133,7 @@ const ConnectionTestModal: React.FC<Props> = ({ open, deviceId, deviceName, onCl
       okText="关闭"
       cancelButtonProps={{ style: { display: 'none' } }}
       width={560}
-      destroyOnClose
+      destroyOnHidden
     >
       <div style={{ padding: '4px 0' }}>
         {PLANNED_STEPS.map((planned, index) => {

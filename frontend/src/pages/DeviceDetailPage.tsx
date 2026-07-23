@@ -1,6 +1,31 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { Modal, Tag, message } from 'antd';
+import {
+  Alert,
+  App,
+  Button,
+  Card,
+  Col,
+  Descriptions,
+  Empty,
+  Input,
+  Row,
+  Spin,
+  Statistic,
+  Table,
+  Tag,
+  Typography,
+} from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+import {
+  ArrowLeftOutlined,
+  ApiOutlined,
+  DownloadOutlined,
+  EditOutlined,
+  DeleteOutlined,
+  PlayCircleOutlined,
+  SearchOutlined,
+} from '@ant-design/icons';
 import {
   fetchDevice,
   fetchDevicePoints,
@@ -13,12 +38,19 @@ import {
 import { listProtocols, protocolTagColor, type ProtocolDescriptor } from '../services/protocolApi';
 import ConnectionTestModal from '../components/ConnectionTestModal';
 import DeviceFormModal from '../components/DeviceFormModal';
-import './DeviceDetailPage.css';
+
+const { Title, Text } = Typography;
+
+type RelatedTask = DeviceStats['related_tasks'][number];
 
 const DeviceDetailPage = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const deviceId = parseInt(id || '0', 10);
+  // antd5:静态 message/Modal.confirm 拿不到 ConfigProvider 的自定义 theme,
+  // 会在控制台刷 "Static function can not consume context" 警告 —— 改用
+  // App.useApp() 拿 context-aware 的实例(App.tsx 的 <AntdApp> 已经包了)。
+  const { message, modal } = App.useApp();
 
   const [device, setDevice] = useState<Device | null>(null);
   const [points, setPoints] = useState<Point[]>([]);
@@ -70,7 +102,7 @@ const DeviceDetailPage = () => {
     // 与设备列表页(DeviceListPage)口径一致:测点和自动导入的任务都会一并
     // 删除,不影响设备本身之外的东西。以前这里一个 confirm 只提测点、列表页
     // 只提任务,两处文案互相矛盾。
-    Modal.confirm({
+    modal.confirm({
       title: '确定删除该设备?',
       content: `${device.name} (${device.code}) —— 测点和自动导入的任务都会一并删除,不影响设备本身之外的东西。`,
       okText: '删除',
@@ -125,214 +157,147 @@ const DeviceDetailPage = () => {
 
   if (loading) {
     return (
-      <div className="loading">
-        <div className="loading__spinner" />
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '60vh' }}>
+        <Spin size="large" />
       </div>
     );
   }
 
   if (error) {
-    return (
-      <div className="error-state">
-        <div className="error-state__title">加载失败</div>
-        <div className="error-state__message">{error}</div>
-      </div>
-    );
+    return <Alert type="error" showIcon message="加载失败" description={error} />;
   }
 
   if (!device) {
-    return (
-      <div className="empty-state">
-        <div className="empty-state__title">设备不存在</div>
-      </div>
-    );
+    return <Empty description="设备不存在" style={{ marginTop: 80 }} />;
   }
 
+  const taskColumns: ColumnsType<RelatedTask> = [
+    { title: '任务编码', dataIndex: 'code' },
+    { title: '任务名称', dataIndex: 'name' },
+    {
+      title: '状态',
+      dataIndex: 'is_active',
+      render: (active: boolean) => <Tag color={active ? 'success' : 'default'}>{active ? '启用' : '停用'}</Tag>,
+    },
+    {
+      title: '操作',
+      render: () => (
+        <Link to="/acquisition">
+          <PlayCircleOutlined /> 控制
+        </Link>
+      ),
+    },
+  ];
+
+  const pointColumns: ColumnsType<Point> = [
+    { title: '编码', dataIndex: 'code', render: (v: string) => <Text strong>{v}</Text> },
+    { title: '地址', dataIndex: 'address', render: (v: string) => <Text type="secondary">{v}</Text> },
+    { title: '描述', dataIndex: 'description', render: (v: string) => <Text type="secondary">{v}</Text> },
+    {
+      // 真正生效的是任务级 task.sample_rate_hz;每测点这个值是死值,标注清楚
+      // 以免误导(rank15c)。Kafka 列已整体移除:to_kafka 只在这个页面出现过,
+      // 设不了也与 InfluxDB 采集链路无关。
+      title: '采样率 (Hz,继承任务)',
+      dataIndex: 'sample_rate_hz',
+    },
+  ];
+
   return (
-    <div className="device-detail-page">
+    <div style={{ maxWidth: 1200 }}>
       {/* Header */}
-      <div className="page-header">
-        <div className="page-header__left">
-          <Link to="/devices" className="back-link">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="15 18 9 12 15 6" />
-            </svg>
-            返回设备列表
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, gap: 16, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <Link to="/devices" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <ArrowLeftOutlined /> 返回设备列表
           </Link>
-          <h2 className="page-header__title">{device.name}</h2>
+          <Title level={3} style={{ margin: 0 }}>{device.name}</Title>
           <Tag color={protocolTagColor(protocols.find((p) => p.name === device.protocol)?.category)}>
             {protocols.find((p) => p.name === device.protocol)?.label ?? device.protocol}
           </Tag>
         </div>
-        <div className="page-header__actions">
-          <button onClick={() => setEditOpen(true)} className="btn btn--secondary">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
-              <path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
-            </svg>
-            修改配置
-          </button>
-          <button onClick={() => setTestOpen(true)} className="btn btn--secondary">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-              <polyline points="22 4 12 14.01 9 11.01" />
-            </svg>
-            测试连接
-          </button>
-          <button onClick={handleDelete} className="btn btn--danger">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
-            </svg>
-            删除设备
-          </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button icon={<EditOutlined />} onClick={() => setEditOpen(true)}>修改配置</Button>
+          <Button icon={<ApiOutlined />} onClick={() => setTestOpen(true)}>测试连接</Button>
+          <Button danger icon={<DeleteOutlined />} onClick={handleDelete}>删除设备</Button>
         </div>
       </div>
 
       {/* Info Grid */}
-      <div className="info-grid">
-        <div className="card">
-          <h3 className="card__title">基本信息</h3>
-          <div className="info-list">
-            <div className="info-item">
-              <span className="info-item__label">设备编码</span>
-              <span className="info-item__value">{device.code}</span>
-            </div>
-            <div className="info-item">
-              <span className="info-item__label">IP 地址</span>
-              <span className="info-item__value">{device.ip_address || 'N/A'}</span>
-            </div>
-            <div className="info-item">
-              <span className="info-item__label">端口</span>
-              <span className="info-item__value">{device.port || 'N/A'}</span>
-            </div>
-            <div className="info-item">
-              <span className="info-item__label">站点 ID</span>
-              <span className="info-item__value">{device.site}</span>
-            </div>
-          </div>
-        </div>
+      <Row gutter={20} style={{ marginBottom: 24 }}>
+        <Col xs={24} md={12}>
+          <Card title="基本信息" size="small" style={{ height: '100%' }}>
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label="设备编码">{device.code}</Descriptions.Item>
+              <Descriptions.Item label="IP 地址">{device.ip_address || 'N/A'}</Descriptions.Item>
+              <Descriptions.Item label="端口">{device.port || 'N/A'}</Descriptions.Item>
+              <Descriptions.Item label="站点 ID">{device.site}</Descriptions.Item>
+            </Descriptions>
+          </Card>
+        </Col>
 
         {stats && (
-          <div className="card">
-            <h3 className="card__title">统计信息</h3>
-            <div className="stats-grid">
-              <div className="stat-item">
-                <div className="stat-item__value">{stats.total_points}</div>
-                <div className="stat-item__label">测点总数</div>
-              </div>
-              <div className="stat-item">
-                <div className="stat-item__value">{stats.task_count}</div>
-                <div className="stat-item__label">关联任务</div>
-              </div>
-              <div className="stat-item stat-item--wide">
-                <div className="stat-item__value stat-item__value--small">
+          <Col xs={24} md={12}>
+            <Card title="统计信息" size="small" style={{ height: '100%' }}>
+              <Row gutter={16}>
+                <Col span={12}>
+                  <Statistic title="测点总数" value={stats.total_points} />
+                </Col>
+                <Col span={12}>
+                  <Statistic title="关联任务" value={stats.task_count} />
+                </Col>
+              </Row>
+              <div style={{ marginTop: 16 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>最近采集</Text>
+                <div style={{ fontSize: 14, fontWeight: 500 }}>
                   {stats.last_acquisition ? new Date(stats.last_acquisition).toLocaleString('zh-CN') : '从未采集'}
                 </div>
-                <div className="stat-item__label">最近采集</div>
               </div>
-            </div>
-          </div>
+            </Card>
+          </Col>
         )}
-      </div>
+      </Row>
 
       {/* Related Tasks */}
       {stats && stats.related_tasks.length > 0 && (
-        <div className="page-section">
-          <h2 className="page-section__title">关联任务 ({stats.task_count})</h2>
-          <div className="table-container">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>任务编码</th>
-                  <th>任务名称</th>
-                  <th>状态</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {stats.related_tasks.slice(0, 5).map(task => (
-                  <tr key={task.id}>
-                    <td className="font-medium">{task.code}</td>
-                    <td>{task.name}</td>
-                    <td>
-                      <span className={task.is_active ? 'status-badge status-badge--active' : 'status-badge status-badge--inactive'}>
-                        <span className="status-badge__dot" />
-                        {task.is_active ? '启用' : '停用'}
-                      </span>
-                    </td>
-                    <td>
-                      <Link to="/acquisition" className="btn btn--ghost btn--icon">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <polygon points="5 3 19 12 5 21 5 3" />
-                        </svg>
-                      </Link>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        <div style={{ marginBottom: 24 }}>
+          <Title level={4} style={{ marginBottom: 16 }}>关联任务 ({stats.task_count})</Title>
+          <Table<RelatedTask>
+            rowKey="id"
+            size="small"
+            columns={taskColumns}
+            dataSource={stats.related_tasks.slice(0, 5)}
+            pagination={false}
+          />
         </div>
       )}
 
       {/* Points List */}
-      <div className="page-section">
-        <div className="page-header">
-          <h2 className="page-section__title">测点列表 ({filteredPoints.length} / {points.length})</h2>
-          <div className="flex gap-sm">
-            <input
-              type="text"
-              className="input"
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
+          <Title level={4} style={{ margin: 0 }}>测点列表 ({filteredPoints.length} / {points.length})</Title>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Input
+              prefix={<SearchOutlined />}
               placeholder="搜索测点..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               style={{ width: 200 }}
+              allowClear
             />
-            <button onClick={handleExportCSV} className="btn btn--secondary">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
-                <polyline points="7 10 12 15 17 10" />
-                <line x1="12" y1="15" x2="12" y2="3" />
-              </svg>
-              导出 CSV
-            </button>
+            <Button icon={<DownloadOutlined />} onClick={handleExportCSV}>导出 CSV</Button>
           </div>
         </div>
 
         {filteredPoints.length === 0 ? (
-          <div className="empty-state">
-            <svg className="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-            </svg>
-            <div className="empty-state__title">{searchTerm ? '没有匹配的测点' : '暂无测点数据'}</div>
-          </div>
+          <Empty description={searchTerm ? '没有匹配的测点' : '暂无测点数据'} />
         ) : (
-          <div className="table-container">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>编码</th>
-                  <th>地址</th>
-                  <th>描述</th>
-                  {/* 真正生效的是任务级 task.sample_rate_hz;每测点这个值是死值,
-                      标注清楚以免误导(rank15c)。Kafka 列已整体移除:to_kafka
-                      只在这个页面出现过,设不了也与 InfluxDB 采集链路无关。 */}
-                  <th>采样率 (Hz,继承任务)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredPoints.map(point => (
-                  <tr key={point.id}>
-                    <td className="font-medium">{point.code}</td>
-                    <td className="text-secondary">{point.address}</td>
-                    <td className="text-secondary">{point.description}</td>
-                    <td>{point.sample_rate_hz}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Table<Point>
+            rowKey="id"
+            size="small"
+            columns={pointColumns}
+            dataSource={filteredPoints}
+            pagination={false}
+          />
         )}
       </div>
 

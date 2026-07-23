@@ -4,7 +4,7 @@
  * 这些字段以前要在每台 scada 设备上重复填一遍;收敛到网关后,整条产线只填一次。
  */
 import React, { useEffect, useState } from 'react';
-import { Alert, Col, Form, Input, InputNumber, Modal, Row, Select, Switch, message } from 'antd';
+import { Alert, App, Col, Form, Input, InputNumber, Modal, Row, Select, Switch } from 'antd';
 
 import {
   DEFAULT_TOPIC_TEMPLATE,
@@ -30,6 +30,10 @@ const QOS_OPTIONS = [
 ];
 
 const ScadaGatewayFormModal: React.FC<Props> = ({ open, gateway, onClose, onSaved }) => {
+  // antd5:静态 message 拿不到 ConfigProvider 的自定义 theme,会在控制台刷
+  // "Static function can not consume context" 警告 —— 改用 App.useApp()
+  // 拿 context-aware 的实例(App.tsx 的 <AntdApp> 已经包了)。
+  const { message } = App.useApp();
   const [form] = Form.useForm<ScadaGatewayInput>();
   const [submitting, setSubmitting] = useState(false);
 
@@ -75,7 +79,7 @@ const ScadaGatewayFormModal: React.FC<Props> = ({ open, gateway, onClose, onSave
       onCancel={onClose}
       width={720}
       confirmLoading={submitting}
-      destroyOnClose
+      destroyOnHidden
     >
       <Alert
         type="info"

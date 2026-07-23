@@ -8,6 +8,7 @@
 import { useEffect, useState } from 'react';
 import {
   Alert,
+  App,
   Button,
   Card,
   Checkbox,
@@ -23,7 +24,6 @@ import {
   Tag,
   Typography,
   Upload,
-  message,
 } from 'antd';
 import {
   CheckCircleOutlined,
@@ -80,6 +80,10 @@ interface ImportJob {
 type Mode = 'merge' | 'replace' | 'append';
 
 const ImportJobPage = () => {
+  // antd5:静态 message 拿不到 ConfigProvider 的自定义 theme,会在控制台刷
+  // "Static function can not consume context" 警告 —— 改用 App.useApp()
+  // 拿 context-aware 的实例(App.tsx 的 <AntdApp> 已经包了)。
+  const { message } = App.useApp();
   const [job, setJob] = useState<ImportJob | null>(null);
   const [step, setStep] = useState(0);
   const [mode, setMode] = useState<Mode>('merge');

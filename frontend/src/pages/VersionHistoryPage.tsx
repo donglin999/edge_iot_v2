@@ -423,7 +423,7 @@ const VersionHistoryPage = () => {
         width={720}
         open={detailVersion !== null}
         onClose={() => setDetailVersion(null)}
-        destroyOnClose
+        destroyOnHidden
       >
         {detailVersion && (
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>

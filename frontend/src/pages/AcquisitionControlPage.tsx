@@ -1,12 +1,36 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Tooltip } from 'antd';
+import type { CSSProperties } from 'react';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Col,
+  Collapse,
+  Empty,
+  Row,
+  Spin,
+  Statistic,
+  Switch,
+  Tooltip,
+  Typography,
+} from 'antd';
+import {
+  CheckCircleOutlined,
+  PlayCircleOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  UnorderedListOutlined,
+  WarningOutlined,
+} from '@ant-design/icons';
 import type { AcqTask, AcquisitionSession } from '../services/acquisitionApi';
 import { fetchTasks, fetchActiveSessions } from '../services/acquisitionApi';
 import { isAbortError } from '../services/http';
 import TaskControlPanel from '../components/acquisition/TaskControlPanel';
 import TaskFormModal from '../components/acquisition/TaskFormModal';
 import { useWebSocket, WebSocketStatus, WebSocketMessage } from '../hooks/useWebSocket';
-import './AcquisitionControlPage.css';
+
+const { Title, Text } = Typography;
 
 const AcquisitionControlPage = () => {
   const [tasks, setTasks] = useState<AcqTask[]>([]);
@@ -114,16 +138,16 @@ const AcquisitionControlPage = () => {
   const runningCount = activeSessions.filter((s) => s.status === 'running').length;
   const errorCount = activeSessions.filter((s) => s.status === 'error').length;
 
-  const getWsStatusText = () => {
+  const getWsStatusBadge = () => {
     switch (wsStatus) {
       case WebSocketStatus.CONNECTED:
-        return <span className="ws-status ws-status--connected">实时连接已建立</span>;
+        return <Badge status="success" text="实时连接已建立" />;
       case WebSocketStatus.CONNECTING:
-        return <span className="ws-status ws-status--connecting">连接中...</span>;
+        return <Badge status="processing" text="连接中..." />;
       case WebSocketStatus.DISCONNECTED:
-        return <span className="ws-status ws-status--disconnected">实时连接已断开</span>;
+        return <Badge status="error" text="实时连接已断开" />;
       case WebSocketStatus.ERROR:
-        return <span className="ws-status ws-status--error">连接错误</span>;
+        return <Badge status="error" text="连接错误" />;
       default:
         return null;
     }
@@ -131,132 +155,127 @@ const AcquisitionControlPage = () => {
 
   if (initialLoading) {
     return (
-      <div className="loading">
-        <div className="loading__spinner" />
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '60vh' }}>
+        <Spin size="large" />
       </div>
     );
   }
 
+  const taskListStyle: CSSProperties = {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 12,
+  };
+
   return (
-    <div className="acquisition-control-page">
+    <div style={{ maxWidth: 1200 }}>
       {/* Header */}
-      <div className="page-header">
-        <div className="page-header__left">
-          <h2>采集控制台</h2>
-          {getWsStatusText()}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: 24,
+          gap: 16,
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <Title level={3} style={{ margin: 0 }}>
+            采集控制台
+          </Title>
+          {getWsStatusBadge()}
         </div>
-        <div className="page-header__actions">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <Tooltip title="关闭后,采集状态和入库速率仍会每 3 秒轮询兜底刷新;这个开关只控制状态变更是否通过 WebSocket 即时推送。">
-            <label className="ws-toggle">
-              <input
-                type="checkbox"
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Switch
+                size="small"
                 checked={useWebSocketUpdates}
-                onChange={(e) => setUseWebSocketUpdates(e.target.checked)}
+                onChange={setUseWebSocketUpdates}
               />
-              <span className="ws-toggle__label">WebSocket 实时推送(关闭后仍每 3s 轮询兜底)</span>
-            </label>
+              <Text type="secondary" style={{ fontSize: 14 }}>
+                WebSocket 实时推送(关闭后仍每 3s 轮询兜底)
+              </Text>
+            </div>
           </Tooltip>
-          <button onClick={() => loadData()} disabled={refreshing} className="btn btn--secondary">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M23 4v6h-6M1 20v-6h6" />
-              <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
-            </svg>
+          <Button icon={<ReloadOutlined />} loading={refreshing} onClick={() => loadData()}>
             刷新
-          </button>
-          <button
+          </Button>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
             onClick={() => {
               setEditingTaskId(undefined);
               setTaskModalOpen(true);
             }}
-            className="btn btn--primary"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
             新建任务
-          </button>
+          </Button>
         </div>
       </div>
 
       {error && (
-        <div className="error-banner">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="12" y1="8" x2="12" y2="12" />
-            <line x1="12" y1="16" x2="12.01" y2="16" />
-          </svg>
-          <span>加载失败: {error}</span>
-        </div>
+        <Alert
+          type="error"
+          showIcon
+          message={`加载失败: ${error}`}
+          style={{ marginBottom: 20 }}
+        />
       )}
 
       {/* Stats */}
-      <div className="stats-bar">
-        <div className="stat-card">
-          <div className="stat-card__icon stat-card__icon--total">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M12 2v20M2 12h20" />
-            </svg>
-          </div>
-          <div className="stat-card__content">
-            <div className="stat-card__value">{tasks.length}</div>
-            <div className="stat-card__label">任务总数</div>
-          </div>
-        </div>
-
-        <div className="stat-card">
-          <div className="stat-card__icon stat-card__icon--active">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M12 6v6l4 2" />
-            </svg>
-          </div>
-          <div className="stat-card__content">
-            <div className="stat-card__value">{activeTasks.length}</div>
-            <div className="stat-card__label">启用任务</div>
-          </div>
-        </div>
-
-        <div className="stat-card">
-          <div className="stat-card__icon stat-card__icon--running">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polygon points="5 3 19 12 5 21 5 3" />
-            </svg>
-          </div>
-          <div className="stat-card__content">
-            <div className="stat-card__value">{runningCount}</div>
-            <div className="stat-card__label">运行中</div>
-          </div>
-        </div>
-
-        <div className="stat-card">
-          <div className="stat-card__icon stat-card__icon--error">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <line x1="15" y1="9" x2="9" y2="15" />
-              <line x1="9" y1="9" x2="15" y2="15" />
-            </svg>
-          </div>
-          <div className="stat-card__content">
-            <div className="stat-card__value">{errorCount}</div>
-            <div className="stat-card__label">错误</div>
-          </div>
-        </div>
-      </div>
+      <Row gutter={16} style={{ marginBottom: 32 }}>
+        <Col xs={12} md={6}>
+          <Card variant="borderless">
+            <Statistic title="任务总数" value={tasks.length} prefix={<UnorderedListOutlined />} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card variant="borderless">
+            <Statistic title="启用任务" value={activeTasks.length} prefix={<CheckCircleOutlined />} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card variant="borderless">
+            <Statistic
+              title="运行中"
+              value={runningCount}
+              prefix={<PlayCircleOutlined />}
+              valueStyle={runningCount > 0 ? { color: '#22c55e' } : undefined}
+            />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card variant="borderless">
+            <Statistic
+              title="错误"
+              value={errorCount}
+              prefix={<WarningOutlined />}
+              valueStyle={errorCount > 0 ? { color: '#ef4444' } : undefined}
+            />
+          </Card>
+        </Col>
+      </Row>
 
       {/* Active Tasks */}
-      <div className="tasks-section">
-        <h3 className="tasks-section__title">启用的任务 ({activeTasks.length})</h3>
+      <div style={{ marginBottom: 24 }}>
+        <Title level={4} style={{ marginBottom: 16 }}>
+          启用的任务 ({activeTasks.length})
+        </Title>
         {activeTasks.length === 0 ? (
-          <div className="empty-state">
-            <svg className="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M12 6v6l4 2" />
-            </svg>
-            <div className="empty-state__title">暂无激活的采集任务</div>
-            <div className="empty-state__description">导入配置或启用任务以开始数据采集</div>
-          </div>
+          <Empty
+            description={
+              <>
+                <div>暂无激活的采集任务</div>
+                <Text type="secondary" style={{ fontSize: 13 }}>
+                  导入配置或启用任务以开始数据采集
+                </Text>
+              </>
+            }
+          />
         ) : (
-          <div className="tasks-list">
+          <div style={taskListStyle}>
             {activeTasks.map((task) => (
               <TaskControlPanel
                 key={task.id}
@@ -275,28 +294,36 @@ const AcquisitionControlPage = () => {
 
       {/* Inactive Tasks */}
       {inactiveTasks.length > 0 && (
-        <details className="tasks-section tasks-section--inactive">
-          <summary className="tasks-section__header">
-            <h3 className="tasks-section__title">未激活的任务 ({inactiveTasks.length})</h3>
-            <svg className="tasks-section__arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="6 9 12 15 18 9" />
-            </svg>
-          </summary>
-          <div className="tasks-list">
-            {inactiveTasks.map((task) => (
-              <TaskControlPanel
-                key={task.id}
-                task={task}
-                activeSession={getSessionForTask(task.id)}
-                onStatusChange={loadData}
-                onEdit={() => {
-                  setEditingTaskId(task.id);
-                  setTaskModalOpen(true);
-                }}
-              />
-            ))}
-          </div>
-        </details>
+        <Collapse
+          ghost
+          style={{ marginBottom: 24 }}
+          items={[
+            {
+              key: 'inactive',
+              label: (
+                <Text strong style={{ fontSize: 16 }}>
+                  未激活的任务 ({inactiveTasks.length})
+                </Text>
+              ),
+              children: (
+                <div style={taskListStyle}>
+                  {inactiveTasks.map((task) => (
+                    <TaskControlPanel
+                      key={task.id}
+                      task={task}
+                      activeSession={getSessionForTask(task.id)}
+                      onStatusChange={loadData}
+                      onEdit={() => {
+                        setEditingTaskId(task.id);
+                        setTaskModalOpen(true);
+                      }}
+                    />
+                  ))}
+                </div>
+              ),
+            },
+          ]}
+        />
       )}
 
       <TaskFormModal

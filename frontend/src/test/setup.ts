@@ -36,11 +36,14 @@ if (!window.ResizeObserver) {
   };
 }
 
-// antd 的 Table/Select 在 jsdom 下会因为拿不到布局信息刷屏 warning，
-// 与被测行为无关，这里静音掉，免得真正的报错被淹没。
+// `Warning: [antd:` 曾经用来静音两类噪音:(1) destroyOnClose 弃用告警 ——
+// 已经把全仓库的 destroyOnClose 都改成 destroyOnHidden,这条本身消失了;
+// (2) message/Modal 静态方法拿不到 ConfigProvider theme 的 "Static function
+// can not consume context" 告警 —— 已经把用得到的调用点都改成 App.useApp()
+// 拿 context-aware 实例。经验证,当前 50 个用例全跑一遍不再触发任何
+// `[antd:` 前缀的告警,这条静音规则整体收掉。
+// 仍需要静音的:
 const IGNORED = [
-  'Warning: [antd:',
-  '`destroyOnClose` is deprecated',
   'Warning: An update to',
   'not wrapped in act',
   'There may be circular references',

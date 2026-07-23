@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  App,
   Button,
   Divider,
   Empty,
@@ -27,7 +28,6 @@ import {
   Table,
   Tag,
   Typography,
-  message,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
@@ -74,6 +74,10 @@ interface Props {
 
 const TaskFormModal: React.FC<Props> = ({ open, taskId, onClose, onSaved }) => {
   const isEdit = taskId !== undefined;
+  // antd5:静态 message 拿不到 ConfigProvider 的自定义 theme,会在控制台刷
+  // "Static function can not consume context" 警告 —— 改用 App.useApp()
+  // 拿 context-aware 的实例(App.tsx 的 <AntdApp> 已经包了)。
+  const { message } = App.useApp();
   const [form] = Form.useForm();
   const [devices, setDevices] = useState<Device[]>([]);
   const [rows, setRows] = useState<PointRow[]>([]);
@@ -382,7 +386,7 @@ const TaskFormModal: React.FC<Props> = ({ open, taskId, onClose, onSaved }) => {
       cancelText="取消"
       confirmLoading={saving}
       width={920}
-      destroyOnClose
+      destroyOnHidden
     >
       <Form form={form} layout="vertical">
         <Space size="large" style={{ width: '100%' }} wrap>

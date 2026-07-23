@@ -89,7 +89,7 @@ const DeviceFormModal: React.FC<Props> = ({ open, deviceId, defaultProtocol, onC
       .finally(() => setLoading(false));
   }, [open, deviceId, defaultProtocol, form]);
 
-  // Modal 的内容是延迟挂载的(destroyOnClose + Portal),打开瞬间那次
+  // Modal 的内容是延迟挂载的(destroyOnHidden + Portal),打开瞬间那次
   // setFieldsValue 有可能写在表单项注册之前,导致「通信协议」明明已由
   // 「添加设备」下拉选好、表单里却是空值、一保存就报「请选择协议」。
   // 这里以 selected 为准再同步一次(protocols 载入后必定已挂载)。
@@ -131,7 +131,7 @@ const DeviceFormModal: React.FC<Props> = ({ open, deviceId, defaultProtocol, onC
       onCancel={onClose}
       width={entry.width}
       confirmLoading={submitting}
-      destroyOnClose
+      destroyOnHidden
     >
       <Spin spinning={loading}>
         <Form form={form} layout="vertical" preserve={false}>

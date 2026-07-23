@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
+  App,
   Badge,
   Button,
   Card,
@@ -19,7 +20,6 @@ import {
   Tabs,
   Tag,
   Typography,
-  message,
 } from 'antd';
 import {
   CheckOutlined,
@@ -83,6 +83,10 @@ const STATUS_LABEL: Record<string, { label: string; color: string }> = {
 };
 
 const AlarmsPage = () => {
+  // antd5:静态 message/Modal.confirm 拿不到 ConfigProvider 的自定义 theme,
+  // 会在控制台刷 "Static function can not consume context" 警告 —— 改用
+  // App.useApp() 拿 context-aware 的实例(App.tsx 的 <AntdApp> 已经包了)。
+  const { message, modal } = App.useApp();
   const [alarms, setAlarms] = useState<Alarm[]>([]);
   const [rules, setRules] = useState<AlarmRule[]>([]);
   const [loading, setLoading] = useState(true);
@@ -163,7 +167,7 @@ const AlarmsPage = () => {
   };
 
   const deleteRule = (rule: AlarmRule) => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除规则 "${rule.name}" ?`,
       content: '已产生的告警记录会保留。',
       okType: 'danger',
@@ -381,7 +385,7 @@ const AlarmsPage = () => {
         onCancel={() => setRuleModalOpen(false)}
         okText="保存"
         cancelText="取消"
-        destroyOnClose
+        destroyOnHidden
         width={600}
       >
         <Form form={form} layout="vertical">
