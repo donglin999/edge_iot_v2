@@ -21,7 +21,6 @@ import {
   Input,
   InputNumber,
   Modal,
-  Popconfirm,
   Select,
   Space,
   Switch,
@@ -437,17 +436,16 @@ const TaskFormModal: React.FC<Props> = ({ open, taskId, onClose, onSaved }) => {
         />
       )}
 
+      {/* 纯说明文字,不是需要确认的操作 —— 以前用 Popconfirm 包着,点一下弹出个
+          没有 onConfirm 的确认框,是个无意义的空点击(rank22b)。改成静态 Alert。 */}
       {isEdit && originalPointIds.length > 0 && (
-        <Popconfirm
-          title="移除的测点会连同实体一起删除"
-          description="保存时,从任务里移除的测点将被彻底删除(不只是解绑)。确认继续?"
-          okText="知道了"
-          showCancel={false}
-        >
-          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-            ⓘ 移除测点 = 删除测点实体
-          </Text>
-        </Popconfirm>
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 8 }}
+          message="移除测点 = 删除测点实体"
+          description="保存时,从任务里移除的测点将被彻底删除,不只是从任务里解绑。"
+        />
       )}
 
       {errors.length > 0 && (

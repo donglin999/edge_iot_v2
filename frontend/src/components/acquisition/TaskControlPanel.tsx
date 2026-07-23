@@ -464,6 +464,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
       case 'running':
         return 'status-badge status-badge--running';
       case 'success':
+      case 'succeeded':
       case 'completed':
         return 'status-badge status-badge--success';
       case 'error':
@@ -478,6 +479,24 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
         return 'status-badge status-badge--stopped';
     }
   };
+
+  // 会话状态中文化。以前直接渲染 activeSession.status 原值(英文,如
+  // "running"/"stopped"),且 'succeeded' 这种非枚举内取值会落到
+  // getStatusClass 的 default 分支变灰(rank22d,思路同 DashboardPage
+  // 的 RUN_STATUS 映射)。
+  const SESSION_STATUS_LABEL: Record<string, string> = {
+    starting: '启动中',
+    running: '运行中',
+    paused: '已暂停',
+    stopping: '停止中',
+    stopped: '已停止',
+    error: '错误',
+    success: '成功',
+    succeeded: '成功',
+    completed: '完成',
+    failed: '失败',
+  };
+  const getStatusLabel = (status: string) => SESSION_STATUS_LABEL[status?.toLowerCase()] ?? status;
 
   const getHealthBadgeClass = (status: string) => {
     switch (status) {
@@ -707,7 +726,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
               <span className="session-item__label">会话状态</span>
               <span className={getStatusClass(activeSession.status)}>
                 <span className="status-badge__dot" />
-                {activeSession.status}
+                {getStatusLabel(activeSession.status)}
               </span>
             </div>
             <div className="session-item">

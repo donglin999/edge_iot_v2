@@ -48,3 +48,23 @@ export async function downloadTemplate(protocols?: string[]): Promise<void> {
     protocols && protocols.length > 0 ? { protocols: protocols.join(',') } : undefined,
   );
 }
+
+/**
+ * AntD Tag color for a protocol's category. Shared by every place that
+ * renders a protocol badge (device list, device detail, ...) so they can't
+ * drift into showing different colors for the same protocol.
+ */
+export function protocolTagColor(category?: ProtocolDescriptor['category']): string {
+  switch (category) {
+    case 'industrial-ethernet':
+      return 'blue';
+    case 'fieldbus':
+      return 'orange';
+    case 'iot':
+      return 'purple';
+    case 'opc':
+      return 'cyan';
+    default:
+      return 'default';
+  }
+}

@@ -1,5 +1,8 @@
-import { useState } from 'react';
-import { NavLink, Outlet, useLocation } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
+import { Breadcrumb } from 'antd';
+import { HomeOutlined } from '@ant-design/icons';
+import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import './Layout.css';
 
 // SVG Icons as components for consistent rendering
@@ -68,7 +71,7 @@ const CollapseIcon = ({ collapsed }: { collapsed: boolean }) => (
 interface NavItem {
   path: string;
   label: string;
-  icon: React.ReactNode;
+  icon: ReactNode;
   end?: boolean;
 }
 
@@ -94,13 +97,53 @@ const routeTitles: Record<string, string> = {
 
 const Layout = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // 侧边栏「系统正常」以前是恒亮绿灯,不接任何数据(rank22a)。现在接真实信号:
+  // 未确认(firing)告警数。null = 还没拿到数据 / 请求失败,不能断言"正常"。
+  const [firingAlarms, setFiringAlarms] = useState<number | null>(null);
   const location = useLocation();
 
-  // Get page title from current path
-  const getPageTitle = () => {
-    // Handle nested routes like /devices/:id
-    const basePath = '/' + location.pathname.split('/')[1];
-    return routeTitles[basePath] || routeTitles[location.pathname] || 'Edge IoT';
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/acquisition/alarms/?status=firing&limit=1');
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        if (!cancelled) setFiringAlarms(typeof data?.count === 'number' ? data.count : 0);
+      } catch {
+        if (!cancelled) setFiringAlarms(null);
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Breadcrumb replaces the old top-bar title (rank18): every page already
+  // draws its own in-page title (often with a subtitle/actions alongside),
+  // so a second identical "设备管理" heading up in the header was pure
+  // duplication. The breadcrumb instead shows navigational context, which
+  // in-page titles don't.
+  const getBreadcrumbItems = (): Array<{ title: ReactNode }> => {
+    const segments = location.pathname.split('/').filter(Boolean);
+    const home = { title: <Link to="/"><HomeOutlined /></Link> };
+    if (segments.length === 0) {
+      return [home, { title: routeTitles['/'] }];
+    }
+    const basePath = '/' + segments[0];
+    const sectionTitle = routeTitles[basePath] || routeTitles[location.pathname] || 'Edge IoT';
+    const items: Array<{ title: ReactNode }> = [
+      home,
+      { title: segments.length > 1 ? <Link to={basePath}>{sectionTitle}</Link> : sectionTitle },
+    ];
+    // Only nested route today is /devices/:id.
+    if (segments.length > 1 && basePath === '/devices') {
+      items.push({ title: '设备详情' });
+    }
+    return items;
   };
 
   return (
@@ -143,10 +186,20 @@ const Layout = () => {
 
         <div className="sidebar__footer">
           {!sidebarCollapsed && (
-            <div className="sidebar__status">
-              <span className="status-dot status-dot--online" />
-              <span className="sidebar__status-text">系统正常</span>
-            </div>
+            <Link to="/alarms" className="sidebar__status" style={{ textDecoration: 'none' }}>
+              <span
+                className={`status-dot status-dot--${
+                  firingAlarms === null ? 'offline' : firingAlarms > 0 ? 'error' : 'online'
+                }`}
+              />
+              <span className="sidebar__status-text">
+                {firingAlarms === null
+                  ? '告警状态未知'
+                  : firingAlarms > 0
+                  ? `${firingAlarms} 个未确认告警`
+                  : '系统正常'}
+              </span>
+            </Link>
           )}
         </div>
       </aside>
@@ -154,7 +207,7 @@ const Layout = () => {
       {/* Main Content */}
       <main className="main">
         <header className="main__header">
-          <h1 className="main__title">{getPageTitle()}</h1>
+          <Breadcrumb items={getBreadcrumbItems()} />
           <div className="main__actions">
             <span className="main__time">
               {new Date().toLocaleDateString('zh-CN', {

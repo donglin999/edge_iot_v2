@@ -410,13 +410,13 @@ const DataVisualizationPage: React.FC = () => {
               allowClear
               showSearch
               optionFilterProp="label"
-              placeholder={tasksLoading ? '加载任务中...' : '任务（全部）'}
+              placeholder={tasksLoading ? '加载任务中...' : '任务（仅启用）'}
               style={{ width: '100%' }}
               value={filter.taskId ?? undefined}
               onChange={(v) => onTaskChange((v as number | undefined) ?? null)}
               options={taskOptions}
               loading={tasksLoading}
-              notFoundContent={tasksLoading ? <Spin size="small" /> : '暂无运行中任务'}
+              notFoundContent={tasksLoading ? <Spin size="small" /> : '暂无启用任务'}
             />
           </Col>
           <Col flex="220px">
@@ -502,8 +502,8 @@ const DataVisualizationPage: React.FC = () => {
           <Empty
             description={
               <span>
-                没有运行中的采集任务，请前往{' '}
-                <a onClick={() => navigate('/acquisition')}>采集控制</a> 启动任务
+                没有启用的采集任务，请前往{' '}
+                <a onClick={() => navigate('/acquisition')}>采集控制</a> 启用任务
               </span>
             }
           />

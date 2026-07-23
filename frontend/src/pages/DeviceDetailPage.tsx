@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
+import { Modal, Tag, message } from 'antd';
 import {
   fetchDevice,
   fetchDevicePoints,
@@ -9,6 +10,7 @@ import {
   Point,
   DeviceStats,
 } from '../services/deviceApi';
+import { listProtocols, protocolTagColor, type ProtocolDescriptor } from '../services/protocolApi';
 import ConnectionTestModal from '../components/ConnectionTestModal';
 import DeviceFormModal from '../components/DeviceFormModal';
 import './DeviceDetailPage.css';
@@ -28,12 +30,18 @@ const DeviceDetailPage = () => {
   const [editOpen, setEditOpen] = useState(false);
   // 「测试连接」立刻开弹窗展示整个过程,不再是按下去干等几秒再出结果。
   const [testOpen, setTestOpen] = useState(false);
+  // 协议展示名/分类色,与设备列表页同源(listProtocols),不再直接渲染机器名。
+  const [protocols, setProtocols] = useState<ProtocolDescriptor[]>([]);
 
   useEffect(() => {
     loadDeviceData();
     // 仅在 deviceId 变化时重新加载；loadDeviceData 每次渲染重建，不入依赖
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceId]);
+
+  useEffect(() => {
+    listProtocols().then(setProtocols).catch(() => undefined);
+  }, []);
 
   const loadDeviceData = async () => {
     setLoading(true);
@@ -57,32 +65,44 @@ const DeviceDetailPage = () => {
   };
 
 
-  const handleDelete = async () => {
-    if (!window.confirm(`确定要删除设备 "${device?.name}" 吗？\n\n注意：删除设备将同时删除其所有测点！`)) {
-      return;
-    }
-
-    try {
-      await deleteDevice(deviceId);
-      navigate('/devices');
-    } catch (err) {
-      alert(`删除失败: ${(err as Error).message}`);
-    }
+  const handleDelete = () => {
+    if (!device) return;
+    // 与设备列表页(DeviceListPage)口径一致:测点和自动导入的任务都会一并
+    // 删除,不影响设备本身之外的东西。以前这里一个 confirm 只提测点、列表页
+    // 只提任务,两处文案互相矛盾。
+    Modal.confirm({
+      title: '确定删除该设备?',
+      content: `${device.name} (${device.code}) —— 测点和自动导入的任务都会一并删除,不影响设备本身之外的东西。`,
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await deleteDevice(deviceId);
+          message.success('已删除');
+          navigate('/devices');
+        } catch (err) {
+          message.error(`删除失败: ${(err as Error).message}`);
+        }
+      },
+    });
   };
 
   const handleExportCSV = () => {
     if (points.length === 0) {
-      alert('没有测点数据可导出');
+      message.warning('没有测点数据可导出');
       return;
     }
 
-    const headers = ['编码', '地址', '描述', '采样率(Hz)', '发送到Kafka'];
+    // 不含 Kafka 列:to_kafka 只在这个页面出现过,设不了也用不上,和
+    // InfluxDB 采集链路无关(rank15b)。采样率标注为"继承任务"—— 真正生效
+    // 的是任务级 task.sample_rate_hz,这里每测点的值是死值,容易误导。
+    const headers = ['编码', '地址', '描述', '采样率(Hz,继承任务)'];
     const rows = points.map(p => [
       p.code,
       p.address,
       p.description,
       p.sample_rate_hz,
-      p.to_kafka ? '是' : '否',
     ]);
 
     const csvContent = [
@@ -102,14 +122,6 @@ const DeviceDetailPage = () => {
     point.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
     point.address.toLowerCase().includes(searchTerm.toLowerCase())
   );
-
-  const getProtocolBadgeClass = (protocol: string) => {
-    const p = protocol.toLowerCase();
-    if (p.includes('modbus')) return 'protocol-badge protocol-badge--modbus';
-    if (p.includes('mqtt')) return 'protocol-badge protocol-badge--mqtt';
-    if (p.includes('plc')) return 'protocol-badge protocol-badge--plc';
-    return 'protocol-badge';
-  };
 
   if (loading) {
     return (
@@ -148,7 +160,9 @@ const DeviceDetailPage = () => {
             返回设备列表
           </Link>
           <h2 className="page-header__title">{device.name}</h2>
-          <span className={getProtocolBadgeClass(device.protocol)}>{device.protocol}</span>
+          <Tag color={protocolTagColor(protocols.find((p) => p.name === device.protocol)?.category)}>
+            {protocols.find((p) => p.name === device.protocol)?.label ?? device.protocol}
+          </Tag>
         </div>
         <div className="page-header__actions">
           <button onClick={() => setEditOpen(true)} className="btn btn--secondary">
@@ -301,8 +315,10 @@ const DeviceDetailPage = () => {
                   <th>编码</th>
                   <th>地址</th>
                   <th>描述</th>
-                  <th>采样率 (Hz)</th>
-                  <th>Kafka</th>
+                  {/* 真正生效的是任务级 task.sample_rate_hz;每测点这个值是死值,
+                      标注清楚以免误导(rank15c)。Kafka 列已整体移除:to_kafka
+                      只在这个页面出现过,设不了也与 InfluxDB 采集链路无关。 */}
+                  <th>采样率 (Hz,继承任务)</th>
                 </tr>
               </thead>
               <tbody>
@@ -312,19 +328,6 @@ const DeviceDetailPage = () => {
                     <td className="text-secondary">{point.address}</td>
                     <td className="text-secondary">{point.description}</td>
                     <td>{point.sample_rate_hz}</td>
-                    <td>
-                      {point.to_kafka ? (
-                        <span className="status-badge status-badge--active">
-                          <span className="status-badge__dot" />
-                          是
-                        </span>
-                      ) : (
-                        <span className="status-badge status-badge--inactive">
-                          <span className="status-badge__dot" />
-                          否
-                        </span>
-                      )}
-                    </td>
                   </tr>
                 ))}
               </tbody>

@@ -10,6 +10,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Form, Input, Modal, Select, Spin, Typography } from 'antd';
 import { apiClient } from '../services/apiClient';
 import { listProtocols, type ProtocolDescriptor } from '../services/protocolApi';
+import { fetchSites, type Site } from '../services/versionApi';
 import {
   getProtocolConfig,
   type DeviceRecord,
@@ -35,6 +36,11 @@ const DeviceFormModal: React.FC<Props> = ({ open, deviceId, defaultProtocol, onC
   const [device, setDevice] = useState<DeviceRecord | undefined>();
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // 站点下拉:之前是裸 number 输入 + 一句指向不存在的 /sites 页面的提示
+  // (rank16)。改为拉取已有站点列表;拉不到时退化为 number 输入,提示改成
+  // 不指向任何页面的「默认站点 1」。
+  const [sites, setSites] = useState<Site[]>([]);
+  const [sitesLoading, setSitesLoading] = useState(true);
   const configRef = useRef<ProtocolConfigHandle>(null);
 
   // Load protocol descriptors once when modal opens
@@ -43,6 +49,15 @@ const DeviceFormModal: React.FC<Props> = ({ open, deviceId, defaultProtocol, onC
     listProtocols()
       .then((data) => setProtocols(data))
       .catch(() => undefined);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    setSitesLoading(true);
+    fetchSites()
+      .then(setSites)
+      .catch(() => setSites([]))
+      .finally(() => setSitesLoading(false));
   }, [open]);
 
   // Pre-fill when editing
@@ -130,9 +145,27 @@ const DeviceFormModal: React.FC<Props> = ({ open, deviceId, defaultProtocol, onC
                 <Input placeholder="如:1#车间空压机" />
               </Form.Item>
 
-              <Form.Item name="site" label="站点 ID" initialValue={1}
-                         tooltip="新站点请先在站点管理页创建">
-                <Input type="number" />
+              <Form.Item
+                name="site"
+                label="站点 ID"
+                initialValue={1}
+                tooltip={
+                  sitesLoading || sites.length > 0
+                    ? '设备所属的站点'
+                    : '默认站点 1(暂无可选站点列表)'
+                }
+              >
+                {sites.length > 0 ? (
+                  <Select
+                    loading={sitesLoading}
+                    showSearch
+                    optionFilterProp="label"
+                    placeholder="选择站点"
+                    options={sites.map((s) => ({ label: `${s.name} (${s.code})`, value: s.id }))}
+                  />
+                ) : (
+                  <Input type="number" disabled={sitesLoading} />
+                )}
               </Form.Item>
             </>
           )}

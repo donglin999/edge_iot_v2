@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { Tooltip } from 'antd';
 import type { AcqTask, AcquisitionSession } from '../services/acquisitionApi';
 import { fetchTasks, fetchActiveSessions } from '../services/acquisitionApi';
 import { isAbortError } from '../services/http';
@@ -145,14 +146,16 @@ const AcquisitionControlPage = () => {
           {getWsStatusText()}
         </div>
         <div className="page-header__actions">
-          <label className="ws-toggle">
-            <input
-              type="checkbox"
-              checked={useWebSocketUpdates}
-              onChange={(e) => setUseWebSocketUpdates(e.target.checked)}
-            />
-            <span className="ws-toggle__label">实时更新</span>
-          </label>
+          <Tooltip title="关闭后,采集状态和入库速率仍会每 3 秒轮询兜底刷新;这个开关只控制状态变更是否通过 WebSocket 即时推送。">
+            <label className="ws-toggle">
+              <input
+                type="checkbox"
+                checked={useWebSocketUpdates}
+                onChange={(e) => setUseWebSocketUpdates(e.target.checked)}
+              />
+              <span className="ws-toggle__label">WebSocket 实时推送(关闭后仍每 3s 轮询兜底)</span>
+            </label>
+          </Tooltip>
           <button onClick={() => loadData()} disabled={refreshing} className="btn btn--secondary">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M23 4v6h-6M1 20v-6h6" />

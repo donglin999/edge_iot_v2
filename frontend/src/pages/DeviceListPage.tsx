@@ -39,7 +39,7 @@ import DeviceFormModal from '../components/DeviceFormModal';
 import { protocolsWithExcel } from '../protocols/registry';
 import { apiClient } from '../services/apiClient';
 import { fetchAllPages } from '../services/pagination';
-import { downloadTemplate, listProtocols, type ProtocolDescriptor } from '../services/protocolApi';
+import { downloadTemplate, listProtocols, protocolTagColor, type ProtocolDescriptor } from '../services/protocolApi';
 import type { DeviceStatus } from '../services/deviceApi';
 
 interface Device {
@@ -125,7 +125,7 @@ const DeviceListPage = () => {
   const handleDelete = (device: Device) => {
     Modal.confirm({
       title: '确定删除该设备?',
-      content: `${device.name} (${device.code}) — 关联的自动导入任务会一起删除。`,
+      content: `${device.name} (${device.code}) —— 测点和自动导入的任务都会一并删除,不影响设备本身之外的东西。`,
       okText: '删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
@@ -164,16 +164,11 @@ const DeviceListPage = () => {
       dataIndex: 'protocol',
       render: (proto: string) => {
         const meta = protocolByName[proto];
-        const color =
-          meta?.category === 'industrial-ethernet' ? 'blue'
-          : meta?.category === 'fieldbus' ? 'orange'
-          : meta?.category === 'iot' ? 'purple'
-          : meta?.category === 'opc' ? 'cyan'
-          : 'default';
-        return <Tag color={color}>{meta?.label ?? proto}</Tag>;
+        return <Tag color={protocolTagColor(meta?.category)}>{meta?.label ?? proto}</Tag>;
       },
-      filters: protocols.map((p) => ({ text: p.label, value: p.name })),
-      onFilter: (value, row) => row.protocol === value,
+      // 协议筛选只在顶部 Segmented 做一次(带每协议计数)。这里以前还挂了一套
+      // filters/onFilter,两套筛选叠加会导致"选 A 协议 + 勾选 B 协议列筛选"
+      // 结果恒为空且无从判断,故移除(rank17)。
     },
     {
       title: '连接',
