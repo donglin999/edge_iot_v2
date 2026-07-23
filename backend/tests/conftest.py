@@ -25,11 +25,24 @@ def django_db_modify_db_settings():
 
     test_db_path = os.path.join(tempfile.gettempdir(), "test_edge_iot.db")
 
+    # 注意:这里必须给全 Django ConnectionHandler.configure_settings 会补的默认键。
+    # 该补默认发生在 cached_property 里、进程启动早期只算一次;我们在这之后整体
+    # 替换 DATABASES["default"],新起的**线程**首次建连接时直接读
+    # settings_dict["TIME_ZONE"] 等键,缺了就 KeyError —— 主线程侥幸复用早期连接
+    # 不受影响,所以这个坑只咬多线程 ORM 测试(chaos/reconnect 一类)。
     settings.DATABASES["default"] = {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": test_db_path,
         "ATOMIC_REQUESTS": False,
+        "AUTOCOMMIT": True,
         "CONN_MAX_AGE": 0,
+        "CONN_HEALTH_CHECKS": False,
+        "TIME_ZONE": None,
+        "USER": "",
+        "PASSWORD": "",
+        "HOST": "",
+        "PORT": "",
+        "TEST": {"CHARSET": None, "COLLATION": None, "MIGRATE": True, "MIRROR": None, "NAME": None},
         "OPTIONS": {
             "timeout": 30,
         },

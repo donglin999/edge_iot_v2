@@ -588,6 +588,20 @@ class AlarmSink(Sink):
 # exceeds this we split it across several frames instead.
 _WS_MAX_READINGS_PER_MSG = 200
 
+# Hard cap on the pre-broadcast buffer (bug found under chaos/backpressure
+# testing): unlike InfluxDBSink._buffer (capped at _MAX_BUFFER_POINTS) and
+# AlarmSink's queue.Queue (capped at _ALARM_QUEUE_MAXSIZE), this list had NO
+# bound. consume() is called synchronously from every ReadWorker's hot loop
+# and only drains once per broadcast_interval (default 1s) on a SEPARATE
+# thread; if that thread stalls (a slow/blocked channel layer, a very large
+# broadcast_interval, or simply many devices at a high sample rate) the list
+# grows without limit — unbounded memory growth exactly like the InfluxDB
+# buffer was hardened against. Mirror that policy: drop the *oldest* reading
+# once full, so recent data is preserved and memory stays flat.
+_WS_MAX_BUFFERED_READINGS = 20000
+# Drop-log throttle: emit one warning every N drops to avoid log spam.
+_WS_BUFFER_DROP_LOG_EVERY = 1000
+
 
 class WebSocketSink(Sink):
     """Aggregate readings and broadcast on a fixed cadence (default 1 Hz).
@@ -603,6 +617,7 @@ class WebSocketSink(Sink):
         self.broadcast_interval = max(0.05, float(broadcast_interval))
         self._lock = threading.Lock()
         self._buffer: List[Reading] = []
+        self._dropped_total = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._broadcast_loop,
@@ -622,6 +637,20 @@ class WebSocketSink(Sink):
 
     def consume(self, reading: Reading) -> None:
         with self._lock:
+            # Bounded buffer: when the broadcast thread falls behind (or
+            # stalls entirely), drop the oldest reading rather than growing
+            # without limit. pop(0) is O(n) but the cap keeps it cheap, and
+            # this only fires while already degraded (mirrors
+            # InfluxDBSink._buffer's drop-oldest policy).
+            if len(self._buffer) >= _WS_MAX_BUFFERED_READINGS:
+                self._buffer.pop(0)
+                self._dropped_total += 1
+                if self._dropped_total % _WS_BUFFER_DROP_LOG_EVERY == 1:
+                    logger.warning(
+                        "WebSocketSink buffer full (size=%d), dropped oldest "
+                        "reading. total_dropped=%d",
+                        len(self._buffer), self._dropped_total,
+                    )
             self._buffer.append(reading)
 
     def consume_event(self, event: Dict[str, Any]) -> None:

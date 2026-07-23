@@ -56,6 +56,23 @@ class InfluxDBStorage(BaseStorage):
         self.flush_interval = int(config.get("flush_interval", 1000))   # ms
         self.jitter_interval = int(config.get("jitter_interval", 200))  # ms
 
+        # --- retry tuning (overridable via config; same defaults as before,
+        # this was previously hardcoded in connect()). Found under chaos
+        # testing: with the defaults, a single failing batch keeps the
+        # batching write_api's internal (non-daemon!) retry threads busy for
+        # 5s + 10s + 20s ~= tens of seconds before giving up and spilling —
+        # and that is per batch, serialized, for however many batches are
+        # in flight. Tests that point at a deliberately unreachable backend
+        # should shrink these so they don't hang for a long time and don't
+        # leave long-lived non-daemon retry threads behind at interpreter
+        # exit (they are NOT daemonized by the underlying reactivex
+        # ThreadPoolExecutor, so a process can fail to exit cleanly while
+        # they are still retrying — see the report for detail).
+        self.write_retry_interval = int(config.get("write_retry_interval", 5_000))    # ms
+        self.write_max_retries = int(config.get("write_max_retries", 3))
+        self.write_max_retry_delay = int(config.get("write_max_retry_delay", 30_000))  # ms
+        self.write_exponential_base = int(config.get("write_exponential_base", 2))
+
         # --- M4: spill queue + replay tuning --------------------------------
         # The spill DB lives next to the Django db by default so it shares the
         # instance's data directory and survives restarts.
@@ -103,10 +120,10 @@ class InfluxDBStorage(BaseStorage):
                 batch_size=self.batch_size,
                 flush_interval=self.flush_interval,
                 jitter_interval=self.jitter_interval,
-                retry_interval=5_000,
-                max_retries=3,
-                max_retry_delay=30_000,
-                exponential_base=2,
+                retry_interval=self.write_retry_interval,
+                max_retries=self.write_max_retries,
+                max_retry_delay=self.write_max_retry_delay,
+                exponential_base=self.write_exponential_base,
             )
             self.write_api = self.client.write_api(
                 write_options=write_options,

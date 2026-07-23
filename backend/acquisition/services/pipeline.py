@@ -483,6 +483,52 @@ class ReadWorker(threading.Thread):
         logger.warning("ReadWorker[%s] read failed: %s", self.device.code, exc)
 
 
+# Bound on each sink's flush()/close() call during Pipeline.stop() (below).
+_SINK_SHUTDOWN_TIMEOUT_S = 5.0
+
+
+def _run_bounded(fn, timeout: float, description: str) -> None:
+    """Run ``fn()`` on a helper daemon thread and wait up to ``timeout`` s.
+
+    Bug found under chaos testing (入库堵塞 / 优雅停止): ``InfluxDBSink.close()``
+    calls ``storage.disconnect()``, which calls the influxdb-client's
+    ``write_api.close()`` — a blocking call with NO timeout parameter that
+    flushes pending *and retries in-flight* batches before returning. When
+    InfluxDB is unreachable this was observed to block for 10s+ (bounded only
+    by the client's own internal retry backoff, which can run into minutes),
+    which previously blocked ``Pipeline.stop()`` — and therefore whatever
+    caller (a Celery task, an API view stopping a session) invoked it —
+    for just as long. That directly breaks the "graceful stop must not hang"
+    contract.
+
+    The helper thread is a daemon, so if ``fn`` truly never returns it will
+    not block process exit — it is a leaked thread, not a leaked process,
+    same trade-off already accepted for stuck ``ReadWorker`` threads.
+    """
+    done = threading.Event()
+    box: Dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_target, daemon=True, name=f"PipelineStop-{description}")
+    t.start()
+    if not done.wait(timeout=timeout):
+        logger.warning(
+            "Pipeline stop: %s did not complete within %.1fs — continuing "
+            "shutdown without waiting further (leaked daemon thread).",
+            description, timeout,
+        )
+        return
+    if "exc" in box:
+        logger.warning("Pipeline stop: %s failed: %s", description, box["exc"])
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -547,14 +593,9 @@ class AcquisitionPipeline:
                 len(stuck), timeout, ", ".join(w.name for w in stuck),
             )
         for sink in self.sinks:
-            try:
-                sink.flush()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Sink %s.flush failed: %s", sink.__class__.__name__, exc)
-            try:
-                sink.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Sink %s.close failed: %s", sink.__class__.__name__, exc)
+            name = sink.__class__.__name__
+            _run_bounded(sink.flush, _SINK_SHUTDOWN_TIMEOUT_S, f"{name}.flush")
+            _run_bounded(sink.close, _SINK_SHUTDOWN_TIMEOUT_S, f"{name}.close")
         logger.info("Pipeline stopped: session=%s", self.session.id)
 
     def is_alive(self) -> bool:
