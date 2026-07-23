@@ -126,6 +126,38 @@ def _parse_s7_address(address: str, data_type: str = "") -> Tuple[str, int, int,
     raise ValueError(f"未识别的 S7 区域 {code}")
 
 
+#: Fallback STRING capacity (characters, excluding the 2-byte header) when a
+#: point doesn't declare ``str_length``. Matches the ``str_length`` FieldSpec
+#: default on ``POINT_FIELDS`` below.
+_DEFAULT_STR_LENGTH = 32
+
+
+def _string_read_length(str_length: Any) -> int:
+    """Wire length in bytes for a STRING point of declared capacity ``str_length``.
+
+    Siemens S7 STRING on the wire is ``[max_len(1B)][actual_len(1B)][chars...]``
+    — always 2 header bytes plus the *declared* character capacity. This is
+    intentionally independent of which numeric-address suffix (DBB/DBW/DBD/
+    MB/MW/MD/...) the point happens to be typed with: that suffix used to be
+    the sole thing deciding read length (1/2/4 bytes), which silently
+    truncated every STRING point to 0-2 usable characters regardless of the
+    PLC-side declared capacity. See ``_parse_s7_address``'s call site in
+    :meth:`SiemensS7Protocol.read_points`, which overrides the address-form
+    length with this value whenever ``data_type == "string"``.
+
+    Falls back to :data:`_DEFAULT_STR_LENGTH` for missing/unparseable input;
+    never goes negative (a declared length of 0 is legal — an always-empty
+    STRING still has to read its 2 header bytes).
+    """
+    try:
+        n = int(str_length)
+    except (TypeError, ValueError):
+        n = _DEFAULT_STR_LENGTH
+    if n < 0:
+        n = 0
+    return 2 + n
+
+
 def _decode(buf: bytes, data_type: str, bit: int) -> Any:
     dt = (data_type or "").lower()
     if dt == "bool":
@@ -183,8 +215,11 @@ class SiemensS7Protocol(BaseProtocol):
         FieldSpec("data_type", "数据类型", kind="enum", choices=_S7_DATA_TYPES,
                   default="float32",
                   help_text="float64/lreal 用于 S7-1200/1500 的 LReal(8 字节,地址仍填 DBD 起始字节); "
-                            "string 当前按地址区域固定长度读取(如 DBB=1/DBW=2/DBD=4 字节),暂不支持自定义 "
-                            "字符串长度,超长字符串会被截断"),
+                            "string 的读取长度由 str_length 字段决定,与地址写的是 DBB/DBW/DBD 无关"),
+        FieldSpec("str_length", "字符串长度", kind="int", default=32,
+                  help_text="仅 data_type=string 时生效:声明的字符容量(不含头部),对应 PLC 侧 "
+                            "STRING[str_length] 的声明长度;实际会从地址起始字节读取 2+str_length "
+                            "字节(西门子 STRING 格式:[max_len(1B)][actual_len(1B)][chars...])"),
         FieldSpec("unit", "单位", default=""),
         FieldSpec("description", "中文名称", default=""),
         FieldSpec("coefficient", "系数", kind="float", default=1.0),
@@ -246,6 +281,11 @@ class SiemensS7Protocol(BaseProtocol):
                 area, db, byte, bit, length = _parse_s7_address(
                     str(point.get("address", "")), data_type
                 )
+                if (data_type or "").lower() == "string":
+                    # STRING read length is governed by the declared capacity,
+                    # not by the DBB/DBW/DBD suffix _parse_s7_address derived
+                    # ``length`` from — see _string_read_length().
+                    length = _string_read_length(point.get("str_length", _DEFAULT_STR_LENGTH))
                 buf = self.client.read_area(area, db, byte, length)
                 value = _decode(bytes(buf), data_type, bit)
                 results.append({

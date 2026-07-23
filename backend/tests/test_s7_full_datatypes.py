@@ -38,7 +38,12 @@ from mocks.transports import FakeArea, FakeS7Client  # noqa: E402
 from acquisition.protocols import s7 as s7_mod  # noqa: E402
 from acquisition.protocols.base import ConnectionError as S7ConnectionError  # noqa: E402
 from acquisition.protocols.base import ReadError  # noqa: E402
-from acquisition.protocols.s7 import SiemensS7Protocol, _decode, _parse_s7_address  # noqa: E402
+from acquisition.protocols.s7 import (  # noqa: E402
+    SiemensS7Protocol,
+    _decode,
+    _parse_s7_address,
+    _string_read_length,
+)
 
 
 # ===========================================================================
@@ -162,27 +167,80 @@ class TestRealSnap7Server:
         assert by_code["bit5"]["value"] is True
         assert by_code["bit2"]["value"] is False
 
-    def test_string_capacity_is_length_minus_2_header_bytes(self, real_server):
-        """记录真实行为(不是 bug 修复,是把 help_text 里"会截断"量化到具体字节数):
-        S7 STRING 头占 2 字节(maxlen, actual_len)，地址区域给多少字节，可用
-        正文就是「区域长度 - 2」。DBB(1 字节)、DBW(2 字节)因此连头都放不下，
-        _decode 里 ``len(buf) < 2`` 分支直接返回空串 —— 不是异常，是静默空值。"""
+    def test_string_read_length_is_governed_by_str_length_not_address_form(self, real_server):
+        """修复前:string 的可读长度被地址数字形态钉死(DBB=1/DBW=2/DBD=4 字节),
+        导致 DBB/DBW 形态永远解出空串、DBD 只剩 2 个字符,quality 仍是 good ——
+        静默错误(见 Agent D 的发现)。修复后:读长改由 str_length 决定
+        (2+str_length 字节),与地址写的是 DBB/DBW/DBD 完全无关 —— 同一段内存,
+        三种地址形态 + 同一个 str_length 应当读出完全相同、完整的字符串。"""
         srv, port = real_server
         srv.write_string("DB", 20, "hello world", max_len=32)
         proto = SiemensS7Protocol({"source_ip": "127.0.0.1", "source_port": port, "rack": 0, "slot": 1})
         try:
             proto.connect()
             results = proto.read_points([
-                {"code": "s_dbb", "address": "DB1.DBB20", "data_type": "string"},  # 1B < header, always ""
-                {"code": "s_dbw", "address": "DB1.DBW20", "data_type": "string"},  # 2B == header only, always ""
-                {"code": "s_dbd", "address": "DB1.DBD20", "data_type": "string"},  # 4B -> 2 usable chars
+                {"code": "s_dbb", "address": "DB1.DBB20", "data_type": "string", "str_length": 32},
+                {"code": "s_dbw", "address": "DB1.DBW20", "data_type": "string", "str_length": 32},
+                {"code": "s_dbd", "address": "DB1.DBD20", "data_type": "string", "str_length": 32},
             ])
         finally:
             proto.disconnect()
         by_code = {r["code"]: r for r in results}
-        assert by_code["s_dbb"]["value"] == ""
-        assert by_code["s_dbw"]["value"] == ""
-        assert by_code["s_dbd"]["value"] == "he"
+        assert by_code["s_dbb"]["value"] == "hello world"
+        assert by_code["s_dbw"]["value"] == "hello world"
+        assert by_code["s_dbd"]["value"] == "hello world"
+        assert all(r["quality"] == "good" for r in by_code.values())
+
+    def test_string_without_str_length_falls_back_to_default_32(self, real_server):
+        """没声明 str_length 的老测点行为要有个确定的兜底,而不是回退到旧的
+        地址形态钉死逻辑 —— 兜底是 32 字符容量(与 POINT_FIELDS 的 default 一致)。"""
+        srv, port = real_server
+        srv.write_string("DB", 20, "no length declared", max_len=32)
+        proto = SiemensS7Protocol({"source_ip": "127.0.0.1", "source_port": port, "rack": 0, "slot": 1})
+        try:
+            proto.connect()
+            results = proto.read_points([
+                {"code": "s", "address": "DB1.DBB20", "data_type": "string"},
+            ])
+        finally:
+            proto.disconnect()
+        assert results[0]["value"] == "no length declared"
+        assert results[0]["quality"] == "good"
+
+    def test_string_chinese_round_trip_over_real_wire(self, real_server):
+        """中文 STRING:actual_len 是字节数不是字符数,UTF-8 里一个汉字 3 字节 ——
+        真协议往返要能正确按字节切、按 UTF-8 解码回完整汉字,不能被腰斩。"""
+        srv, port = real_server
+        srv.write_string("DB", 60, "温度传感器一号", max_len=32)  # 21 UTF-8 bytes
+        proto = SiemensS7Protocol({"source_ip": "127.0.0.1", "source_port": port, "rack": 0, "slot": 1})
+        try:
+            proto.connect()
+            results = proto.read_points([
+                {"code": "s", "address": "DB1.DBD60", "data_type": "string", "str_length": 32},
+            ])
+        finally:
+            proto.disconnect()
+        assert results[0]["value"] == "温度传感器一号"
+        assert results[0]["quality"] == "good"
+
+    def test_string_empty_and_full_capacity_over_real_wire(self, real_server):
+        srv, port = real_server
+        srv.write_string("DB", 100, "", max_len=8)
+        srv.write_string("DB", 120, "12345678", max_len=8)  # exactly fills capacity
+        proto = SiemensS7Protocol({"source_ip": "127.0.0.1", "source_port": port, "rack": 0, "slot": 1})
+        try:
+            proto.connect()
+            results = proto.read_points([
+                {"code": "empty", "address": "DB1.DBB100", "data_type": "string", "str_length": 8},
+                {"code": "full", "address": "DB1.DBW120", "data_type": "string", "str_length": 8},
+            ])
+        finally:
+            proto.disconnect()
+        by_code = {r["code"]: r for r in results}
+        assert by_code["empty"]["value"] == ""
+        assert by_code["empty"]["quality"] == "good"
+        assert by_code["full"]["value"] == "12345678"
+        assert by_code["full"]["quality"] == "good"
 
     def test_mixed_batch_one_bad_address_does_not_void_others(self, real_server):
         srv, port = real_server
@@ -314,6 +372,79 @@ class TestDoubleWordWidening:
         assert byte == 16  # 起始字节不受 data_type 提示影响
 
 
+class TestStringReadLength:
+    """``_string_read_length`` —— STRING 读长 = 2(头部) + 声明容量,与地址
+    形态(DBB/DBW/DBD)无关。这是 ``read_points`` 里覆盖 ``_parse_s7_address``
+    衍生长度的那一层,直接对这个纯函数穷举比端到端更快、更精确。"""
+
+    @pytest.mark.parametrize("str_length,expect", [
+        (0, 2), (1, 3), (8, 10), (32, 34), (255, 257),
+    ])
+    def test_declared_length_plus_two_byte_header(self, str_length, expect):
+        assert _string_read_length(str_length) == expect
+
+    def test_missing_falls_back_to_default_32(self):
+        assert _string_read_length(None) == 2 + 32
+
+    @pytest.mark.parametrize("bad", ["not-a-number", "", [], object()])
+    def test_unparseable_falls_back_to_default_32(self, bad):
+        assert _string_read_length(bad) == 2 + 32
+
+    def test_negative_declared_length_clamped_to_zero(self):
+        # 不合理输入(负数)不应该产出一个比 2 还小的读长请求。
+        assert _string_read_length(-5) == 2
+
+    def test_string_type_hint_accepted_as_numeric_string(self):
+        # Excel 导入路径可能把它当字符串传进来("32" 而不是 32)。
+        assert _string_read_length("32") == 34
+
+
+class TestReadPointsStringLengthDrivesWireRequest:
+    """``read_points`` 对 string 测点实际请求的字节数由 str_length 决定,
+    与地址是 DBB/DBW/DBD 无关 —— 用 FakeS7Client 直接断言 read_area 收到的
+    size 参数(而不是仅看解码结果),证明修复动的是请求长度本身。"""
+
+    def test_dbb_dbw_dbd_all_request_same_length_for_same_str_length(self, s7_with_fake_client):
+        FakeS7Client.areas = {
+            (1, 0): bytes([32, 5]) + b"hello" + b"\x00" * 27,
+        }
+        proto = SiemensS7Protocol({"source_ip": "10.0.0.1"})
+        proto.is_connected = True
+        proto.client = FakeS7Client()
+
+        seen_sizes = []
+        real_read_area = proto.client.read_area
+
+        def _spy_read_area(area, db, start, size):
+            seen_sizes.append(size)
+            return real_read_area(area, db, start, size)
+
+        proto.client.read_area = _spy_read_area
+
+        results = proto.read_points([
+            {"code": "s_dbb", "address": "DB1.DBB0", "data_type": "string", "str_length": 32},
+            {"code": "s_dbw", "address": "DB1.DBW0", "data_type": "string", "str_length": 32},
+            {"code": "s_dbd", "address": "DB1.DBD0", "data_type": "string", "str_length": 32},
+        ])
+        assert seen_sizes == [34, 34, 34]  # 2 + 32, identical regardless of DBB/DBW/DBD
+        by_code = {r["code"]: r for r in results}
+        assert by_code["s_dbb"]["value"] == "hello"
+        assert by_code["s_dbw"]["value"] == "hello"
+        assert by_code["s_dbd"]["value"] == "hello"
+
+    def test_str_length_zero_still_reads_two_header_bytes(self, s7_with_fake_client):
+        FakeS7Client.areas = {(1, 0): bytes([0, 0])}
+        proto = SiemensS7Protocol({"source_ip": "10.0.0.1"})
+        proto.is_connected = True
+        proto.client = FakeS7Client()
+
+        results = proto.read_points([
+            {"code": "s", "address": "DB1.DBB0", "data_type": "string", "str_length": 0},
+        ])
+        assert results[0]["value"] == ""
+        assert results[0]["quality"] == "good"
+
+
 # ===========================================================================
 # 3. 字节级穷举 —— _decode
 # ===========================================================================
@@ -404,6 +535,20 @@ class TestDecodeString:
         越界抛异常，只会拿到能拿到的部分 —— 记录这个静默截断行为。"""
         buf = bytes([10, 200]) + b"ab"  # actual_len=200 但 buffer 里只有 2 个字符
         assert _decode(buf, "string", bit=0) == "ab"
+
+    def test_chinese_string_actual_len_is_byte_count_not_char_count(self):
+        # UTF-8 里"温度传感器"是 5 个汉字 × 3 字节 = 15 字节；actual_len 必须
+        # 按字节数填，_decode 按字节切片再整体 UTF-8 解码，不能按字符数切
+        # (按字符数切会把多字节字符从中间切断，decode 直接抛异常或产生乱码)。
+        text = "温度传感器"
+        raw = text.encode("utf-8")
+        buf = bytes([32, len(raw)]) + raw + b"\x00" * (32 - len(raw))
+        assert _decode(buf, "string", bit=0) == text
+
+    def test_string_at_exact_full_declared_capacity(self):
+        # actual_len 等于 max_len(容量刚好占满，没有多余的零填充可读)。
+        buf = bytes([8, 8]) + b"12345678"
+        assert _decode(buf, "string", bit=0) == "12345678"
 
 
 class TestDecodeShortBufferRaises:
