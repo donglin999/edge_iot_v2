@@ -1,8 +1,43 @@
+/**
+ * 任务总览。
+ *
+ * 这一版是系统级整改的产物:删掉了原来一堆恒 0、误导、或点了没反应的东西 ——
+ * 「成功率」(前端 status key 和后端对不上、TaskRun 也没有终态,永远 0)、
+ * 「异常告警」卡(取 status.error 恒 0,与告警中心口径冲突)、假的成功/异常
+ * 环形图、以及四个死控件(时间范围切换/类型下拉/导出/查看全部,全都不接任何
+ * 数据)。只留真实、有价值的:任务数、设备在线、任务列表、最近运行、快捷入口。
+ *
+ * 设备「在线」直接消费后端 device.status(online/offline 两态),与设备管理页
+ * 同源同口径 —— 不再自己从会话 device_health 重算三态,避免两页对不上。
+ */
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import {
+  Card,
+  Col,
+  Empty,
+  Row,
+  Statistic,
+  Table,
+  Tag,
+  Typography,
+} from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+import {
+  ApiOutlined,
+  CloudUploadOutlined,
+  DatabaseOutlined,
+  HistoryOutlined,
+  LineChartOutlined,
+  PlayCircleOutlined,
+  RightOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons';
+
 import { isAbortError } from '../services/http';
 import { fetchAllPages, withLimitOffset } from '../services/pagination';
-import './DashboardPage.css';
+
+const { Title, Text } = Typography;
 
 interface TaskRun {
   task: string;
@@ -28,22 +63,23 @@ interface TaskItem {
   is_active: boolean;
 }
 
-interface DeviceStats {
-  total: number;
-  online: number;
-  offline: number;
-  error: number;
-}
+/** 运行记录状态 → 中文 + 颜色。原来直接渲染英文原值且 succeeded 落灰。 */
+const RUN_STATUS: Record<string, { text: string; color: string }> = {
+  running: { text: '运行中', color: 'processing' },
+  succeeded: { text: '成功', color: 'success' },
+  completed: { text: '完成', color: 'success' },
+  stopped: { text: '已停止', color: 'default' },
+  failed: { text: '失败', color: 'error' },
+  error: { text: '错误', color: 'error' },
+};
 
 const DashboardPage = () => {
   const [data, setData] = useState<OverviewPayload | null>(null);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
-  const [deviceStats, setDeviceStats] = useState<DeviceStats>({ total: 0, online: 0, offline: 0, error: 0 });
-  // Only the very first load shows the full-page spinner. Background refreshes
-  // (30s interval) update data in place without tearing down the dashboard.
+  const [deviceStats, setDeviceStats] = useState({ total: 0, online: 0 });
+  const [runningCount, setRunningCount] = useState(0);
   const [initialLoading, setInitialLoading] = useState(true);
   const [, setError] = useState<string | null>(null);
-  const [timeRange, setTimeRange] = useState<'24h' | '7d' | '30d'>('24h');
 
   const fetchOverview = useCallback(async (signal?: AbortSignal) => {
     const response = await fetch('/api/config/tasks/overview/?site_code=default', { signal });
@@ -51,24 +87,21 @@ const DashboardPage = () => {
     return (await response.json()) as OverviewPayload;
   }, []);
 
-  // 标准 list 端点:DRF 全局分页后返回 `{ results }`;逐页合并仍取全量(XIU-9 / H10)。
   const fetchTasks = useCallback(async (signal?: AbortSignal) => {
     return fetchAllPages<TaskItem>(async (limit, offset) => {
       const response = await fetch(
         withLimitOffset('/api/config/tasks/?site_code=default', limit, offset),
-        { signal }
+        { signal },
       );
       if (!response.ok) throw new Error(await response.text());
       return response.json();
     });
   }, []);
 
+  // 设备在线口径:直接用后端 device.status(两态),与设备管理页一致。
   const fetchDevices = useCallback(async (signal?: AbortSignal) => {
-    return fetchAllPages<{ id: number; protocol: string }>(async (limit, offset) => {
-      const response = await fetch(
-        withLimitOffset('/api/config/devices/', limit, offset),
-        { signal }
-      );
+    return fetchAllPages<{ id: number; status?: string }>(async (limit, offset) => {
+      const response = await fetch(withLimitOffset('/api/config/devices/', limit, offset), { signal });
       if (!response.ok) throw new Error(await response.text());
       return response.json();
     });
@@ -77,12 +110,7 @@ const DashboardPage = () => {
   const fetchActiveSessions = useCallback(async (signal?: AbortSignal) => {
     const response = await fetch('/api/acquisition/sessions/active/', { signal });
     if (!response.ok) throw new Error(await response.text());
-    return (await response.json()) as Array<{
-      id: number;
-      task: number;
-      status: string;
-      metadata?: { device_health?: Record<string, { status: string }> };
-    }>;
+    return (await response.json()) as Array<{ id: number; status: string }>;
   }, []);
 
   useEffect(() => {
@@ -91,56 +119,33 @@ const DashboardPage = () => {
 
     const load = async () => {
       try {
-        // allSettled: a single failing endpoint must not blank the whole
-        // dashboard — render whatever succeeded and flag the rest.
-        const [overviewRes, tasksRes, devicesRes, sessionsRes] =
-          await Promise.allSettled([
-            fetchOverview(signal),
-            fetchTasks(signal),
-            fetchDevices(signal),
-            fetchActiveSessions(signal),
-          ]);
+        // allSettled:单个接口失败不该让整页空白 —— 渲染成功的部分,其余标注。
+        const [overviewRes, tasksRes, devicesRes, sessionsRes] = await Promise.allSettled([
+          fetchOverview(signal),
+          fetchTasks(signal),
+          fetchDevices(signal),
+          fetchActiveSessions(signal),
+        ]);
         if (signal.aborted) return;
 
         const failed: string[] = [];
-
         if (overviewRes.status === 'fulfilled') setData(overviewRes.value);
         else failed.push('任务概览');
-
         if (tasksRes.status === 'fulfilled') setTasks(tasksRes.value);
         else failed.push('任务列表');
 
         const devices = devicesRes.status === 'fulfilled' ? devicesRes.value : [];
         if (devicesRes.status === 'rejected') failed.push('设备');
-
-        const activeSessions =
-          sessionsRes.status === 'fulfilled' ? sessionsRes.value : [];
-        if (sessionsRes.status === 'rejected') failed.push('活跃会话');
-
-        // Real device counts: a device is "online" if it appears in any
-        // running session's device_health with status === "healthy".
-        const healthyCodes = new Set<string>();
-        const errorCodes = new Set<string>();
-        for (const session of activeSessions) {
-          const dh = session.metadata?.device_health || {};
-          for (const [code, info] of Object.entries(dh)) {
-            if (info.status === 'healthy') healthyCodes.add(code);
-            else errorCodes.add(code);
-          }
-        }
-        const total = devices.length;
-        const online = healthyCodes.size;
-        const errored = errorCodes.size;
         setDeviceStats({
-          total,
-          online,
-          error: errored,
-          offline: Math.max(0, total - online - errored),
+          total: devices.length,
+          online: devices.filter((d) => d.status === 'online').length,
         });
 
-        setError(
-          failed.length > 0 ? `部分数据加载失败：${failed.join('、')}` : null,
-        );
+        const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value : [];
+        if (sessionsRes.status === 'rejected') failed.push('活跃会话');
+        setRunningCount(sessions.filter((s) => s.status === 'running').length);
+
+        setError(failed.length > 0 ? `部分数据加载失败：${failed.join('、')}` : null);
       } catch (err) {
         if (!isAbortError(err)) setError((err as Error).message);
       } finally {
@@ -149,29 +154,12 @@ const DashboardPage = () => {
     };
 
     load();
-    // 30s auto-refresh keeps the dashboard meaningful without WebSocket plumbing
     const interval = setInterval(load, 30000);
     return () => {
       aborter.abort();
       clearInterval(interval);
     };
   }, [fetchOverview, fetchTasks, fetchDevices, fetchActiveSessions]);
-
-  const getStatusBadgeClass = (status: string) => {
-    switch (status.toLowerCase()) {
-      case 'running':
-      case 'active':
-        return 'status-badge status-badge--running';
-      case 'success':
-      case 'completed':
-        return 'status-badge status-badge--success';
-      case 'error':
-      case 'failed':
-        return 'status-badge status-badge--error';
-      default:
-        return 'status-badge status-badge--stopped';
-    }
-  };
 
   const formatTime = (date: string | null) => {
     if (!date) return '-';
@@ -183,527 +171,179 @@ const DashboardPage = () => {
     });
   };
 
-  const totalStatusCount = Object.values(data?.status || {}).reduce((a, b) => a + b, 0);
-  const successRate = totalStatusCount > 0
-    ? Math.round(((data?.status?.success || 0) + (data?.status?.completed || 0)) / totalStatusCount * 100)
-    : 0;
+  const taskColumns: ColumnsType<TaskItem> = [
+    {
+      title: '任务编码',
+      dataIndex: 'code',
+      render: (code: string) => <Text style={{ fontFamily: 'monospace' }}>{code}</Text>,
+    },
+    { title: '名称', dataIndex: 'name' },
+    {
+      title: '状态',
+      dataIndex: 'is_active',
+      width: 90,
+      render: (active: boolean) => (
+        <Tag color={active ? 'success' : 'default'}>{active ? '启用' : '停用'}</Tag>
+      ),
+    },
+    {
+      title: '',
+      width: 80,
+      render: () => (
+        <Link to="/acquisition">
+          <PlayCircleOutlined /> 控制
+        </Link>
+      ),
+    },
+  ];
 
-  if (initialLoading) {
-    return (
-      <div className="dashboard">
-        <div className="dashboard__loading">
-          <div className="loading">
-            <div className="loading__spinner" />
-          </div>
+  const runColumns: ColumnsType<TaskRun> = [
+    {
+      title: '任务',
+      dataIndex: 'task',
+      render: (task: string, r) => (
+        <div>
+          <div>{task}</div>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {r.worker || '本地'}
+          </Text>
         </div>
-      </div>
-    );
-  }
+      ),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      width: 100,
+      render: (s: string) => {
+        const meta = RUN_STATUS[s?.toLowerCase()] ?? { text: s, color: 'default' };
+        return <Tag color={meta.color}>{meta.text}</Tag>;
+      },
+    },
+    {
+      title: '时间',
+      dataIndex: 'started_at',
+      width: 130,
+      render: (t: string | null) => <Text type="secondary">{formatTime(t)}</Text>,
+    },
+  ];
+
+  const quickActions = [
+    { to: '/acquisition', icon: <PlayCircleOutlined />, title: '采集控制', desc: '启停任务、管理测点' },
+    { to: '/devices', icon: <DatabaseOutlined />, title: '设备管理', desc: '设备与测点配置' },
+    { to: '/import', icon: <CloudUploadOutlined />, title: '导入配置', desc: '上传 Excel 配置' },
+    { to: '/data', icon: <LineChartOutlined />, title: '数据可视化', desc: '历史趋势查询' },
+    { to: '/alarms', icon: <ThunderboltOutlined />, title: '告警中心', desc: '连接/系统告警' },
+    { to: '/versions', icon: <HistoryOutlined />, title: '版本历史', desc: '配置版本记录' },
+  ];
 
   return (
-    <div className="dashboard">
-      {/* Page Header */}
-      <div className="dashboard__header">
-        <div className="dashboard__header-left">
-          <h1 className="dashboard__title">数据采集平台</h1>
-          <p className="dashboard__subtitle">实时监控和管理您的IoT设备数据采集</p>
-        </div>
-        <div className="dashboard__header-right">
-          <div className="time-range-selector">
-            <button
-              className={`time-range-btn ${timeRange === '24h' ? 'time-range-btn--active' : ''}`}
-              onClick={() => setTimeRange('24h')}
-            >
-              24小时
-            </button>
-            <button
-              className={`time-range-btn ${timeRange === '7d' ? 'time-range-btn--active' : ''}`}
-              onClick={() => setTimeRange('7d')}
-            >
-              7天
-            </button>
-            <button
-              className={`time-range-btn ${timeRange === '30d' ? 'time-range-btn--active' : ''}`}
-              onClick={() => setTimeRange('30d')}
-            >
-              30天
-            </button>
-          </div>
-        </div>
+    <div style={{ padding: 24 }}>
+      <div style={{ marginBottom: 20 }}>
+        <Title level={3} style={{ margin: 0 }}>
+          数据采集平台
+        </Title>
+        <Text type="secondary">实时监控和管理 IoT 设备数据采集</Text>
       </div>
 
-      {/* Metrics Row */}
-      <div className="metrics-row stagger">
-        <div className="metric-card animate-slideIn">
-          <div className="metric-card__glow" />
-          <div className="metric-card__icon metric-card__icon--primary">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <rect x="3" y="3" width="7" height="7" rx="1" />
-              <rect x="14" y="3" width="7" height="7" rx="1" />
-              <rect x="3" y="14" width="7" height="7" rx="1" />
-              <rect x="14" y="14" width="7" height="7" rx="1" />
-            </svg>
-          </div>
-          <div className="metric-card__value">{data?.total_tasks || 0}</div>
-          <div className="metric-card__label">
-            任务总数
-          </div>
-        </div>
+      {/* 真实指标 */}
+      <Row gutter={16} style={{ marginBottom: 16 }}>
+        <Col xs={12} md={6}>
+          <Card variant="borderless" loading={initialLoading}>
+            <Statistic
+              title="任务总数"
+              value={data?.total_tasks ?? 0}
+              prefix={<DatabaseOutlined />}
+            />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card variant="borderless" loading={initialLoading}>
+            <Statistic title="启用任务" value={data?.active_tasks ?? 0} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card variant="borderless" loading={initialLoading}>
+            <Statistic
+              title="运行中会话"
+              value={runningCount}
+              valueStyle={{ color: runningCount > 0 ? '#52c41a' : undefined }}
+              prefix={<PlayCircleOutlined />}
+            />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card variant="borderless" loading={initialLoading}>
+            <Statistic
+              title="设备在线"
+              value={deviceStats.online}
+              suffix={`/ ${deviceStats.total}`}
+              prefix={<ApiOutlined />}
+              valueStyle={{
+                color: deviceStats.total > 0 && deviceStats.online === 0 ? '#ff4d4f' : undefined,
+              }}
+            />
+          </Card>
+        </Col>
+      </Row>
 
-        <div className="metric-card animate-slideIn">
-          <div className="metric-card__glow" />
-          <div className="metric-card__icon metric-card__icon--success">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-              <polyline points="22 4 12 14.01 9 11.01" />
-            </svg>
-          </div>
-          <div className="metric-card__value">{data?.active_tasks || 0}</div>
-          <div className="metric-card__label">
-            启用任务
-            <span className="metric-card__badge">活跃</span>
-          </div>
-        </div>
+      <Row gutter={16} style={{ marginBottom: 16 }}>
+        <Col xs={24} lg={12}>
+          <Card
+            variant="borderless"
+            title="任务列表"
+            extra={
+              <Link to="/acquisition">
+                采集控制 <RightOutlined />
+              </Link>
+            }
+          >
+            {tasks.length === 0 ? (
+              <Empty description="暂无任务 —— 导入配置或在采集控制页新建" />
+            ) : (
+              <Table<TaskItem>
+                rowKey="id"
+                size="small"
+                columns={taskColumns}
+                dataSource={tasks.slice(0, 6)}
+                pagination={false}
+              />
+            )}
+          </Card>
+        </Col>
+        <Col xs={24} lg={12}>
+          <Card variant="borderless" title="最近运行">
+            {!data?.recent_runs || data.recent_runs.length === 0 ? (
+              <Empty description="暂无运行记录 —— 启动采集任务后在此显示" />
+            ) : (
+              <Table<TaskRun>
+                rowKey={(r) => r.log_reference || `${r.task}|${r.started_at || ''}`}
+                size="small"
+                columns={runColumns}
+                dataSource={data.recent_runs.slice(0, 6)}
+                pagination={false}
+              />
+            )}
+          </Card>
+        </Col>
+      </Row>
 
-        <div className="metric-card animate-slideIn">
-          <div className="metric-card__glow" />
-          <div className="metric-card__icon metric-card__icon--info">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <rect x="2" y="3" width="20" height="14" rx="2" />
-              <line x1="8" y1="21" x2="16" y2="21" />
-              <line x1="12" y1="17" x2="12" y2="21" />
-            </svg>
-          </div>
-          <div className="metric-card__value">{deviceStats.total}</div>
-          <div className="metric-card__label">
-            设备总数
-            <span className="metric-card__badge metric-card__trend--up">
-              在线 {deviceStats.online}
-            </span>
-          </div>
-        </div>
-
-        <div className="metric-card animate-slideIn">
-          <div className="metric-card__glow" />
-          <div className="metric-card__icon metric-card__icon--warning">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-              <line x1="12" y1="9" x2="12" y2="13" />
-              <line x1="12" y1="17" x2="12.01" y2="17" />
-            </svg>
-          </div>
-          <div className="metric-card__value">{deviceStats.error}</div>
-          <div className="metric-card__label">
-            异常设备
-            {deviceStats.error > 0 && <span className="metric-card__badge metric-card__badge--warning">需要关注</span>}
-          </div>
-        </div>
-      </div>
-
-      {/* Charts Row */}
-      <div className="charts-grid">
-        {/* Status Distribution Chart */}
-        <div className="chart-card animate-scaleIn">
-          <div className="chart-card__header">
-            <div>
-              <h3 className="chart-card__title">状态分布</h3>
-              <p className="chart-card__subtitle">任务运行状态概览</p>
-            </div>
-            <div className="chart-card__action">
-              <select className="form-select form-select--sm">
-                <option>全部类型</option>
-                <option>Modbus</option>
-                <option>MQTT</option>
-              </select>
-            </div>
-          </div>
-          <div className="chart-card__body">
-            <div className="chart-content">
-              <div className="donut-chart">
-                <svg viewBox="0 0 100 100" className="donut-chart__svg">
-                  {/* Success segment */}
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="40"
-                    fill="none"
-                    stroke="var(--success)"
-                    strokeWidth="12"
-                    strokeDasharray={`${successRate * 2.51} 251`}
-                    transform="rotate(-90 50 50)"
-                    className="donut-chart__segment"
-                  />
-                  {/* Error segment */}
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="40"
-                    fill="none"
-                    stroke="var(--error)"
-                    strokeWidth="12"
-                    strokeDasharray={`${((data?.status?.error || 0) / (totalStatusCount || 1)) * 251} 251`}
-                    strokeDashoffset={`-${successRate * 2.51}`}
-                    transform="rotate(-90 50 50)"
-                    className="donut-chart__segment"
-                  />
-                  {/* Running segment */}
-                  <circle
-                    cx="50"
-                    cy="50"
-                    r="40"
-                    fill="none"
-                    stroke="var(--warning)"
-                    strokeWidth="12"
-                    strokeDasharray={`${((data?.status?.running || 0) / (totalStatusCount || 1)) * 251} 251`}
-                    strokeDashoffset={`-${(successRate + ((data?.status?.error || 0) / (totalStatusCount || 1))) * 251}`}
-                    transform="rotate(-90 50 50)"
-                    className="donut-chart__segment"
-                  />
-                </svg>
-                <div className="donut-chart__center">
-                  <span className="donut-chart__value">{successRate}%</span>
-                  <span className="donut-chart__label">成功率</span>
-                </div>
-              </div>
-              <div className="chart-legend">
-                <div className="legend-item">
-                  <span className="legend-dot legend-dot--success" />
-                  <span className="legend-label">成功</span>
-                  <span className="legend-value">{(data?.status?.success || 0) + (data?.status?.completed || 0)}</span>
-                </div>
-                <div className="legend-item">
-                  <span className="legend-dot legend-dot--warning" />
-                  <span className="legend-label">运行中</span>
-                  <span className="legend-value">{data?.status?.running || 0}</span>
-                </div>
-                <div className="legend-item">
-                  <span className="legend-dot legend-dot--error" />
-                  <span className="legend-label">异常</span>
-                  <span className="legend-value">{data?.status?.error || 0}</span>
-                </div>
-                <div className="legend-item">
-                  <span className="legend-dot legend-dot--muted" />
-                  <span className="legend-label">停止</span>
-                  <span className="legend-value">{data?.status?.stopped || 0}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Device Status Chart */}
-        <div className="chart-card animate-scaleIn">
-          <div className="chart-card__header">
-            <div>
-              <h3 className="chart-card__title">设备状态</h3>
-              <p className="chart-card__subtitle">在线/离线监控</p>
-            </div>
-            <div className="chart-card__action">
-              <button className="btn btn--ghost btn--sm">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="7 10 12 15 17 10" />
-                  <line x1="12" y1="15" x2="12" y2="3" />
-                </svg>
-                导出
-              </button>
-            </div>
-          </div>
-          <div className="chart-card__body">
-            <div className="device-status-chart">
-              <div className="status-bar">
-                <div className="status-bar__segments">
-                  <div
-                    className="status-bar__segment status-bar__segment--success"
-                    style={{ width: `${(deviceStats.online / (deviceStats.total || 1)) * 100}%` }}
-                  />
-                  <div
-                    className="status-bar__segment status-bar__segment--error"
-                    style={{ width: `${(deviceStats.error / (deviceStats.total || 1)) * 100}%` }}
-                  />
-                  <div
-                    className="status-bar__segment status-bar__segment--muted"
-                    style={{ width: `${(deviceStats.offline / (deviceStats.total || 1)) * 100}%` }}
-                  />
-                </div>
-              </div>
-              <div className="status-numbers">
-                <div className="status-number">
-                  <span className="status-number__value text-success">{deviceStats.online}</span>
-                  <span className="status-number__label">在线</span>
-                </div>
-                <div className="status-number">
-                  <span className="status-number__value text-error">{deviceStats.error}</span>
-                  <span className="status-number__label">异常</span>
-                </div>
-                <div className="status-number">
-                  <span className="status-number__value text-muted">{deviceStats.offline}</span>
-                  <span className="status-number__label">离线</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Status Cards */}
-      <div className="status-cards-row">
-        <div className="status-card-compact">
-          <div className="status-card-compact__icon status-card-compact__icon--success">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-              <polyline points="22 4 12 14.01 9 11.01" />
-            </svg>
-          </div>
-          <div className="status-card-compact__content">
-            <span className="status-card-compact__value">{data?.active_tasks || 0}</span>
-            <span className="status-card-compact__label">活跃任务</span>
-          </div>
-          <div className="status-card-compact__indicator status-card-compact__indicator--success" />
-        </div>
-
-        <div className="status-card-compact">
-          <div className="status-card-compact__icon status-card-compact__icon--warning">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <polyline points="12 6 12 12 16 14" />
-            </svg>
-          </div>
-          <div className="status-card-compact__content">
-            <span className="status-card-compact__value">{data?.recent_runs?.length || 0}</span>
-            <span className="status-card-compact__label">今日运行</span>
-          </div>
-          <div className="status-card-compact__indicator status-card-compact__indicator--warning" />
-        </div>
-
-        <div className="status-card-compact">
-          <div className="status-card-compact__icon status-card-compact__icon--info">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-            </svg>
-          </div>
-          <div className="status-card-compact__content">
-            <span className="status-card-compact__value">{successRate}%</span>
-            <span className="status-card-compact__label">成功率</span>
-          </div>
-          <div className="status-card-compact__indicator status-card-compact__indicator--success" />
-        </div>
-
-        <div className="status-card-compact">
-          <div className="status-card-compact__icon status-card-compact__icon--error">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <line x1="12" y1="8" x2="12" y2="12" />
-              <line x1="12" y1="16" x2="12.01" y2="16" />
-            </svg>
-          </div>
-          <div className="status-card-compact__content">
-            <span className="status-card-compact__value">{data?.status?.error || 0}</span>
-            <span className="status-card-compact__label">异常告警</span>
-          </div>
-          <div className="status-card-compact__indicator status-card-compact__indicator--error" />
-        </div>
-      </div>
-
-      {/* Main Content Grid */}
-      <div className="dashboard__grid">
-        {/* Task List */}
-        <div className="table-card animate-slideIn">
-          <div className="table-card__header">
-            <h3 className="table-card__title">任务列表</h3>
-            <Link to="/acquisition" className="btn btn--primary btn--sm">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polygon points="5 3 19 12 5 21 5 3" />
-              </svg>
-              采集控制
-            </Link>
-          </div>
-          {tasks.length === 0 ? (
-            <div className="empty-state">
-              <svg className="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <path d="M9 9h6M9 15h6M9 12h6" />
-              </svg>
-              <div className="empty-state__title">暂无任务</div>
-              <div className="empty-state__description">导入配置文件以创建采集任务</div>
-            </div>
-          ) : (
-            <div className="table-container">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>任务编码</th>
-                    <th>名称</th>
-                    <th>状态</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {tasks.slice(0, 5).map((task) => (
-                    <tr key={task.id}>
-                      <td>
-                        <div className="task-code">
-                          <span className="task-code__icon">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <rect x="3" y="3" width="18" height="18" rx="2" />
-                              <path d="M9 9h6M9 15h6M9 12h6" />
-                            </svg>
-                          </span>
-                          <span className="task-code__text font-medium">{task.code}</span>
-                        </div>
-                      </td>
-                      <td>{task.name}</td>
-                      <td>
-                        <span className={task.is_active ? 'status-badge status-badge--active' : 'status-badge status-badge--inactive'}>
-                          <span className="status-badge__dot" />
-                          {task.is_active ? '启用' : '停用'}
-                        </span>
-                      </td>
-                      <td>
-                        <Link to="/acquisition" className="btn btn--ghost btn--icon btn--sm">
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polygon points="5 3 19 12 5 21 5 3" />
-                          </svg>
-                        </Link>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        {/* Recent Runs */}
-        <div className="table-card animate-slideIn">
-          <div className="table-card__header">
-            <h3 className="table-card__title">最近运行</h3>
-            <button className="btn btn--ghost btn--sm">
-              查看全部
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </button>
-          </div>
-          {data?.recent_runs && data.recent_runs.length === 0 ? (
-            <div className="empty-state">
-              <svg className="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <circle cx="12" cy="12" r="10" />
-                <polyline points="12 6 12 12 16 14" />
-              </svg>
-              <div className="empty-state__title">暂无运行记录</div>
-              <div className="empty-state__description">启动采集任务后将在此显示</div>
-            </div>
-          ) : (
-            <div className="table-container">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>任务</th>
-                    <th>状态</th>
-                    <th>时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data?.recent_runs?.slice(0, 5).map((run) => (
-                    <tr
-                      key={
-                        run.log_reference ||
-                        `${run.task}|${run.started_at || ''}|${run.finished_at || ''}`
-                      }
-                    >
-                      <td>
-                        <div className="run-task">
-                          <span className="run-task__name font-medium">{run.task}</span>
-                          <span className="run-task__worker text-xs text-muted">{run.worker || '本地'}</span>
-                        </div>
-                      </td>
-                      <td>
-                        <span className={getStatusBadgeClass(run.status)}>
-                          <span className="status-badge__dot" />
-                          {run.status}
-                        </span>
-                      </td>
-                      <td className="text-secondary">{formatTime(run.started_at)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Quick Actions */}
-      <div className="quick-actions animate-slideIn">
-        <h3 className="quick-actions__title">快速操作</h3>
-        <div className="quick-actions__grid">
-          <Link to="/acquisition" className="quick-action-card">
-            <div className="quick-action-card__icon quick-action-card__icon--primary">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polygon points="5 3 19 12 5 21 5 3" />
-              </svg>
-            </div>
-            <div className="quick-action-card__content">
-              <span className="quick-action-card__title">采集控制</span>
-              <span className="quick-action-card__description">启动/停止采集任务</span>
-            </div>
-            <svg className="quick-action-card__arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-          </Link>
-
-          <Link to="/import" className="quick-action-card">
-            <div className="quick-action-card__icon quick-action-card__icon--success">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="17 8 12 3 7 8" />
-                <line x1="12" y1="3" x2="12" y2="15" />
-              </svg>
-            </div>
-            <div className="quick-action-card__content">
-              <span className="quick-action-card__title">导入配置</span>
-              <span className="quick-action-card__description">上传Excel配置文件</span>
-            </div>
-            <svg className="quick-action-card__arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-          </Link>
-
-          <Link to="/data" className="quick-action-card">
-            <div className="quick-action-card__icon quick-action-card__icon--info">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="18" y1="20" x2="18" y2="10" />
-                <line x1="12" y1="20" x2="12" y2="4" />
-                <line x1="6" y1="20" x2="6" y2="14" />
-              </svg>
-            </div>
-            <div className="quick-action-card__content">
-              <span className="quick-action-card__title">数据可视化</span>
-              <span className="quick-action-card__description">查看历史趋势数据</span>
-            </div>
-            <svg className="quick-action-card__arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-          </Link>
-
-          <Link to="/versions" className="quick-action-card">
-            <div className="quick-action-card__icon quick-action-card__icon--warning">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10" />
-                <polyline points="12 6 12 12 16 14" />
-              </svg>
-            </div>
-            <div className="quick-action-card__content">
-              <span className="quick-action-card__title">版本历史</span>
-              <span className="quick-action-card__description">查看配置版本记录</span>
-            </div>
-            <svg className="quick-action-card__arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-          </Link>
-        </div>
-      </div>
+      <Card variant="borderless" title="快速操作">
+        <Row gutter={[16, 16]}>
+          {quickActions.map((a) => (
+            <Col xs={12} md={8} lg={4} key={a.to}>
+              <Link to={a.to}>
+                <Card size="small" hoverable style={{ textAlign: 'center' }}>
+                  <div style={{ fontSize: 22, marginBottom: 6 }}>{a.icon}</div>
+                  <div style={{ fontWeight: 600 }}>{a.title}</div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {a.desc}
+                  </Text>
+                </Card>
+              </Link>
+            </Col>
+          ))}
+        </Row>
+      </Card>
     </div>
   );
 };

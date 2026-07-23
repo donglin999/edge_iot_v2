@@ -6,7 +6,6 @@ import logging
 from datetime import timedelta
 
 from django.db import transaction
-from django.db.models import Max
 from django.http import HttpResponse
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
@@ -771,10 +770,12 @@ class AcqTaskViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         recent_window = now - timedelta(hours=24)
 
+        # 站点下的全部任务。原来这里额外 filter(last_version__isnull=False) 只算
+        # 「有配置版本」的任务 —— 但通过任务 CRUD / 脚本建的任务没有版本记录,会被
+        # 漏掉,导致总览显示「任务总数 0」而任务列表里明明有任务,口径打架。去掉版本门,
+        # 与 /config/tasks/ 列表一致:只要测点落在本站点就计入。
         base_qs = (
             models.AcqTask.objects.filter(points__device__site__code=site_code)
-            .annotate(last_version=Max("versions__version"))
-            .filter(last_version__isnull=False)
             .distinct()
         )
         total_tasks = base_qs.count()
