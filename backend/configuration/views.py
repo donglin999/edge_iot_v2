@@ -827,7 +827,7 @@ class AcqTaskViewSet(viewsets.ModelViewSet):
             task=task,
             status__in=[
                 acq_models.AcquisitionSession.STATUS_RUNNING,
-                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_PAUSED,
             ]
         ).first()
 
@@ -885,7 +885,7 @@ class AcqTaskViewSet(viewsets.ModelViewSet):
             task=task,
             status__in=[
                 acq_models.AcquisitionSession.STATUS_RUNNING,
-                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_PAUSED,
             ]
         ).order_by("-started_at").first()
 
@@ -1127,7 +1127,7 @@ class ConfigVersionViewSet(
             task=task,
             status__in=[
                 acq_models.AcquisitionSession.STATUS_RUNNING,
-                acq_models.AcquisitionSession.STATUS_RUNNING,
+                acq_models.AcquisitionSession.STATUS_PAUSED,
             ]
         ).first()
 

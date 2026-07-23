@@ -169,7 +169,14 @@ class AcqTaskSerializer(serializers.ModelSerializer):
         # validation entirely (we have nothing concrete to constrain).
         incoming_points = attrs.get("points")
         if incoming_points:
-            protocols = {p.device.protocol for p in incoming_points if p.device_id}
+            # Aggregate in one query instead of touching p.device per point
+            # (which was N+1'ing on unselected FKs for large point batches).
+            protocols = set(
+                models.Point.objects
+                .filter(pk__in=[p.pk for p in incoming_points], device_id__isnull=False)
+                .values_list("device__protocol", flat=True)
+                .distinct()
+            )
         elif self.instance is not None and self.instance.pk:
             protocols = set(
                 self.instance.points

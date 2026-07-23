@@ -376,10 +376,16 @@ def _parse_gateway_sheet(ws) -> Tuple[Dict[str, Any], List[RowError]]:
 
 
 def _to_int(value: Any) -> Optional[int]:
+    # openpyxl (and Excel formulas/re-saved templates) commonly hand back
+    # whole numbers as floats (8883.0, qos 0.0) — int("8883.0") raises, so
+    # go through float() first and only accept values with no fractional part.
     try:
-        return int(str(value).strip())
+        f = float(str(value).strip())
     except (TypeError, ValueError):
         return None
+    if not f.is_integer():
+        return None
+    return int(f)
 
 
 def _to_float(value: Any) -> Optional[float]:
