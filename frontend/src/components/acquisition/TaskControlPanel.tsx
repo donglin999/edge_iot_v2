@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, InputNumber, Modal, message } from 'antd';
+import { Button, InputNumber, Modal, Tag, Tooltip, message } from 'antd';
 import type { AcqTask, AcquisitionSession } from '../../services/acquisitionApi';
 import {
   startTask,
@@ -144,14 +144,40 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
 
   const isRunning = !!(activeSession && activeSession.status === 'running');
 
-  // 实际入库频率 —— 后端用 InfluxDBSink.total_written 在时间窗内算出的点/秒,
-  // 只计**写成功**的量。它和左边设定的采样频率是两回事:采样频率是「打算多快
-  // 采」,这个是「实际多快真的落到 InfluxDB」。InfluxDB 写不进去时它就是 0。
+  // 入库速率 —— 实际 vs 目标。
+  //
+  // 实际:后端用 InfluxDBSink.total_written 在时间窗内算出的点/秒,只计**写成功**
+  //   的量(真正落到 InfluxDB 的频率;写不进去时为 0)。
+  // 目标:采样频率 × 测点数(后端 metadata.ingest_target_points_per_sec)。这是
+  //   pipeline 的真实口径 —— 所有测点共用一个任务级采样频率、每周期各读一遍。
+  // 达标率 = 实际 / 目标,给操作员一个「达没达标」的直观参照。
+  const meta = (isRunning && activeSession?.metadata) || undefined;
   const actualIngestRate =
-    isRunning && activeSession?.metadata &&
-    typeof activeSession.metadata.ingest_points_per_sec === 'number'
-      ? (activeSession.metadata.ingest_points_per_sec as number)
+    meta && typeof meta.ingest_points_per_sec === 'number'
+      ? (meta.ingest_points_per_sec as number)
       : null;
+  const targetIngestRate =
+    meta && typeof meta.ingest_target_points_per_sec === 'number'
+      ? (meta.ingest_target_points_per_sec as number)
+      : null;
+  const ingestRatio =
+    actualIngestRate !== null && targetIngestRate && targetIngestRate > 0
+      ? actualIngestRate / targetIngestRate
+      : null;
+  // 阈值取 0.95,吸收批量 flush 与首窗口抖动。
+  const ingestGrade =
+    actualIngestRate === null
+      ? null
+      : ingestRatio === null
+        ? 'unknown'
+        : ingestRatio >= 0.95
+          ? 'ok'
+          : ingestRatio >= 0.7
+            ? 'near'
+            : 'low';
+  const ingestBasis = (meta?.ingest_target_basis ?? undefined) as
+    | { sample_rate_hz?: number; point_count?: number }
+    | undefined;
 
   const sampleRateDirty =
     sampleRateValue !== null &&
@@ -615,16 +641,60 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
         </div>
         {isRunning && (
           <div className="sample-rate__actual">
-            <span className="sample-rate__actual-label">实际入库</span>
-            <span className="sample-rate__actual-value">
-              {actualIngestRate === null
-                ? '统计中…'
-                : `${actualIngestRate} 点/秒`}
-            </span>
-            {actualIngestRate === 0 && (
-              <span className="sample-rate__actual-warn">
-                （数据未落库 —— 检查 InfluxDB 连接）
-              </span>
+            <span className="sample-rate__actual-label">入库速率</span>
+            {actualIngestRate === null ? (
+              <span className="sample-rate__actual-value">统计中…</span>
+            ) : (
+              <Tooltip
+                title={
+                  <div style={{ fontSize: 12, lineHeight: 1.6 }}>
+                    <div>目标 = 采样频率 × 测点数</div>
+                    {ingestBasis && (
+                      <div>
+                        &nbsp;&nbsp;= {ingestBasis.sample_rate_hz} Hz × {ingestBasis.point_count} 个
+                        {' = '}
+                        {targetIngestRate} 点/秒
+                      </div>
+                    )}
+                    <div style={{ marginTop: 4 }}>
+                      实际 = 最近约 10s 成功写入 InfluxDB 的点数 ÷ 窗口时长
+                    </div>
+                    {ingestRatio !== null && (
+                      <div>达标率 = 实际 ÷ 目标 = {(ingestRatio * 100).toFixed(0)}%</div>
+                    )}
+                    <div style={{ marginTop: 4, opacity: 0.85 }}>
+                      低于 100% 常见原因:测点读失败/质量 bad、InfluxDB 写入拥塞、设备响应慢
+                    </div>
+                  </div>
+                }
+              >
+                <span style={{ cursor: 'help' }}>
+                  <span className="sample-rate__actual-value">
+                    实际 {actualIngestRate}
+                    {targetIngestRate !== null && ` / 目标 ${targetIngestRate}`} 点/秒
+                  </span>
+                  {ingestGrade === 'ok' && (
+                    <Tag color="success" style={{ marginLeft: 8 }}>
+                      达标{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
+                    </Tag>
+                  )}
+                  {ingestGrade === 'near' && (
+                    <Tag color="warning" style={{ marginLeft: 8 }}>
+                      接近{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
+                    </Tag>
+                  )}
+                  {ingestGrade === 'low' && actualIngestRate > 0 && (
+                    <Tag color="error" style={{ marginLeft: 8 }}>
+                      偏低{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
+                    </Tag>
+                  )}
+                  {actualIngestRate === 0 && (
+                    <Tag color="error" style={{ marginLeft: 8 }}>
+                      未落库 · 检查 InfluxDB
+                    </Tag>
+                  )}
+                </span>
+              </Tooltip>
             )}
           </div>
         )}

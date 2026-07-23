@@ -461,3 +461,60 @@ class TestIngestRateMetadata:
         session.refresh_from_db()
         assert "ingest_points_per_sec" not in session.metadata
         assert session.metadata["total_points_read"] == 100
+
+    def test_target_rate_is_sample_rate_times_point_count(
+        self, create_device, create_point, create_task, create_session,
+    ):
+        """目标速率 = 采样频率 × 测点数(pipeline 的真实口径,非按每测点频率求和)。"""
+        device = create_device(protocol="modbus_tcp")
+        pts = [create_point(device=device, code=f"p{i}") for i in range(3)]
+        task = create_task(points=pts)
+        task.sample_rate_hz = 2  # 工厂忽略该 kwarg,显式设
+        task.save(update_fields=["sample_rate_hz"])
+        session = create_session(task=task)
+
+        svc = self._service_with_pipeline(task, session, 0)
+        svc._update_sqlite_metadata({}, timestamp=1000.0)
+
+        session.refresh_from_db()
+        m = session.metadata
+        # 2 Hz × 3 测点 = 6 点/秒
+        assert m["ingest_target_points_per_sec"] == 6.0
+        assert m["ingest_target_basis"] == {"sample_rate_hz": 2.0, "point_count": 3}
+
+
+@pytest.mark.django_db
+class TestTemplateDataTypeReachesReadPlan:
+    """连续采集必须带上 template.data_type,否则模板定型的 float32 被当 uint16 读半个值。
+
+    _resolve_data_type 优先读 point.extra['data_type'],其次 point.template.data_type。
+    但连续采集路径把 _PointAdapter.template 置 None,拿不到模板 —— 于是只靠模板定型、
+    没在 extra 冗余 data_type 的测点(测点 CRUD 建的就是这种)回落 uint16:float32 被
+    算成 1 个寄存器(应为 2)、当 uint16 解码,现场读出「半个值」还被系数/精度掩盖。
+    """
+
+    def test_template_float32_gives_two_registers(
+        self, create_device, create_point_template, create_point, create_task, create_session,
+    ):
+        from acquisition.services.pipeline import _PointAdapter
+        from acquisition.services.read_plan import ReadPlanBuilder
+
+        device = create_device(protocol="modbus_tcp")
+        # 模板定型 float32,测点 extra 里**故意不放** data_type(模拟只选模板的情况)
+        tpl = create_point_template(data_type="float32")
+        point = create_point(device=device, code="flow", address="40001",
+                             template=tpl, extra={"function_code": 3})
+        task = create_task(points=[point])
+        session = create_session(task=task)
+
+        # 走真实的 device_groups → _PointAdapter → ReadPlanBuilder
+        service = AcquisitionService(task, session)
+        point_dicts = service.device_groups[device.id]["points"]
+
+        # point_config 里必须带上模板的 data_type
+        assert point_dicts[0].get("data_type") == "float32", point_dicts[0]
+
+        groups = ReadPlanBuilder.build(device, _PointAdapter.iter(point_dicts))
+        pm = groups[0].points[0]
+        assert pm.data_type == "float32"
+        assert pm.num_registers == 2, "float32 必须占 2 个寄存器,否则读出半个值"

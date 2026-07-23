@@ -91,6 +91,12 @@ class AcquisitionService:
             if point.template:
                 point_config.setdefault("cn_name", point.template.name)
                 point_config.setdefault("unit", point.template.unit)
+                # data_type 决定寄存器数与解码方式(float32 占 2 个寄存器,uint16 占 1)。
+                # 只靠模板定型、没把 data_type 冗余进 point.extra 的测点(测点 CRUD 就是
+                # 这种),如果这里不带上,读计划会回落 uint16 —— float32 被算成 1 个寄存器、
+                # 当 uint16 解码,现场读出「半个值」,还被 coefficient/precision 掩盖。
+                # 导入路径因为把 data_type 也塞进了 extra 而幸免,这里补上让三条路一致。
+                point_config.setdefault("data_type", point.template.data_type)
             groups[device_id]["points"].append(point_config)
 
         return dict(groups)
@@ -426,6 +432,25 @@ class AcquisitionService:
                 delta = max(new_total - prev_total, 0)
                 meta["ingest_points_per_sec"] = round(delta / dt, 2)
                 meta["ingest_measured_at"] = timestamp
+
+            # 目标入库速率 —— 给实际速率一个参照,让人一眼看出达没达标。
+            #
+            # 口径必须和 pipeline 的**真实**行为一致:所有 ReadWorker 用同一个
+            # task.sample_rate_hz,每个采集周期把全部测点各读一遍。所以
+            #   目标点/秒 = 采样频率 × 测点总数
+            # 注意:Point.sample_rate_hz / TaskPoint.overrides 目前在运行时被忽略,
+            # 不参与目标计算(不能按「每测点频率求和/取最高」,那和实际不符)。
+            # 测点数用 device_groups(与真正在跑的 worker 同源),不用启动校验快照。
+            point_count = sum(len(g.get("points", [])) for g in self.device_groups.values())
+            try:
+                sample_rate = float(self.task.sample_rate_hz)
+            except (TypeError, ValueError):
+                sample_rate = 0.0
+            meta["ingest_target_points_per_sec"] = round(sample_rate * point_count, 2)
+            meta["ingest_target_basis"] = {
+                "sample_rate_hz": sample_rate,
+                "point_count": point_count,
+            }
 
             meta["device_health"] = health_summary
             meta["last_health_update"] = timestamp

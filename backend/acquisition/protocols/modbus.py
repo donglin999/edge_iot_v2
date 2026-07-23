@@ -421,7 +421,11 @@ class ModbusTCPProtocol(_ModbusBase):
     DEVICE_FIELDS = (
         FieldSpec("source_ip", "IP 地址", required=True, example="192.168.1.100"),
         FieldSpec("source_port", "端口", kind="int", default=502, example=502),
-        FieldSpec("slave_id", "从站地址", kind="int", default=1, help_text="Modbus Slave ID,默认 1"),
+        # 「从站/Slave」是 RS-485 串行多点总线的概念;Modbus TCP 帧里对应的是
+        # MBAP 头的 Unit Identifier(单元标识符)。纯 TCP 设备直连一般填 1,经
+        # TCP→RTU 网关时才填后端串行从机地址。叫「从站地址」会让工程师误按串口站号规划。
+        FieldSpec("slave_id", "单元标识符 (Unit ID)", kind="int", default=1,
+                  help_text="Modbus TCP 单元标识符(MBAP Unit Id);直连设备一般填 1,经 TCP/RTU 网关时填后端串行从机地址"),
         FieldSpec("byte_order", "字节序", kind="enum", choices=_BYTE_ORDERS, default="big",
                   help_text="float32/int32 多字节解析顺序;ABCD=big, DCBA=little, BADC=big-swap, CDAB=little-swap"),
         FieldSpec("timeout", "超时(秒)", kind="float", default=10.0),
