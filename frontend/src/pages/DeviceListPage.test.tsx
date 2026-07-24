@@ -138,15 +138,14 @@ describe('模板下拉重组', () => {
   });
 });
 
-describe('导出联动', () => {
-  it('筛选具体生产协议时,「导出当前设备」走 v2 per-protocol 导出', async () => {
+describe('导出联动(独立「导出配置」按钮)', () => {
+  it('筛选具体生产协议时,导出走 v2 per-protocol', async () => {
     const user = userEvent.setup();
     stubApi();
     renderPage();
     await user.click(await screen.findByText(/Modbus TCP \(0\)/));
-    await openTemplateMenu(user);
 
-    await user.click(await screen.findByText('导出当前设备(Excel)'));
+    await user.click(screen.getByRole('button', { name: /导出配置/ }));
     await waitFor(() =>
       expect(downloadFile).toHaveBeenCalledWith(
         '/config/protocol-excel/export/',
@@ -156,14 +155,12 @@ describe('导出联动', () => {
     );
   });
 
-  it('筛选「全部」时仍走 40 列全量导出(legacy),菜单文案标注', async () => {
+  it('筛选「全部」时仍走 40 列全量导出(legacy)', async () => {
     const user = userEvent.setup();
     stubApi();
     renderPage();
-    await openTemplateMenu(user);
 
-    expect(screen.getByText('导出当前设备(Excel · legacy 全量单表)')).toBeInTheDocument();
-    await user.click(screen.getByText('导出当前设备(Excel · legacy 全量单表)'));
+    await user.click(screen.getByRole('button', { name: /导出配置/ }));
     await waitFor(() =>
       expect(downloadFile).toHaveBeenCalledWith(
         '/config/devices/export/',
@@ -179,9 +176,8 @@ describe('导出联动', () => {
     stubApi();
     renderPage();
     await user.click(await screen.findByText(/SCADA 网关 \(MQTT\) \(0\)/));
-    await openTemplateMenu(user);
 
-    await user.click(await screen.findByText('导出当前设备(Excel)'));
+    await user.click(screen.getByRole('button', { name: /导出配置/ }));
     await waitFor(() => expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/请在「SCADA 网关」页导出/)));
     expect(downloadFile).not.toHaveBeenCalled();
     warnSpy.mockRestore();

@@ -28,6 +28,7 @@ import type { ColumnsType } from 'antd/es/table';
 import {
   CloudDownloadOutlined,
   CloudUploadOutlined,
+  ExportOutlined,
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
@@ -291,15 +292,10 @@ const DeviceListPage = () => {
   );
 
   /**
-   * 模板下拉重组(docs/excel-import-export-v2.md「前端」节):
+   * 模板下拉(docs/excel-import-export-v2.md「前端」节):
    *   1. 每个生产协议一项,走 v2 每协议两表模板(设备+测点);
    *   2. scada 项保持指向既有网关两表模板(protocolsWithExcel() 里登记的那份);
    *   3. 通用单表模板沉底并标注 legacy —— 40 列大宽表,只有跨协议批量场景还用得上。
-   *
-   * 「导出当前设备」联动当前协议筛选(Segmented 选中的 filterProtocol):
-   *   - 具体生产协议 → v2 per-protocol 导出;
-   *   - 「全部」→ 仍是 40 列全量导出(legacy,跨协议只有大宽表装得下,菜单文案标注);
-   *   - scada → 提示去网关页导出(连接参数挂在网关而非 device.metadata,两种格式都装不下)。
    */
   const templateMenu = useMemo(
     () => ({
@@ -311,29 +307,8 @@ const DeviceListPage = () => {
         ...protocolsWithExcel().map((e) => ({ key: `custom:${e.protocol}`, label: e.label })),
         { type: 'divider' as const },
         { key: 'generic', label: '通用单表模板(legacy · 全部协议)' },
-        { type: 'divider' as const },
-        {
-          key: 'export-current-devices',
-          label:
-            filterProtocol === 'all'
-              ? '导出当前设备(Excel · legacy 全量单表)'
-              : '导出当前设备(Excel)',
-        },
       ],
       onClick: ({ key }: { key: string }) => {
-        if (key === 'export-current-devices') {
-          if (filterProtocol === 'scada') {
-            message.warning('SCADA 设备请在「SCADA 网关」页导出(网关两表格式)。');
-            return;
-          }
-          if (filterProtocol === 'all' || V2_EXCLUDED_PROTOCOLS.has(filterProtocol)) {
-            const protocols = filterProtocol === 'all' ? undefined : [filterProtocol];
-            downloadDeviceExport(protocols).catch(() => undefined);
-            return;
-          }
-          exportProtocolDevices(filterProtocol).catch(() => undefined);
-          return;
-        }
         if (key === 'generic') {
           downloadTemplate().catch(() => undefined);
           return;
@@ -349,8 +324,28 @@ const DeviceListPage = () => {
         }
       },
     }),
-    [filterProtocol, v2Protocols],
+    [v2Protocols],
   );
+
+  /**
+   * 「导出配置」独立按钮(原先埋在模板下拉最后一项,用户找不到 —— 导出也确实
+   * 不是"模板")。联动当前协议筛选(Segmented 的 filterProtocol):
+   *   - 具体生产协议 → v2 per-protocol 导出(两表,可直接改完再导回);
+   *   - 「全部」→ 40 列全量导出(legacy,跨协议只有大宽表装得下);
+   *   - scada → 提示去网关页导出(连接参数挂在网关而非 device.metadata)。
+   */
+  const handleExport = () => {
+    if (filterProtocol === 'scada') {
+      message.warning('SCADA 设备请在「SCADA 网关」页导出(网关两表格式)。');
+      return;
+    }
+    if (filterProtocol === 'all' || V2_EXCLUDED_PROTOCOLS.has(filterProtocol)) {
+      const protocols = filterProtocol === 'all' ? undefined : [filterProtocol];
+      downloadDeviceExport(protocols).catch(() => undefined);
+      return;
+    }
+    exportProtocolDevices(filterProtocol).catch(() => undefined);
+  };
 
   const segOptions = useMemo(
     () => [
@@ -383,6 +378,17 @@ const DeviceListPage = () => {
             <Button icon={<CloudUploadOutlined />} onClick={() => setImportModalOpen(true)}>
               导入配置
             </Button>
+            <Tooltip
+              title={
+                filterProtocol === 'all'
+                  ? '导出全部设备(legacy 全量单表);切换上方协议筛选可导出单协议两表格式'
+                  : `导出当前筛选的 ${filterProtocol} 设备(两表格式,可改完直接导回)`
+              }
+            >
+              <Button icon={<ExportOutlined />} onClick={handleExport}>
+                导出配置
+              </Button>
+            </Tooltip>
             <Dropdown menu={addMenu} trigger={['click']}>
               <Button type="primary" icon={<PlusOutlined />}>
                 添加设备
