@@ -83,6 +83,18 @@ GATEWAY_COLUMNS: Tuple[ColumnSpec, ...] = (
                example=models.ScadaGateway.DEFAULT_TOPIC_TEMPLATE),
 )
 
+# 采集任务三列(可选)也放在「网关服务」sheet 上:导出时从库里现有任务反推填入,
+# 导入时若表单没显式给任务字段,就用这三列的值建任务 —— 这样"导出→全删→导回"
+# 不需要操作员重新记忆/填写任务配置,scada 与 v2 协议(设备表带 sample_rate_hz)
+# 的闭环行为对齐。老文件没有这三列照样能导(列为可选,不参与缺列校验)。
+TASK_COLUMNS: Tuple[ColumnSpec, ...] = (
+    ColumnSpec("task_code", "任务编码",
+               help_text="可留空。填了就在导入时自动创建采集任务(多设备时每台派生 task_code-设备名);"
+                         "导入表单里显式传的 task_code 优先于此列", example="task-zs-scada"),
+    ColumnSpec("task_name", "任务名称", help_text="可留空,留空取任务编码", example="中山 SCADA 采集"),
+    ColumnSpec("sample_rate_hz", "采样频率(Hz)", help_text="可留空,默认 1", example=1),
+)
+
 POINT_COLUMNS: Tuple[ColumnSpec, ...] = (
     ColumnSpec("device_name", "设备名", required=True,
                help_text="话题中的 {device_name} 段；相同 device_name 的多行自动归为同一台设备",
@@ -96,7 +108,7 @@ POINT_COLUMNS: Tuple[ColumnSpec, ...] = (
     ColumnSpec("unit", "单位", example="MPa"),
 )
 
-_GATEWAY_EXAMPLE_ROW = {c.name: c.example for c in GATEWAY_COLUMNS}
+_GATEWAY_EXAMPLE_ROW = {c.name: c.example for c in (*GATEWAY_COLUMNS, *TASK_COLUMNS)}
 _POINT_EXAMPLE_ROWS = (
     {
         "device_name": "A0201010001150403", "device_label": "注塑机1",
@@ -118,10 +130,11 @@ _NOTES_ROWS = (
     ["3) 不需要在设备行里重复任何 MQTT 字段（地址/端口/TLS/账号/密码/QoS/产品Key/话题模板）。"],
     ["4) 黄底列为必填项；鼠标悬停表头可看中文名 / 取值范围 / 示例。"],
     ["5) 导入：POST /api/config/scada-gateways/import/（multipart，字段名 file）。"],
-    ["   可选表单字段 task_code / task_name / sample_rate_hz —— 填了 task_code 就顺带创建采集任务，"],
-    ["   并把本次导入的全部测点绑定到该任务；不填则只建设备和测点。"],
-    ["6) 导入按 code 幂等：同一份文件导入多次不会产生重复设备/测点，只会就地更新。"],
-    ["7) 导出：GET /api/config/scada-gateways/{id}/export/ 得到同格式文件，可改完再导入。"],
+    ["   采集任务的来源优先级：表单字段 task_code/task_name/sample_rate_hz（页面导入弹窗勾选任务时传）"],
+    ["   > 「网关服务」sheet 的同名三列（导出文件自动带上，导回即恢复任务）> 都没有则只建设备和测点。"],
+    ["   多台设备时每台派生独立任务（task_code-设备名），删设备会连带删它的任务。"],
+    ["6) 导入按 code 幂等：同一份文件导入多次不会产生重复设备/测点/任务，只会就地更新。"],
+    ["7) 导出：GET /api/config/scada-gateways/{id}/export/ 得到同格式文件（含任务三列），可改完再导入。"],
     [""],
     ["技术细节："],
     ["* 导入与页面上的「批量创建」走同一个 provision 服务，行为完全一致。"],
@@ -172,8 +185,9 @@ def _build(gateway_rows: Sequence[Dict[str, Any]], point_rows: Sequence[Dict[str
     wb = Workbook()
     gw_ws = wb.active
     gw_ws.title = SHEET_GATEWAY
-    _write_header(gw_ws, GATEWAY_COLUMNS)
-    _write_rows(gw_ws, GATEWAY_COLUMNS, gateway_rows)
+    gw_columns = (*GATEWAY_COLUMNS, *TASK_COLUMNS)
+    _write_header(gw_ws, gw_columns)
+    _write_rows(gw_ws, gw_columns, gateway_rows)
 
     pt_ws = wb.create_sheet(SHEET_POINTS)
     _write_header(pt_ws, POINT_COLUMNS)
@@ -200,7 +214,8 @@ def build_scada_export(gateway: models.ScadaGateway) -> bytes:
     gateway_row = {spec.name: getattr(gateway, spec.name) for spec in GATEWAY_COLUMNS}
 
     point_rows: List[Dict[str, Any]] = []
-    devices = gateway.devices.prefetch_related("points").order_by("code")
+    devices = list(gateway.devices.prefetch_related("points").order_by("code"))
+    gateway_row.update(_infer_task_columns(devices))
     for device in devices:
         # The device_name is the only per-device datum the fleet doesn't share;
         # fall back to the code suffix if metadata was hand-edited away.
@@ -219,6 +234,45 @@ def build_scada_export(gateway: models.ScadaGateway) -> bytes:
     return _build([gateway_row], point_rows)
 
 
+def _infer_task_columns(devices: Sequence[models.Device]) -> Dict[str, Any]:
+    """从网关设备现挂的采集任务反推出任务模板三列,让导出文件可以原样导回并恢复任务。
+
+    provision 的派生规则是 ``{base}-{device_name}``(单设备时直接用 base),这里做
+    逆运算:剥掉每个任务的设备名后缀取公共 base。多个互不相关的任务(剥完 base 不
+    一致)说明这不是 provision 派生的一族,无法归一成一个模板 —— 留空,导回后由
+    操作员在导入弹窗里自行决定,绝不猜错。频率取各任务最大值(与入库频率指标同口径)。
+    """
+    task_and_device: Dict[int, Tuple[models.AcqTask, models.Device]] = {}
+    for device in devices:
+        for task in models.AcqTask.objects.filter(points__device=device).distinct():
+            task_and_device[task.id] = (task, device)
+    if not task_and_device:
+        return {}
+
+    bases, names, rates = set(), [], []
+    for task, device in task_and_device.values():
+        device_name = (device.metadata or {}).get("scada_device_name") or device.code
+        code = task.code
+        if code.endswith(f"-{device_name}"):
+            code = code[: -(len(device_name) + 1)]
+        name = task.name
+        suffix = f" · {device_name}"
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+        bases.add(code)
+        names.append(name)
+        rates.append(task.sample_rate_hz)
+
+    if len(bases) != 1:
+        return {}
+    base = next(iter(bases))
+    return {
+        "task_code": base,
+        "task_name": names[0] if names[0] != base else "",
+        "sample_rate_hz": float(max(rates)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -231,6 +285,9 @@ class ParsedWorkbook:
     gateway: Dict[str, Any]
     devices: List[Dict[str, Any]]
     errors: List[RowError]
+    #: 「网关服务」sheet 任务三列的值(键 task_code/task_name/sample_rate_hz),
+    #: 没填 task_code 时为 None。导入视图用它兜底:表单显式传的任务字段优先。
+    task: Optional[Dict[str, Any]] = None
 
     @property
     def is_valid(self) -> bool:
@@ -293,31 +350,32 @@ def _missing_columns(headers: Sequence[str], columns: Sequence[ColumnSpec]) -> L
     return [c.name for c in columns if c.required and c.name not in present]
 
 
-def _parse_gateway_sheet(ws) -> Tuple[Dict[str, Any], List[RowError]]:
+def _parse_gateway_sheet(ws) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], List[RowError]]:
     errors: List[RowError] = []
     headers, records = _read_sheet(ws)
 
+    # 任务三列不参与缺列校验:旧版导出/手写文件没有它们也必须能导。
     missing = _missing_columns(headers, GATEWAY_COLUMNS)
     if missing:
         errors.append(RowError(
             1, ", ".join(missing), f"「{SHEET_GATEWAY}」缺少必要列: {', '.join(missing)}",
             protocol=SCADA_PROTOCOL,
         ))
-        return {}, errors
+        return {}, None, errors
 
     if not records:
         errors.append(RowError(
             2, "code", f"「{SHEET_GATEWAY}」没有数据行，请填写一行网关配置",
             protocol=SCADA_PROTOCOL,
         ))
-        return {}, errors
+        return {}, None, errors
     if len(records) > 1:
         errors.append(RowError(
             records[1][0], "code",
             f"「{SHEET_GATEWAY}」只能有一行：整个网关共用一套 MQTT 配置",
             protocol=SCADA_PROTOCOL,
         ))
-        return {}, errors
+        return {}, None, errors
 
     row_num, record = records[0]
     data: Dict[str, Any] = {}
@@ -372,7 +430,24 @@ def _parse_gateway_sheet(ws) -> Tuple[Dict[str, Any], List[RowError]]:
                                f"请把占位符 {PASSWORD_PLACEHOLDER} 替换为真实密码",
                                protocol=SCADA_PROTOCOL))
 
-    return data, errors
+    # --- 任务三列(可选) ---
+    task: Optional[Dict[str, Any]] = None
+    task_code = _clean(record.get("task_code"))
+    if task_code:
+        task = {"task_code": task_code}
+        task_name = _clean(record.get("task_name"))
+        if task_name:
+            task["task_name"] = task_name
+        raw_rate = record.get("sample_rate_hz")
+        if _clean(raw_rate):
+            rate = _to_float(raw_rate)
+            if rate is None or rate <= 0:
+                errors.append(RowError(row_num, "sample_rate_hz", "采样频率必须是正数",
+                                       protocol=SCADA_PROTOCOL))
+            else:
+                task["sample_rate_hz"] = rate
+
+    return data, task, errors
 
 
 def _to_int(value: Any) -> Optional[int]:
@@ -496,12 +571,12 @@ def parse_scada_workbook(source) -> ParsedWorkbook:
                 protocol=SCADA_PROTOCOL,
             )])
 
-        gateway_data, gateway_errors = _parse_gateway_sheet(wb[SHEET_GATEWAY])
+        gateway_data, task, gateway_errors = _parse_gateway_sheet(wb[SHEET_GATEWAY])
         devices, point_errors = _parse_points_sheet(wb[SHEET_POINTS])
     finally:
         wb.close()
 
-    return ParsedWorkbook(gateway_data, devices, gateway_errors + point_errors)
+    return ParsedWorkbook(gateway_data, devices, gateway_errors + point_errors, task=task)
 
 
 def build_task_payload(

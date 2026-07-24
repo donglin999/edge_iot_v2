@@ -791,7 +791,7 @@ const ScadaConfig = forwardRef<ProtocolConfigHandle, ProtocolConfigProps>(
                       name="task_enabled"
                       label="同时创建/更新采集任务"
                       valuePropName="checked"
-                      tooltip="勾选后,设备/测点落库的同时建好采集任务,不必再去采集控制页配置"
+                      tooltip="勾选后,设备/测点落库的同时建好采集任务,不必再去采集控制页配置。导入导出文件时:这里填的优先;不勾则用文件「网关服务」表里的任务三列(导出文件自动带上,导回即恢复任务)"
                     >
                       <Switch
                         checkedChildren="是"

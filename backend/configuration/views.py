@@ -121,7 +121,8 @@ class ScadaGatewayViewSet(viewsets.ModelViewSet):
         summary="导入 SCADA 两表 Excel",
         description=(
             "multipart 上传字段名 file。可选表单字段 task_code / task_name / "
-            "sample_rate_hz：填了 task_code 就顺带创建采集任务并绑定本次全部测点。"
+            "sample_rate_hz：填了 task_code 就顺带创建采集任务并绑定本次全部测点；"
+            "不填则回退用「网关服务」sheet 里的任务三列（导出文件自带，导回即恢复任务）。"
             "按 code 幂等；校验失败返回 400 + 逐行错误，且不写入任何数据。"
         ),
         request={"multipart/form-data": serializers.ScadaImportSerializer},
@@ -144,10 +145,15 @@ class ScadaGatewayViewSet(viewsets.ModelViewSet):
         if not parsed.is_valid:
             return _import_error_response(parsed.errors)
 
+        # 任务来源优先级:表单显式字段 > 「网关服务」sheet 任务三列(导出文件自带,
+        # 导回即恢复任务) > 都没有则只建设备/测点。
+        workbook_task = parsed.task or {}
+        form_rate = request.data.get("sample_rate_hz")
         task_payload = build_task_payload(
-            task_code=request.data.get("task_code", ""),
-            task_name=request.data.get("task_name", ""),
-            sample_rate_hz=request.data.get("sample_rate_hz"),
+            task_code=request.data.get("task_code") or workbook_task.get("task_code", ""),
+            task_name=request.data.get("task_name") or workbook_task.get("task_name", ""),
+            sample_rate_hz=form_rate if form_rate not in (None, "")
+            else workbook_task.get("sample_rate_hz"),
         )
 
         gateway_data = dict(parsed.gateway)

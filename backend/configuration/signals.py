@@ -116,8 +116,11 @@ def delete_owned_tasks(sender, instance: models.Device, **kwargs) -> None:
         .distinct()
     )
     if task_ids:
-        deleted, _ = models.AcqTask.objects.filter(id__in=task_ids).delete()
+        # delete() 的第一个返回值是含级联表(TaskPoint 绑定行、会话等)的总行数,
+        # 不是任务数 —— 日志里报它会虚高误导排查,按 task_ids 计。
+        _, per_model = models.AcqTask.objects.filter(id__in=task_ids).delete()
         logger.info(
             "Cascade-deleted %d task(s) bound to device %s: %s",
-            deleted, instance.code, task_ids,
+            per_model.get(models.AcqTask._meta.label, len(task_ids)),
+            instance.code, task_ids,
         )

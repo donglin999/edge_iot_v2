@@ -26,6 +26,8 @@ GATEWAY_HEADERS = [
     "code", "name", "source_ip", "source_port", "mqtt_use_tls", "mqtt_username",
     "mqtt_password", "mqtt_qos", "mqtt_client_id", "mqtt_read_timeout",
     "product_key", "topic_template",
+    # 任务三列:导出自动带上(从现有任务反推),导入时作表单字段的兜底。
+    "task_code", "task_name", "sample_rate_hz",
 ]
 POINT_HEADERS = ["device_name", "device_label", "code", "description", "data_type", "unit"]
 
@@ -498,3 +500,96 @@ def test_generated_template_is_importable_after_filling_password(api_client, db)
 
     assert resp.status_code == status.HTTP_201_CREATED
     assert resp.json()["created"] == {"devices": 1, "points": 2}
+
+
+# ---------------------------------------------------------------------------
+# 任务三列:导出携带 / 导入兜底(闭环——导出文件导回即恢复任务)
+# ---------------------------------------------------------------------------
+
+GATEWAY_ROW_WITH_TASK = GATEWAY_ROW + ["zs-acq", "中山采集", 2.5]
+
+
+def test_export_carries_task_columns(api_client, db):
+    """导出的「网关服务」行带任务三列:base 编码(剥设备名后缀)、名称、最大频率。"""
+    post_import(api_client, build_workbook(),
+                task_code="zs-acq", task_name="中山采集", sample_rate_hz="2.5")
+    gateway = config_models.ScadaGateway.objects.get(code="zs-scada")
+
+    resp = api_client.get(f"/api/config/scada-gateways/{gateway.id}/export/")
+    wb = load_workbook(io.BytesIO(resp.content))
+    row = {c.value: v.value for c, v in zip(wb["网关服务"][1], wb["网关服务"][2])}
+
+    assert row["task_code"] == "zs-acq"
+    assert row["task_name"] == "中山采集"
+    assert row["sample_rate_hz"] == 2.5
+
+
+def test_export_without_tasks_leaves_task_columns_blank(api_client, db):
+    post_import(api_client, build_workbook())
+    gateway = config_models.ScadaGateway.objects.get(code="zs-scada")
+
+    resp = api_client.get(f"/api/config/scada-gateways/{gateway.id}/export/")
+    wb = load_workbook(io.BytesIO(resp.content))
+    row = {c.value: v.value for c, v in zip(wb["网关服务"][1], wb["网关服务"][2])}
+
+    assert row["task_code"] is None
+    assert row["sample_rate_hz"] is None
+
+
+def test_import_restores_tasks_from_workbook_columns(api_client, db):
+    """表单不传任务字段时,用表内任务三列建任务 —— 导出→导回自动恢复任务。"""
+    resp = post_import(api_client, build_workbook(gateway_rows=[GATEWAY_ROW_WITH_TASK]))
+
+    assert resp.status_code == status.HTTP_201_CREATED
+    tasks = list(config_models.AcqTask.objects.filter(code__startswith="zs-acq-"))
+    assert len(tasks) == 2
+    for t in tasks:
+        assert t.name.startswith("中山采集")
+        assert float(t.sample_rate_hz) == 2.5
+
+
+def test_form_task_fields_override_workbook_columns(api_client, db):
+    post_import(api_client, build_workbook(gateway_rows=[GATEWAY_ROW_WITH_TASK]),
+                task_code="form-acq", task_name="表单任务", sample_rate_hz="4")
+
+    assert config_models.AcqTask.objects.filter(code__startswith="form-acq-").count() == 2
+    assert config_models.AcqTask.objects.filter(code__startswith="zs-acq").count() == 0
+
+
+def test_workbook_without_task_columns_still_imports(api_client, db):
+    """旧版文件(没有任务三列)照常导入,且不建任务。"""
+    blob = build_workbook(gateway_headers=GATEWAY_HEADERS[:12],
+                          gateway_rows=[GATEWAY_ROW])
+    resp = post_import(api_client, blob)
+
+    assert resp.status_code == status.HTTP_201_CREATED
+    assert config_models.AcqTask.objects.count() == 0
+
+
+def test_workbook_task_rate_must_be_positive(api_client, db):
+    bad = GATEWAY_ROW + ["zs-acq", "", -1]
+    resp = post_import(api_client, build_workbook(gateway_rows=[bad]))
+
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert any(e["column"] == "sample_rate_hz" for e in resp.json()["errors"])
+
+
+def test_export_reimport_round_trip_restores_tasks(api_client, db):
+    """全闭环:导出 → 清库 → 导回(不带任何表单字段)→ 任务原样恢复。"""
+    post_import(api_client, build_workbook(),
+                task_code="zs-acq", task_name="中山采集", sample_rate_hz="2.5")
+    gateway = config_models.ScadaGateway.objects.get(code="zs-scada")
+    blob = api_client.get(f"/api/config/scada-gateways/{gateway.id}/export/").content
+
+    for d in config_models.Device.objects.filter(protocol="scada"):
+        d.delete()
+    gateway.delete()
+    assert config_models.AcqTask.objects.count() == 0
+
+    resp = post_import(api_client, blob)
+
+    assert resp.status_code == status.HTTP_201_CREATED
+    tasks = list(config_models.AcqTask.objects.filter(code__startswith="zs-acq-"))
+    assert len(tasks) == 2
+    assert {float(t.sample_rate_hz) for t in tasks} == {2.5}
+    assert sum(t.points.count() for t in tasks) == 3
