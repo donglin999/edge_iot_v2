@@ -275,14 +275,23 @@ class MQTTProtocol(BaseProtocol):
         timeout = self.read_timeout  # seconds, configurable via mqtt_read_timeout
 
         try:
-            # Try to get messages from queue with timeout
-            while True:
+            # 每轮读取 = 一个快照:第一条消息最多等 read_timeout,拿到后把队列里
+            # **当前已有**的消息非阻塞排干就返回。
+            #
+            # 以前是「每条都 get(timeout) 直到队列空」—— 只要消息到达间隔小于
+            # read_timeout(比如 1Hz 流 vs 2s 超时),循环永远等得到下一条,
+            # read_points 永不返回:采集循环整个卡死在一次 read 里。有限条消息的
+            # 测试暴露不了,持续流的真实 broker 一接就卡(实测 60s+ 不归)。
+            try:
+                message = self.data_queue.get(timeout=timeout)
+            except queue.Empty:
+                message = None
+            while message is not None:
+                result = self._parse_message(message, points)
+                if result:
+                    results.extend(result)
                 try:
-                    message = self.data_queue.get(timeout=timeout)
-                    # Parse message and create result
-                    result = self._parse_message(message, points)
-                    if result:
-                        results.extend(result)
+                    message = self.data_queue.get_nowait()
                 except queue.Empty:
                     break
         except Exception as e:

@@ -367,3 +367,51 @@ class TestQueueSemantics:
         finally:
             target_logger.removeHandler(handler)
             proto.disconnect()
+
+
+def test_read_points_returns_under_continuous_stream(broker):
+    """持续消息流下 read_points 必须在一个快照后返回,不能被流喂到永不归。
+
+    以前的排空循环是「每条 get(timeout) 直到空」:消息到达间隔 < read_timeout 时
+    (1Hz 流 vs 2s 超时),永远等得到下一条 —— read_points 卡死。有限条消息的
+    测试暴露不了,本用例用后台线程持续发布来复现。
+    """
+    import json as _json
+    import threading as _threading
+    import time as _time
+
+    import paho.mqtt.client as _mqtt
+
+    from acquisition.protocols.mqtt import MQTTProtocol
+
+    stop = _threading.Event()
+
+    def _publisher():
+        pub = _mqtt.Client(client_id="cont-pub")
+        pub.connect(broker.host, broker.host_port, keepalive=10)
+        pub.loop_start()
+        while not stop.wait(0.3):  # 0.3s 间隔 << 2s read_timeout
+            pub.publish("cont/stream", _json.dumps({"v": _time.time()}))
+        pub.loop_stop(); pub.disconnect()
+
+    t = _threading.Thread(target=_publisher, daemon=True)
+    t.start()
+    try:
+        proto = MQTTProtocol({
+            "source_ip": broker.host, "source_port": broker.host_port,
+            "mqtt_topics": "cont/stream", "mqtt_use_tls": False,
+            "mqtt_qos": 0, "mqtt_read_timeout": 2.0,
+        })
+        assert proto.connect()
+        _time.sleep(1.0)  # 攒几条
+
+        started = _time.time()
+        results = proto.read_points([{"code": "v", "data_type": "float"}])
+        elapsed = _time.time() - started
+
+        # 必须远小于「被流卡死」的量级;给宽裕上限 6s(首条等待 2s + 排空)
+        assert elapsed < 6.0, f"read_points 被持续流卡了 {elapsed:.1f}s"
+        assert results, "攒了 1s 的消息,至少要读到一条"
+        proto.disconnect()
+    finally:
+        stop.set(); t.join(timeout=3)
