@@ -104,11 +104,9 @@ const AcquisitionControlPage = () => {
 
   // 每 3s 轮询一次活跃会话。
   //
-  // 以前这里在 WS 连接时会 return 掉、完全不轮询 —— 因为 WS 的 session_status
-  // 已经能把状态变更即时推过来。但 WS 只在**状态变化**时推,而「实际入库频率」
-  // (session.metadata.ingest_points_per_sec)是后端每 10s 刷一次的持续量,
-  // 状态不变时 WS 根本不会带它过来。所以这个轮询要一直跑,才能让实时速率读数
-  // 保持新鲜;WS 仍然负责状态变更的即时反馈,两者都写 activeSessions,幂等无害。
+  // WS 只在**状态变化**时推送,会话 metadata 里的持续量(运行时长、健康摘要等)
+  // 状态不变时不会更新 —— 轮询作为兜底让面板数据保持新鲜;WS 仍负责状态变更的
+  // 即时反馈,两者都写 activeSessions,幂等无害。
   useEffect(() => {
     let aborter: AbortController | null = null;
     const poll = () => {
@@ -187,7 +185,7 @@ const AcquisitionControlPage = () => {
           {getWsStatusBadge()}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <Tooltip title="关闭后,采集状态和入库速率仍会每 3 秒轮询兜底刷新;这个开关只控制状态变更是否通过 WebSocket 即时推送。">
+          <Tooltip title="关闭后,采集与会话状态仍会每 3 秒轮询兜底刷新;这个开关只控制状态变更是否通过 WebSocket 即时推送。">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <Switch
                 size="small"

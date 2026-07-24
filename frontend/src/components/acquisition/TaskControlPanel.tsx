@@ -171,40 +171,9 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
 
   const isRunning = !!(activeSession && activeSession.status === 'running');
 
-  // 入库速率 —— 实际 vs 目标。
-  //
-  // 实际:后端用 InfluxDBSink.total_written 在时间窗内算出的点/秒,只计**写成功**
-  //   的量(真正落到 InfluxDB 的频率;写不进去时为 0)。
-  // 目标:采样频率 × 测点数(后端 metadata.ingest_target_points_per_sec)。这是
-  //   pipeline 的真实口径 —— 所有测点共用一个任务级采样频率、每周期各读一遍。
-  // 达标率 = 实际 / 目标,给操作员一个「达没达标」的直观参照。
-  const meta = (isRunning && activeSession?.metadata) || undefined;
-  const actualIngestRate =
-    meta && typeof meta.ingest_points_per_sec === 'number'
-      ? (meta.ingest_points_per_sec as number)
-      : null;
-  const targetIngestRate =
-    meta && typeof meta.ingest_target_points_per_sec === 'number'
-      ? (meta.ingest_target_points_per_sec as number)
-      : null;
-  const ingestRatio =
-    actualIngestRate !== null && targetIngestRate && targetIngestRate > 0
-      ? actualIngestRate / targetIngestRate
-      : null;
-  // 阈值取 0.95,吸收批量 flush 与首窗口抖动。
-  const ingestGrade =
-    actualIngestRate === null
-      ? null
-      : ingestRatio === null
-        ? 'unknown'
-        : ingestRatio >= 0.95
-          ? 'ok'
-          : ingestRatio >= 0.7
-            ? 'near'
-            : 'low';
-  const ingestBasis = (meta?.ingest_target_basis ?? undefined) as
-    | { sample_rate_hz?: number; point_count?: number }
-    | undefined;
+  // 入库速率的展示已按用户要求移除(2026-07-24)。后端仍在 session.metadata 里
+  // 维护 ingest_points_per_sec / ingest_target_points_per_sec,作为诊断数据可经
+  // /acquisition/sessions/{id}/status/ 查看 —— 只是不再上界面。
 
   const sampleRateDirty =
     sampleRateValue !== null &&
@@ -651,65 +620,6 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
               : '※ 修改后将影响新启动的会话'}
           </Text>
         </div>
-        {isRunning && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, paddingLeft: 84, flexWrap: 'wrap' }}>
-            <Text type="secondary" style={{ fontSize: 12 }}>入库速率</Text>
-            {actualIngestRate === null ? (
-              <Text style={{ fontSize: 14, fontWeight: 600 }}>统计中…</Text>
-            ) : (
-              <Tooltip
-                title={
-                  <div style={{ fontSize: 12, lineHeight: 1.6 }}>
-                    <div>目标 = 采样频率 × 测点数</div>
-                    {ingestBasis && (
-                      <div>
-                        &nbsp;&nbsp;= {ingestBasis.sample_rate_hz} Hz × {ingestBasis.point_count} 个
-                        {' = '}
-                        {targetIngestRate} 点/秒
-                      </div>
-                    )}
-                    <div style={{ marginTop: 4 }}>
-                      实际 = 最近约 10s 成功写入 InfluxDB 的点数 ÷ 窗口时长
-                    </div>
-                    {ingestRatio !== null && (
-                      <div>达标率 = 实际 ÷ 目标 = {(ingestRatio * 100).toFixed(0)}%</div>
-                    )}
-                    <div style={{ marginTop: 4, opacity: 0.85 }}>
-                      低于 100% 常见原因:测点读失败/质量 bad、InfluxDB 写入拥塞、设备响应慢
-                    </div>
-                  </div>
-                }
-              >
-                <span style={{ cursor: 'help' }}>
-                  <Text style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
-                    实际 {actualIngestRate}
-                    {targetIngestRate !== null && ` / 目标 ${targetIngestRate}`} 点/秒
-                  </Text>
-                  {ingestGrade === 'ok' && (
-                    <Tag color="success" style={{ marginLeft: 8 }}>
-                      达标{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
-                    </Tag>
-                  )}
-                  {ingestGrade === 'near' && (
-                    <Tag color="warning" style={{ marginLeft: 8 }}>
-                      接近{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
-                    </Tag>
-                  )}
-                  {ingestGrade === 'low' && actualIngestRate > 0 && (
-                    <Tag color="error" style={{ marginLeft: 8 }}>
-                      偏低{ingestRatio !== null && ` ${(ingestRatio * 100).toFixed(0)}%`}
-                    </Tag>
-                  )}
-                  {actualIngestRate === 0 && (
-                    <Tag color="error" style={{ marginLeft: 8 }}>
-                      未落库 · 检查 InfluxDB
-                    </Tag>
-                  )}
-                </span>
-              </Tooltip>
-            )}
-          </div>
-        )}
       </div>
 
       {activeSession && (
