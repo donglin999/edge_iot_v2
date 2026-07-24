@@ -7,6 +7,7 @@ from . import views
 router = DefaultRouter()
 router.register(r"sites", views.SiteViewSet, basename="site")
 router.register(r"scada-gateways", views.ScadaGatewayViewSet, basename="scada-gateway")
+router.register(r"protocol-excel", views.ProtocolExcelViewSet, basename="protocol-excel")
 router.register(r"devices", views.DeviceViewSet, basename="device")
 router.register(r"channels", views.ChannelViewSet, basename="channel")
 router.register(r"points", views.PointViewSet, basename="point")

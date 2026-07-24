@@ -16,8 +16,10 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from acquisition.protocols import ProtocolRegistry
 from configuration.services.exporter import ExcelExportService
 from configuration.services.importer import ExcelImportService, RowError
+from configuration.services import protocol_excel
 from configuration.services.scada_excel import (
     build_scada_export,
     build_scada_template,
@@ -216,6 +218,129 @@ def _import_error_response(errors) -> Response:
         },
         status=status.HTTP_400_BAD_REQUEST,
     )
+
+
+def _protocol_query_param(request):
+    """Resolve+validate the ``protocol`` query param shared by template/export.
+
+    Returns ``(canonical_name, None)`` on success or ``(None, Response)`` with
+    a ready-to-return 400 on failure — callers just check the second slot.
+    """
+    protocol = (request.query_params.get("protocol") or "").strip().lower()
+    if not protocol:
+        return None, Response(
+            {"errors": [{"row": 0, "sheet": "", "column": "protocol", "message": "缺少 query 参数 protocol"}]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        klass = ProtocolRegistry.get(protocol)
+    except ValueError:
+        return None, Response(
+            {"errors": [{"row": 0, "sheet": "", "column": "protocol", "message": f"未知协议 '{protocol}'"}]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if klass.META.name in protocol_excel.EXCLUDED_PROTOCOLS:
+        return None, Response(
+            {"errors": [{
+                "row": 0, "sheet": "", "column": "protocol",
+                "message": f"协议 '{klass.META.name}' 不支持 v2 通用模板/导出，请使用其专属流程",
+            }]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return klass.META.name, None
+
+
+def _protocol_import_error_response(errors) -> Response:
+    """400 in the v2 shape: {row, sheet, column, message} per problem."""
+    return Response(
+        {
+            "protocol": "",
+            "created": {"devices": 0, "points": 0, "tasks": 0},
+            "updated": {"devices": 0, "points": 0, "tasks": 0},
+            "devices": [],
+            "errors": [e.to_dict() for e in errors],
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+@extend_schema_view()
+class ProtocolExcelViewSet(viewsets.ViewSet):
+    """协议 Excel v2：每个生产协议一份「设备+测点」两表模板/导出/导入。
+
+    与 legacy 40 列大宽表(ImportJob 流程)并存,互不覆盖：scada/simulator 不
+    在此引擎范围内(scada 走 :class:`ScadaGatewayViewSet` 自己的两表流程)。
+    列定义 100% 来自协议的 ``DEVICE_FIELDS``/``POINT_FIELDS``
+    (:mod:`acquisition.protocols`),新增协议自动获得模板/导入/导出。
+    """
+
+    @extend_schema(
+        summary="下载协议 v2 两表 Excel 模板",
+        description="query 参数 protocol=modbus_tcp 等(生产协议,不含 scada/simulator)；"
+                    "「设备」一行一台设备 +「测点」一行一个测点，无需重复任何连接字段",
+        parameters=[OpenApiParameter(name="protocol", required=True, type=str)],
+        responses={200: OpenApiTypes.BINARY, 400: None},
+    )
+    @action(detail=False, methods=["get"], url_path="template")
+    def template(self, request):
+        protocol, error_response = _protocol_query_param(request)
+        if error_response is not None:
+            return error_response
+        content = protocol_excel.build_template(protocol)
+        return _xlsx_response(content, f"{protocol}_v2_template.xlsx")
+
+    @extend_schema(
+        summary="导出协议当前配置为 v2 两表 Excel",
+        description="query 参数 protocol=modbus_tcp 等；导出格式与模板一致，可直接改完重新导入",
+        parameters=[OpenApiParameter(name="protocol", required=True, type=str)],
+        responses={200: OpenApiTypes.BINARY, 400: None},
+    )
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        protocol, error_response = _protocol_query_param(request)
+        if error_response is not None:
+            return error_response
+        content = protocol_excel.build_export(protocol)
+        ts = timezone.now().strftime("%Y%m%d_%H%M%S")
+        return _xlsx_response(content, f"{protocol}_v2_{ts}.xlsx")
+
+    @extend_schema(
+        summary="导入协议 v2 两表 Excel",
+        description=(
+            "multipart 上传字段名 file。协议按「使用说明」sheet 的元数据识别，缺失时按「设备」sheet "
+            "列签名自动识别。同步执行，整体一个事务：任何行级错误 → 400 + 逐行 "
+            "{row, sheet, column, message}，不写入任何数据。按设备 code / 测点 (device, code) 幂等；"
+            "一设备一采集任务(task-{设备编码})，频率取该行 sample_rate_hz。"
+        ),
+        request={"multipart/form-data": {"type": "object", "properties": {"file": {"type": "string", "format": "binary"}}}},
+        responses={200: None, 201: None, 400: None},
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="import",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_excel(self, request):
+        upload = request.FILES.get("file")
+        if upload is None:
+            return _protocol_import_error_response([
+                protocol_excel.RowError(0, "", "file", "请上传 Excel 文件（multipart 字段名 file）"),
+            ])
+
+        parsed = protocol_excel.parse_workbook(upload)
+        if not parsed.is_valid:
+            return _protocol_import_error_response(parsed.errors)
+
+        result = protocol_excel.provision(parsed.protocol, parsed.devices)
+
+        created = result["created"]
+        code = (
+            status.HTTP_201_CREATED
+            if created["devices"] or created["points"]
+            else status.HTTP_200_OK
+        )
+        return Response(result, status=code)
 
 
 @extend_schema_view(

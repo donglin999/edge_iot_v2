@@ -27,6 +27,7 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import {
   CloudDownloadOutlined,
+  CloudUploadOutlined,
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
@@ -36,12 +37,15 @@ import {
 
 import ConnectionTestModal from '../components/ConnectionTestModal';
 import DeviceFormModal from '../components/DeviceFormModal';
+import ProtocolExcelImportModal from '../components/ProtocolExcelImportModal';
 import { protocolsWithExcel } from '../protocols/registry';
 import { apiClient } from '../services/apiClient';
 import { fetchAllPages } from '../services/pagination';
 import {
   downloadDeviceExport,
+  downloadProtocolTemplateV2,
   downloadTemplate,
+  exportProtocolDevices,
   listProtocols,
   protocolTagColor,
   type ProtocolDescriptor,
@@ -81,6 +85,13 @@ const DEVICE_STATUS: Record<
 
 const { Text, Title } = Typography;
 
+/**
+ * v2 每协议两表 Excel(docs/excel-import-export-v2.md)不覆盖这两个协议:
+ * scada 有自己的网关两表流程(protocolsWithExcel() 已经把它列进模板下拉),
+ * simulator 不是生产协议。模板下拉的 v2 分组、导出联动都要排除它俩。
+ */
+const V2_EXCLUDED_PROTOCOLS = new Set(['scada', 'simulator']);
+
 const DeviceListPage = () => {
   const [devices, setDevices] = useState<Device[]>([]);
   const [protocols, setProtocols] = useState<ProtocolDescriptor[]>([]);
@@ -88,6 +99,7 @@ const DeviceListPage = () => {
   const [search, setSearch] = useState('');
   const [filterProtocol, setFilterProtocol] = useState<string>('all');
   const [modalOpen, setModalOpen] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | undefined>(undefined);
   const [defaultProtocol, setDefaultProtocol] = useState<string | undefined>();
   // 「测试连接」立刻开弹窗展示过程,而不是等几秒蹦个 toast。
@@ -272,23 +284,41 @@ const DeviceListPage = () => {
     [protocols],
   );
 
+  /** 生产协议(排除 scada/simulator)——模板下拉的 v2 分组来源,动态自协议清单。 */
+  const v2Protocols = useMemo(
+    () => protocols.filter((p) => !V2_EXCLUDED_PROTOCOLS.has(p.name)),
+    [protocols],
+  );
+
   /**
-   * 模板下拉:通用单表模板 + 各协议在注册表里声明的专属模板 + 导出当前设备。
+   * 模板下拉重组(docs/excel-import-export-v2.md「前端」节):
+   *   1. 每个生产协议一项,走 v2 每协议两表模板(设备+测点);
+   *   2. scada 项保持指向既有网关两表模板(protocolsWithExcel() 里登记的那份);
+   *   3. 通用单表模板沉底并标注 legacy —— 40 列大宽表,只有跨协议批量场景还用得上。
    *
-   * 通用模板是一张 40 列的大宽表,scada 用它得逐行重复 broker/账号/密码 ——
-   * 那正是网关模型要消掉的重复,所以 scada 必须给出自己的两表模板。
-   *
-   * 「导出当前设备」按当前协议筛选(Segmented 选中的 filterProtocol)传给后端
-   * /config/devices/export/;后端恒排除 scada(连接参数挂在网关而非
-   * device.metadata,通用格式装不下),所以筛到 scada 时改为提示去网关页导出。
+   * 「导出当前设备」联动当前协议筛选(Segmented 选中的 filterProtocol):
+   *   - 具体生产协议 → v2 per-protocol 导出;
+   *   - 「全部」→ 仍是 40 列全量导出(legacy,跨协议只有大宽表装得下,菜单文案标注);
+   *   - scada → 提示去网关页导出(连接参数挂在网关而非 device.metadata,两种格式都装不下)。
    */
   const templateMenu = useMemo(
     () => ({
       items: [
-        { key: 'generic', label: '通用模板(全部协议 · 单表)' },
-        ...protocolsWithExcel().map((e) => ({ key: e.protocol, label: e.label })),
+        ...v2Protocols.map((p) => ({
+          key: `v2:${p.name}`,
+          label: `${p.label} 模板(设备+测点两表)`,
+        })),
+        ...protocolsWithExcel().map((e) => ({ key: `custom:${e.protocol}`, label: e.label })),
         { type: 'divider' as const },
-        { key: 'export-current-devices', label: '导出当前设备(Excel)' },
+        { key: 'generic', label: '通用单表模板(legacy · 全部协议)' },
+        { type: 'divider' as const },
+        {
+          key: 'export-current-devices',
+          label:
+            filterProtocol === 'all'
+              ? '导出当前设备(Excel · legacy 全量单表)'
+              : '导出当前设备(Excel)',
+        },
       ],
       onClick: ({ key }: { key: string }) => {
         if (key === 'export-current-devices') {
@@ -296,15 +326,30 @@ const DeviceListPage = () => {
             message.warning('SCADA 设备请在「SCADA 网关」页导出(网关两表格式)。');
             return;
           }
-          const protocols = filterProtocol === 'all' ? undefined : [filterProtocol];
-          downloadDeviceExport(protocols).catch(() => undefined);
+          if (filterProtocol === 'all' || V2_EXCLUDED_PROTOCOLS.has(filterProtocol)) {
+            const protocols = filterProtocol === 'all' ? undefined : [filterProtocol];
+            downloadDeviceExport(protocols).catch(() => undefined);
+            return;
+          }
+          exportProtocolDevices(filterProtocol).catch(() => undefined);
           return;
         }
-        const custom = protocolsWithExcel().find((e) => e.protocol === key);
-        (custom ? custom.download() : downloadTemplate()).catch(() => undefined);
+        if (key === 'generic') {
+          downloadTemplate().catch(() => undefined);
+          return;
+        }
+        if (key.startsWith('v2:')) {
+          downloadProtocolTemplateV2(key.slice('v2:'.length)).catch(() => undefined);
+          return;
+        }
+        if (key.startsWith('custom:')) {
+          const protocol = key.slice('custom:'.length);
+          const custom = protocolsWithExcel().find((e) => e.protocol === protocol);
+          custom?.download().catch(() => undefined);
+        }
       },
     }),
-    [filterProtocol],
+    [filterProtocol, v2Protocols],
   );
 
   const segOptions = useMemo(
@@ -335,6 +380,9 @@ const DeviceListPage = () => {
             <Dropdown menu={templateMenu} trigger={['click']}>
               <Button icon={<CloudDownloadOutlined />}>下载 Excel 模板</Button>
             </Dropdown>
+            <Button icon={<CloudUploadOutlined />} onClick={() => setImportModalOpen(true)}>
+              导入配置
+            </Button>
             <Dropdown menu={addMenu} trigger={['click']}>
               <Button type="primary" icon={<PlusOutlined />}>
                 添加设备
@@ -382,6 +430,12 @@ const DeviceListPage = () => {
         defaultProtocol={defaultProtocol}
         onClose={() => setModalOpen(false)}
         onSaved={refresh}
+      />
+
+      <ProtocolExcelImportModal
+        open={importModalOpen}
+        onClose={() => setImportModalOpen(false)}
+        onImported={refresh}
       />
     </div>
   );

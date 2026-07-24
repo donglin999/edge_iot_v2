@@ -218,6 +218,11 @@ const ImportJobPage = () => {
             <Text type="secondary">
               通过 Excel 一次性配置多设备、多测点。每行选择 protocol_type,系统会按对应协议字段做行级校验。
             </Text>
+            <div>
+              <Text type="warning">
+                新格式(每协议设备+测点两表,免选协议自动识别)已迁到「设备管理」页的「导入配置」——本页保留给存量 40 列文件。
+              </Text>
+            </div>
           </div>
           <Space>
             <Dropdown
