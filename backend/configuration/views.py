@@ -332,7 +332,7 @@ class ProtocolExcelViewSet(viewsets.ViewSet):
             protocol = protocols_in_play.pop()
             if protocol == "scada":
                 return Response(
-                    {"detail": "SCADA 设备请在「SCADA 网关」页导出(网关两表格式)"},
+                    {"detail": "SCADA 设备请用设备列表行内导出(导出其网关两表),或在编辑该设备的配置弹窗里导出"},
                     status=status.HTTP_400_BAD_REQUEST)
             try:
                 content = protocol_excel.build_export(protocol, device_ids=device_ids)

@@ -55,9 +55,14 @@ const PROTOCOLS = [
   },
 ];
 
-function stubApi() {
+function stubApi(gateways: Array<{ id: number; code: string }> = []) {
   vi.mocked(apiClient.get).mockImplementation((url: string) => {
     if (url.includes('/acquisition/protocols/')) return Promise.resolve({ data: PROTOCOLS });
+    if (url.includes('/config/scada-gateways/')) {
+      return Promise.resolve({
+        data: { count: gateways.length, next: null, previous: null, results: gateways },
+      });
+    }
     return Promise.resolve({ data: { count: 0, next: null, previous: null, results: [] } });
   });
 }
@@ -170,15 +175,30 @@ describe('导出联动(独立「导出配置」按钮)', () => {
     );
   });
 
-  it('筛选 scada 时提示去网关页,不发导出请求', async () => {
-    const warnSpy = vi.spyOn(message, 'warning').mockImplementation(() => '' as never);
+  it('筛选 scada 时直接导出网关两表(单网关)', async () => {
     const user = userEvent.setup();
-    stubApi();
+    stubApi([{ id: 7, code: 'gw1' }]);
     renderPage();
     await user.click(await screen.findByText(/SCADA 网关 \(MQTT\) \(0\)/));
 
     await user.click(screen.getByRole('button', { name: /导出配置/ }));
-    await waitFor(() => expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/请在「SCADA 网关」页导出/)));
+    await waitFor(() =>
+      expect(downloadFile).toHaveBeenCalledWith(
+        '/config/scada-gateways/7/export/',
+        expect.stringMatching(/^scada_gw1/),
+      ),
+    );
+  });
+
+  it('筛选 scada 且没有网关时提示先建网关,不发下载', async () => {
+    const warnSpy = vi.spyOn(message, 'warning').mockImplementation(() => '' as never);
+    const user = userEvent.setup();
+    stubApi([]);
+    renderPage();
+    await user.click(await screen.findByText(/SCADA 网关 \(MQTT\) \(0\)/));
+
+    await user.click(screen.getByRole('button', { name: /导出配置/ }));
+    await waitFor(() => expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/还没有 SCADA 网关/)));
     expect(downloadFile).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });

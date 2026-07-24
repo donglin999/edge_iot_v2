@@ -95,7 +95,7 @@ const ProtocolExcelImportModal = ({ open, onClose, onImported }: ProtocolExcelIm
         </p>
         <p className="ant-upload-text">点击或拖拽 .xlsx 文件到此处上传</p>
         <p className="ant-upload-hint">
-          SCADA 设备请到「SCADA 网关」页导入;旧版 40 列通用模板请到「导入作业」页。
+          SCADA 设备请在「添加设备 → 选 scada」或编辑 scada 设备的弹窗里导入(网关两表);旧版 40 列通用模板请到「导入作业」页。
         </p>
       </Dragger>
 

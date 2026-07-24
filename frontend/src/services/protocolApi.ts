@@ -124,7 +124,7 @@ export async function exportProtocolDevices(protocol: string): Promise<void> {
 
 /**
  * 单设备导出:只导这一台(v2 两表,可改完直接导回)。协议由后端从设备推断;
- * scada 设备后端会 400(应走网关页),调用方自行拦或让错误浮出。
+ * scada 设备后端会 400(网关配置请走 scada 配置弹窗/列表行内导出),调用方自行拦或让错误浮出。
  */
 export async function exportSingleDevice(deviceId: number, deviceCode: string): Promise<void> {
   const safe = deviceCode.replace(/[/\s]/g, '_');

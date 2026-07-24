@@ -52,6 +52,7 @@ import {
   protocolTagColor,
   type ProtocolDescriptor,
 } from '../services/protocolApi';
+import { exportGateway, listGateways } from '../services/scadaApi';
 import type { DeviceStatus } from '../services/deviceApi';
 
 interface Device {
@@ -244,12 +245,21 @@ const DeviceListPage = () => {
               }}
             />
           </Tooltip>
-          <Tooltip title={row.protocol === 'scada' ? 'SCADA 设备请在网关页导出' : '导出这台设备(两表,可导回)'}>
+          <Tooltip
+            title={
+              row.protocol === 'scada'
+                ? '导出其所属网关配置(网关两表,含同网关全部设备)'
+                : '导出这台设备(两表,可导回)'
+            }
+          >
             <Button
               icon={<ExportOutlined />}
               size="small"
-              disabled={row.protocol === 'scada'}
-              onClick={() => exportSingleDevice(row.id, row.code).catch(() => undefined)}
+              onClick={() =>
+                row.protocol === 'scada'
+                  ? exportScadaDeviceGateway(row.code)
+                  : exportSingleDevice(row.id, row.code).catch(() => undefined)
+              }
             />
           </Tooltip>
           <Tooltip title="测试连接">
@@ -341,11 +351,39 @@ const DeviceListPage = () => {
    * 不是"模板")。联动当前协议筛选(Segmented 的 filterProtocol):
    *   - 具体生产协议 → v2 per-protocol 导出(两表,可直接改完再导回);
    *   - 「全部」→ 40 列全量导出(legacy,跨协议只有大宽表装得下);
-   *   - scada → 提示去网关页导出(连接参数挂在网关而非 device.metadata)。
+   *   - scada → 直接导出网关两表(连接参数挂在网关而非 device.metadata;
+   *     多个网关时逐个导出,每个网关一份文件)。
    */
-  const handleExport = () => {
+  /**
+   * scada 设备行内导出:导出它所属网关的两表配置。设备序列化里没有 gateway 字段,
+   * 但 provision 生成的 code 是确定的 `scada-{网关编码}-{device_name}`,按前缀反查
+   * (与 ScadaConfig.inferGateway 同法);匹配不上且只有一个网关时就用它。
+   */
+  const exportScadaDeviceGateway = async (deviceCode: string) => {
+    const gateways = await listGateways().catch(() => []);
+    const matched = gateways
+      .filter((g) => deviceCode.startsWith(`scada-${g.code}-`))
+      .sort((a, b) => b.code.length - a.code.length)[0]
+      ?? (gateways.length === 1 ? gateways[0] : undefined);
+    if (!matched) {
+      message.warning('无法确定该设备所属网关 —— 请在编辑该设备的配置弹窗里导出。');
+      return;
+    }
+    await exportGateway(matched.id, matched.code).catch(() => undefined);
+  };
+
+  const handleExport = async () => {
     if (filterProtocol === 'scada') {
-      message.warning('SCADA 设备请在「SCADA 网关」页导出(网关两表格式)。');
+      const gateways = await listGateways().catch(() => []);
+      if (gateways.length === 0) {
+        message.warning('还没有 SCADA 网关 —— 请先添加 scada 设备(会引导建网关)。');
+        return;
+      }
+      for (const gw of gateways) {
+        // 逐个下载;浏览器对同一手势的多下载一般放行,个别拦截时用户可再点一次。
+        await exportGateway(gw.id, gw.code).catch(() => undefined);
+      }
+      if (gateways.length > 1) message.info(`已导出 ${gateways.length} 个网关,各一份文件`);
       return;
     }
     if (filterProtocol === 'all' || V2_EXCLUDED_PROTOCOLS.has(filterProtocol)) {
