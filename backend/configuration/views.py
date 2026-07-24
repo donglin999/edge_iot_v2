@@ -290,13 +290,58 @@ class ProtocolExcelViewSet(viewsets.ViewSet):
         return _xlsx_response(content, f"{protocol}_v2_template.xlsx")
 
     @extend_schema(
-        summary="导出协议当前配置为 v2 两表 Excel",
-        description="query 参数 protocol=modbus_tcp 等；导出格式与模板一致，可直接改完重新导入",
-        parameters=[OpenApiParameter(name="protocol", required=True, type=str)],
+        summary="导出协议当前配置为 v2 两表 Excel(可选按设备)",
+        description=(
+            "query 参数 protocol=modbus_tcp 等；导出格式与模板一致，可直接改完重新导入。"
+            "可选 device_ids=1,2 只导出指定设备(单设备导出)——此时 protocol 可省略，"
+            "由设备推断(多协议混合或 scada/simulator 会 400)。"
+        ),
+        parameters=[
+            OpenApiParameter(name="protocol", required=False, type=str),
+            OpenApiParameter(name="device_ids", required=False, type=str),
+        ],
         responses={200: OpenApiTypes.BINARY, 400: None},
     )
     @action(detail=False, methods=["get"], url_path="export")
     def export(self, request):
+        raw_ids = request.query_params.get("device_ids", "")
+        device_ids: list[int] = []
+        for part in raw_ids.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                device_ids.append(int(part))
+            except ValueError:
+                return Response({"detail": f"device_ids 含非法值: {part!r}"},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+        if device_ids:
+            # 单设备/多设备导出:协议由设备推断,省得前端再传一遍;顺带把
+            # 「id 不存在 / 混协议 / scada」这三类错误在这里给出人话。
+            found = list(models.Device.objects.filter(id__in=device_ids))
+            missing = set(device_ids) - {d.id for d in found}
+            if missing:
+                return Response({"detail": f"设备不存在: {sorted(missing)}"},
+                                status=status.HTTP_400_BAD_REQUEST)
+            protocols_in_play = {d.protocol for d in found}
+            if len(protocols_in_play) > 1:
+                return Response(
+                    {"detail": f"所选设备跨协议({sorted(protocols_in_play)}),一次只能导出一个协议"},
+                    status=status.HTTP_400_BAD_REQUEST)
+            protocol = protocols_in_play.pop()
+            if protocol == "scada":
+                return Response(
+                    {"detail": "SCADA 设备请在「SCADA 网关」页导出(网关两表格式)"},
+                    status=status.HTTP_400_BAD_REQUEST)
+            try:
+                content = protocol_excel.build_export(protocol, device_ids=device_ids)
+            except ValueError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            ts = timezone.now().strftime("%Y%m%d_%H%M%S")
+            stem = found[0].code.replace("/", "_") if len(found) == 1 else f"{protocol}_selected"
+            return _xlsx_response(content, f"{stem}_{ts}.xlsx")
+
         protocol, error_response = _protocol_query_param(request)
         if error_response is not None:
             return error_response

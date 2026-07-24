@@ -589,3 +589,74 @@ def test_export_carries_device_code_so_custom_coded_devices_round_trip(api_clien
     # 没有冒出身份公式推导的重复设备
     assert models.Device.objects.filter(protocol="modbus_tcp").count() == 1
     assert models.Device.objects.get(protocol="modbus_tcp").code == "custom-99"
+
+
+# ---------------------------------------------------------------------------
+# 单设备导出(device_ids 参数)
+# ---------------------------------------------------------------------------
+
+
+def _mk_device(site, code, ip, slave, with_point=True):
+    d = models.Device.objects.create(
+        site=site, code=code, name=code, protocol="modbus_tcp",
+        ip_address=ip, port=502,
+        metadata={"source_ip": ip, "source_port": 502, "slave_id": slave,
+                  "byte_order": "big", "timeout": 5.0},
+    )
+    if with_point:
+        models.Point.objects.create(
+            device=d, code="t1", address="40001", description="温度",
+            extra={"data_type": "uint16", "num": 1, "function_code": 3},
+        )
+    return d
+
+
+@pytest.mark.django_db
+def test_single_device_export_contains_only_that_device(api_client):
+    """偶尔只想导一台设备 —— device_ids 只导指定设备,协议由设备推断。"""
+    site = models.Site.objects.create(code="default", name="default")
+    d1 = _mk_device(site, "dev-a", "10.66.0.1", 1)
+    _mk_device(site, "dev-b", "10.66.0.2", 2)
+
+    resp = api_client.get(EXPORT_URL, {"device_ids": str(d1.id)})
+    assert resp.status_code == status.HTTP_200_OK
+
+    wb = load_workbook(io.BytesIO(resp.content))
+    codes = [r[1] for r in wb[SHEET_DEVICES].iter_rows(min_row=3, values_only=True)]
+    assert codes == ["dev-a"], codes  # device_code 列只有这一台
+
+    # 单设备导出照样能原样导回(圆环)
+    import_resp = _upload(api_client, resp.content)
+    created = import_resp.data["created"]
+    assert (created["devices"], created["points"]) == (0, 0), import_resp.data
+
+
+@pytest.mark.django_db
+def test_single_device_export_rejects_mixed_protocols_and_missing(api_client):
+    site = models.Site.objects.create(code="default", name="default")
+    d1 = _mk_device(site, "dev-a", "10.66.0.1", 1)
+    other = models.Device.objects.create(
+        site=site, code="mq-1", name="mq", protocol="mqtt", ip_address="b", port=1883,
+        metadata={"source_ip": "b", "source_port": 1883, "mqtt_topics": "t"})
+
+    r = api_client.get(EXPORT_URL, {"device_ids": f"{d1.id},{other.id}"})
+    assert r.status_code == status.HTTP_400_BAD_REQUEST
+    assert "跨协议" in r.data["detail"]
+
+    r2 = api_client.get(EXPORT_URL, {"device_ids": "999999"})
+    assert r2.status_code == status.HTTP_400_BAD_REQUEST
+    assert "不存在" in r2.data["detail"]
+
+    r3 = api_client.get(EXPORT_URL, {"device_ids": "abc"})
+    assert r3.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_single_device_export_rejects_scada(api_client):
+    site = models.Site.objects.create(code="default", name="default")
+    d = models.Device.objects.create(
+        site=site, code="scada-x", name="x", protocol="scada", ip_address="h", port=8883,
+        metadata={"scada_device_name": "X"})
+    r = api_client.get(EXPORT_URL, {"device_ids": str(d.id)})
+    assert r.status_code == status.HTTP_400_BAD_REQUEST
+    assert "SCADA" in r.data["detail"]

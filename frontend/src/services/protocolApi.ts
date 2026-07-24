@@ -123,6 +123,17 @@ export async function exportProtocolDevices(protocol: string): Promise<void> {
 }
 
 /**
+ * 单设备导出:只导这一台(v2 两表,可改完直接导回)。协议由后端从设备推断;
+ * scada 设备后端会 400(应走网关页),调用方自行拦或让错误浮出。
+ */
+export async function exportSingleDevice(deviceId: number, deviceCode: string): Promise<void> {
+  const safe = deviceCode.replace(/[/\s]/g, '_');
+  await downloadFile(`${PROTOCOL_EXCEL_BASE}export/`, `${safe}.xlsx`, {
+    device_ids: String(deviceId),
+  });
+}
+
+/**
  * v2 同步导入(不走 ImportJob/celery):上传一份工作簿,后端自动识别协议
  * (优先读「使用说明」sheet 的元数据,退化到列签名匹配),整体一个事务 ——
  * 任何行级错误都 400 且不写任何数据。

@@ -47,6 +47,7 @@ import {
   downloadProtocolTemplateV2,
   downloadTemplate,
   exportProtocolDevices,
+  exportSingleDevice,
   listProtocols,
   protocolTagColor,
   type ProtocolDescriptor,
@@ -241,6 +242,14 @@ const DeviceListPage = () => {
                 setDefaultProtocol(row.protocol);
                 setModalOpen(true);
               }}
+            />
+          </Tooltip>
+          <Tooltip title={row.protocol === 'scada' ? 'SCADA 设备请在网关页导出' : '导出这台设备(两表,可导回)'}>
+            <Button
+              icon={<ExportOutlined />}
+              size="small"
+              disabled={row.protocol === 'scada'}
+              onClick={() => exportSingleDevice(row.id, row.code).catch(() => undefined)}
             />
           </Tooltip>
           <Tooltip title="测试连接">

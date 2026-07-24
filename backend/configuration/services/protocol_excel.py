@@ -771,11 +771,16 @@ def _point_row_for_export(point: models.Point, device_name: str, klass) -> Dict[
     return row
 
 
-def build_export(protocol: str) -> bytes:
+def build_export(protocol: str, device_ids: Optional[List[int]] = None) -> bytes:
     """Serialise the live devices/points for ``protocol`` into the v2 layout.
 
     Same shape as :func:`build_template` — import-ready, so export → edit →
     import is a supported round trip.
+
+    Args:
+        protocol: 协议名。
+        device_ids: 可选;只导出这些设备(单设备导出用)。给了 id 但不属于该
+            协议的会被过滤掉 —— 调用方(视图)负责先做归属校验并给出友好错误。
     """
     klass = ProtocolRegistry.get(protocol)
     if klass.META.name in EXCLUDED_PROTOCOLS:
@@ -787,6 +792,8 @@ def build_export(protocol: str) -> bytes:
         .prefetch_related("points")
         .order_by("code")
     )
+    if device_ids:
+        devices_qs = devices_qs.filter(id__in=device_ids)
 
     device_rows: List[Dict[str, Any]] = []
     point_rows: List[Dict[str, Any]] = []
