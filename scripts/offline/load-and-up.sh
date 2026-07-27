@@ -22,7 +22,12 @@ cd "$(dirname "$0")"
 ENV_ARGS=(); UP_ARGS=(); LOAD_ONLY=0; PROFILE_ARGS=(--profile ui); MODE="完整模式(带界面)"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --env-file) ENV_ARGS+=(--env-file "$2"); shift 2 ;;
+    # WEB_PORT 单独记下来:它只进 compose 的变量空间,结尾的健康检查提示要打真实
+    # 端口就得自己从 env 文件里读,否则永远显示默认 :80 误导现场。
+    --env-file) ENV_ARGS+=(--env-file "$2")
+                v=$(grep -E '^WEB_PORT=' "$2" 2>/dev/null | tail -1 | cut -d= -f2)
+                [ -n "${v:-}" ] && WEB_PORT="$v"
+                shift 2 ;;
     --load-only) LOAD_ONLY=1; shift ;;
     --headless) PROFILE_ARGS=(); MODE="采集模式(无界面)"; shift ;;
     --ui) PROFILE_ARGS=(--profile ui); MODE="完整模式(带界面)"; shift ;;
