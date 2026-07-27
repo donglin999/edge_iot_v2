@@ -19,11 +19,13 @@ WB="${1:-config/博创注塑机-scada导入.xlsx}"
 [ -f "$WB" ] || { echo "找不到工作簿: $WB"; exit 1; }
 
 echo "==> [1/3] 拷贝工作簿进容器"
-docker compose cp "$WB" celery-acq:/tmp/scada_import.xlsx
+# 特意不用 docker compose:现场可能只有 compose v1(没有 cp 子命令)。容器名
+# 在 docker-compose.yml 里固定为 celery-acq,直接 docker cp/exec 两版通吃。
+docker cp "$WB" celery-acq:/tmp/scada_import.xlsx
 
 echo "==> [2/3] 导入(与页面导入同一条 parse→provision 服务链)"
 echo "==> [3/3] 下发采集启动"
-docker compose exec -T celery-acq python - <<'PY'
+docker exec -i celery-acq python - <<'PY'
 import os
 import django
 

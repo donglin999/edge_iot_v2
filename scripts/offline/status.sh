@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-docker compose exec -T celery-acq python - <<'PY'
+docker exec -i celery-acq python - <<'PY'
 import os
 import time
 
