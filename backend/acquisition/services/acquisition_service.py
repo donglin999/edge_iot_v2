@@ -370,6 +370,7 @@ class AcquisitionService:
                 "fields": {
                     "consecutive_failures": health.get("consecutive_failures", 0),
                     "last_success_ts": health.get("last_success") or 0,
+                    "dropped_messages": health.get("dropped_messages", 0),
                     "session_status": self.session.status,
                 },
                 "time": int(timestamp * 1e9),
@@ -412,6 +413,8 @@ class AcquisitionService:
                     "status": health.get("status", "unknown"),
                     "consecutive_failures": health.get("consecutive_failures", 0),
                     "last_success": health.get("last_success"),
+                    # 队列溢出累计丢弃(推模式协议;拉模式恒 0/缺省)。
+                    "dropped_messages": health.get("dropped_messages", 0),
                 }
 
             self.session.refresh_from_db(fields=["metadata"])

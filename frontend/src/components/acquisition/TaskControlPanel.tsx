@@ -549,6 +549,11 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
                          deviceHealth.status === 'timeout' ? '超时' : '断开'}
                 </Tag>
               )}
+              {deviceHealth && Number(deviceHealth.dropped_messages) > 0 && (
+                <Tooltip title="设备推送速率超过处理能力,接收队列溢出丢弃的消息数(累计)。可提高任务采集频率或调大设备的接收队列容量(mqtt_queue_size)">
+                  <Tag color="error">丢弃 {Number(deviceHealth.dropped_messages)} 条</Tag>
+                </Tooltip>
+              )}
             </Space>
           </div>
           <Text type="secondary" style={{ fontFamily: 'monospace', fontSize: 13, display: 'block' }}>

@@ -49,6 +49,9 @@ class MQTTProtocol(BaseProtocol):
                   help_text="留空自动生成"),
         FieldSpec("mqtt_read_timeout", "读取超时(秒)", kind="float", default=5.0,
                   help_text="采集循环从消息队列拉数据时的最长等待时间;队列空闲超过该值即结束本轮读取"),
+        FieldSpec("mqtt_queue_size", "接收队列容量", kind="int", default=1000,
+                  help_text="消息推送快于消费时的缓冲上限;持续吞吐上限≈容量×采集频率(条/秒)。"
+                            "队列满时丢弃新消息并计数(会话健康指标 dropped_messages + 数据丢弃告警)"),
     )
     # mqtt_client_id defaults to "" (auto-generated at connect time), so it
     # must not be part of device identity: two devices on the same broker
@@ -98,7 +101,16 @@ class MQTTProtocol(BaseProtocol):
             self.read_timeout = 5.0
 
         self.client: Optional[mqtt.Client] = None
-        self.data_queue = queue.Queue(maxsize=1000)
+        try:
+            queue_size = int(device_config.get("mqtt_queue_size", 1000))
+        except (TypeError, ValueError):
+            queue_size = 1000
+        if queue_size <= 0:
+            queue_size = 1000
+        self.data_queue = queue.Queue(maxsize=queue_size)
+        # 累计丢弃数(队列满)。paho 网络线程独占自增,其他线程只读 —— 读到的
+        # 至多是滞后一拍的值,够用;不加锁。
+        self.dropped_messages = 0
         self.is_running = False
 
         # Set by the on_connect wrapper installed in connect(); used to block
@@ -329,7 +341,13 @@ class MQTTProtocol(BaseProtocol):
             }
             self.data_queue.put(message_data, block=False)
         except queue.Full:
-            self.logger.warning("Message queue is full, dropping message")
+            self.dropped_messages += 1
+            # 高频溢出时逐条打日志本身就会成为瓶颈 —— 首条必打,之后每 1000 条打一次。
+            if self.dropped_messages == 1 or self.dropped_messages % 1000 == 0:
+                self.logger.warning(
+                    "Message queue is full, dropping message (dropped_total=%d)",
+                    self.dropped_messages,
+                )
         except Exception as e:
             self.logger.error(f"Error processing MQTT message: {e}")
 

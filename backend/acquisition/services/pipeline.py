@@ -116,6 +116,15 @@ class ReadWorker(threading.Thread):
         self._connecting_emitted = False
         # Per-disconnect-cycle counter — incremented on each retry attempt.
         self._reconnect_attempt = 0
+        # ----- data-loss (queue overflow) tracking ----------------------
+        # 推模式协议(MQTT/scada)队列满时静默丢新消息,协议实例只维护自己的
+        # dropped_messages;重连会换新实例、计数归零,所以 worker 层折叠出跨
+        # 实例的累计值(_dropped_base + 当前实例),并在增长时拉数据丢弃告警、
+        # 静默一段时间后自动清除。
+        self._dropped_base = 0
+        self._last_dropped_seen = 0
+        self._last_drop_increase_at: Optional[float] = None
+        self._drop_alarm_raised = False
         # Tracks whether ``gave_up`` has already been emitted for the
         # current backoff window so we don't repeat it every loop.
         self._gave_up_emitted = False
@@ -250,6 +259,59 @@ class ReadWorker(threading.Thread):
         clear_system_alarm(f"connectivity:{self.device.code}")
         self._offline_alarm_raised = False
 
+    # ------------------------------------------------------ data-loss alarm
+    #: 丢弃停止多久后自动清除数据丢弃告警(秒)。
+    DROP_ALARM_CLEAR_WINDOW_S = 60.0
+
+    def _track_dropped_messages(self) -> None:
+        """把队列溢出丢弃数发布到健康记录,并管理数据丢弃告警的生命周期。
+
+        推模式协议(MQTT/scada)在推送速率超过「队列容量×采集频率」时静默丢新
+        消息 —— 压测实证 2240 msg/s 下丢了一半、界面毫无异样。这里让丢弃变成
+        看得见的三件事:健康指标 dropped_messages(进会话 metadata 和 InfluxDB
+        健康点)、丢弃增长时的 data_loss 系统告警(dedup 幂等)、丢弃停止
+        ``DROP_ALARM_CLEAR_WINDOW_S`` 后自动清除并重新武装。
+
+        拉模式协议没有 dropped_messages 属性,total 恒 0,全程零开销短路。
+        """
+        total = self._dropped_base + getattr(self.protocol, "dropped_messages", 0)
+        if total == 0 and not self._drop_alarm_raised:
+            return
+
+        now = time.time()
+        if total > self._last_dropped_seen:
+            delta = total - self._last_dropped_seen
+            self._last_dropped_seen = total
+            self._last_drop_increase_at = now
+            self._update_health(dropped_messages=total)
+            if not self._drop_alarm_raised:
+                from acquisition.services.reporting import raise_system_alarm
+
+                code = self.device.code
+                raise_system_alarm(
+                    category="data_loss",
+                    severity="warning",
+                    message=(
+                        f"设备 {code} 消息推送速率超过处理能力,接收队列溢出丢弃数据"
+                        f"(本次新增 {delta} 条,累计 {total} 条)。"
+                        "建议提高任务采集频率或调大接收队列容量(mqtt_queue_size)"
+                    ),
+                    device_code=code,
+                    session=self._session,
+                    value={"dropped_total": total, "dropped_delta": delta},
+                    dedup_key=f"data_loss:{code}",
+                )
+                self._drop_alarm_raised = True
+        elif (
+            self._drop_alarm_raised
+            and self._last_drop_increase_at is not None
+            and (now - self._last_drop_increase_at) >= self.DROP_ALARM_CLEAR_WINDOW_S
+        ):
+            from acquisition.services.reporting import clear_system_alarm
+
+            clear_system_alarm(f"data_loss:{self.device.code}")
+            self._drop_alarm_raised = False
+
     def _flush_failed_events(self, *, force: bool = False) -> None:
         """Emit a ``read_failed`` aggregate when the burst threshold or
         window has elapsed (or ``force`` is set, e.g. on disconnect)."""
@@ -285,6 +347,9 @@ class ReadWorker(threading.Thread):
                 self.device,
                 overrides={"timeout": self._auto_timeout},
             )
+            # 换协议实例前折叠旧实例的丢弃数,让 dropped_messages 跨重连累计。
+            if self.protocol is not None:
+                self._dropped_base += getattr(self.protocol, "dropped_messages", 0)
             self.protocol = ProtocolRegistry.create(self.device.protocol, cfg)
             self.protocol.connect()
             self._update_health(
@@ -409,6 +474,7 @@ class ReadWorker(threading.Thread):
                 self._read_cycle()
                 # Window-based flush in the healthy path.
                 self._flush_failed_events()
+                self._track_dropped_messages()
 
             elapsed = time.time() - cycle_start
             sleep = max(0.0, self.cycle_interval - elapsed)
@@ -463,6 +529,8 @@ class ReadWorker(threading.Thread):
                     self.protocol.disconnect()
             except Exception:  # noqa: BLE001
                 pass
+            if self.protocol is not None:
+                self._dropped_base += getattr(self.protocol, "dropped_messages", 0)
             self.protocol = None
             # Edge: only the *first* timeout per disconnect cycle emits
             # ``disconnected``. Subsequent ticks find ``self.protocol``
