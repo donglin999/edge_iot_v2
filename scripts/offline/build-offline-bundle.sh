@@ -80,9 +80,11 @@ echo "images.tar 大小: $(du -h "$OUT/images.tar" | cut -f1)" >> "$OUT/manifest
 echo "==> [5/5] 打包运行材料"
 cp deploy/offline/docker-compose.offline.yml "$OUT/docker-compose.yml"
 cp scripts/offline/load-and-up.sh            "$OUT/"
+cp scripts/offline/import-and-start.sh       "$OUT/"
+cp scripts/offline/status.sh                 "$OUT/"
 cp deploy/offline/.env.example               "$OUT/.env.example"
 cp docs/deploy/offline-amd64-monolith.md     "$OUT/README.md" 2>/dev/null || true
-chmod +x "$OUT/load-and-up.sh"
+chmod +x "$OUT/load-and-up.sh" "$OUT/import-and-start.sh" "$OUT/status.sh"
 
 echo ""
 echo "==> 完成。安装包目录："
