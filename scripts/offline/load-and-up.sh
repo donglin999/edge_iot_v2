@@ -68,6 +68,18 @@ done
 
 [ "$LOAD_ONLY" -eq 1 ] && { echo "load-only 完成。"; exit 0; }
 
+# 固定容器名(redis-iot 等)是全局唯一的:换个目录重新部署时,旧目录起的同名
+# 容器会让 up 直接冲突失败(现场实测)。up 前一律清掉同名旧容器 —— 配置数据在
+# named volume 里不受影响;正在跑的采集会话被打断后,worker 重启时自动恢复
+# RUNNING 会话,不丢状态。注意 volume 跟着 compose 项目名(=目录名)走,换目录
+# 部署等于新数据库,起完记得重跑 ./import-and-start.sh(幂等)。
+echo "==> 清理旧容器(固定容器名,重复部署冲突预防)"
+for c in redis-iot migrate-iot django-iot celery-acq celery-short frontend-iot; do
+  if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
+    docker rm -f "$c" >/dev/null 2>&1 && echo "   已移除旧容器 $c"
+  fi
+done
+
 # 自动识别 compose：优先 v2 插件（docker compose），回退 v1（docker-compose）
 if docker compose version >/dev/null 2>&1; then
   DC=(docker compose)
