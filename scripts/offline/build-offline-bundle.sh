@@ -24,10 +24,11 @@ cd "$REPO_ROOT"
 OUT="dist/offline/zhongshan-monolith-amd64"
 PLATFORM="linux/amd64"
 
-# 目标机已有、不打包，仅在 README/清单里记录为前置要求。
-# influxdb 由生产环境自行运行在宿主机（本包不启动它），故不列入。
-PREEXISTING_IMAGES=(redis:7.0.10)
+# 2026-07-27 现场实测:工控机连 redis 镜像都没有且无网 —— "目标机已有"不成立,
+# redis 一并打进包,安装包完全自包含。influxdb 仍由生产环境自行运行(不打包)。
+PREEXISTING_IMAGES=()
 BUILT_IMAGES=(edge-iot/backend:offline-amd64 edge-iot/web:offline-amd64)
+BUNDLED_PULLED_IMAGES=(redis:7.0.10)
 
 # 从 docker-save tar 内某镜像的 config blob 读架构（architecture 字段），让清单
 # 反映实际发出的字节，而不是本机 by-name 镜像（Mac 上 by-name inspect 命中 arm64
@@ -62,18 +63,19 @@ docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" \
   -f deploy/offline/Dockerfile.web -t edge-iot/web:offline-amd64 --load .
 
 echo "==> [4/5] docker save -> images.tar (+ sha256, manifest)"
-docker save --platform "$PLATFORM" "${BUILT_IMAGES[@]}" -o "$OUT/images.tar"
+# 基础镜像按目标架构拉取(本机可能只有 arm64 缓存,save 出去会在工控机上起不来)
+for img in "${BUNDLED_PULLED_IMAGES[@]}"; do
+  docker pull --platform "$PLATFORM" "$img"
+done
+docker save --platform "$PLATFORM" "${BUILT_IMAGES[@]}" "${BUNDLED_PULLED_IMAGES[@]}" -o "$OUT/images.tar"
 ( cd "$OUT" && shasum -a 256 images.tar > images.tar.sha256 )
 : > "$OUT/manifest.txt"
-echo "# 应用镜像（已打包在 images.tar 内）" >> "$OUT/manifest.txt"
-for img in "${BUILT_IMAGES[@]}"; do
+echo "# 镜像（全部已打包在 images.tar 内,完全自包含）" >> "$OUT/manifest.txt"
+for img in "${BUILT_IMAGES[@]}" "${BUNDLED_PULLED_IMAGES[@]}"; do
   arch=$(tar_arch "$OUT/images.tar" "$img")
   size=$(docker image inspect "$img" --format '{{.Size}}' 2>/dev/null || echo '?')
   printf '%-40s arch=%-6s size=%s\n' "$img" "$arch" "$size" >> "$OUT/manifest.txt"
 done
-echo "" >> "$OUT/manifest.txt"
-echo "# 前置镜像（目标机必须已存在，未打包）" >> "$OUT/manifest.txt"
-for img in "${PREEXISTING_IMAGES[@]}"; do echo "$img" >> "$OUT/manifest.txt"; done
 echo "" >> "$OUT/manifest.txt"
 echo "images.tar 大小: $(du -h "$OUT/images.tar" | cut -f1)" >> "$OUT/manifest.txt"
 

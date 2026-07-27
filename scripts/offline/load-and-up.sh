@@ -30,14 +30,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-echo "==> 前置检查：目标机须已有 redis:7.0.10 镜像（本包不含它）"
-if docker image inspect redis:7.0.10 >/dev/null 2>&1; then
-  echo "   [有] redis:7.0.10"
-else
-  echo "   [缺] redis:7.0.10  <== 目标机缺此镜像且无网络。若宿主机已自跑 Redis，"
-  echo "        请删除 docker-compose.yml 里的 redis 服务；否则先 docker load 该镜像。"
-  exit 1
-fi
+# redis:7.0.10 自 2026-07-27 起打进 images.tar(现场实测目标机没有该镜像且无网,
+# "目标机已有"的假设不成立)。docker load 后统一自检,这里不再前置拦截。
 echo "==> 提醒：InfluxDB 由生产环境自行运行，需可通过 127.0.0.1:8086 访问（org=Midea/bucket=Record）"
 if command -v curl >/dev/null 2>&1; then
   curl -fsS "http://127.0.0.1:8086/health" >/dev/null 2>&1 \
@@ -55,11 +49,17 @@ fi
 echo "==> docker load < images.tar"
 docker load -i images.tar
 
-echo "==> 架构自检（edge-iot/* 应均为 amd64）"
-docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'edge-iot/|redis:7.0.10' | sort -u | while read -r img; do
-  arch=$(docker image inspect "$img" --format '{{.Architecture}}' 2>/dev/null || echo '?')
-  printf '   %-44s %s\n' "$img" "$arch"
+echo "==> 镜像自检（三个镜像应齐全且均为 amd64）"
+MISSING=0
+for img in edge-iot/backend:offline-amd64 edge-iot/web:offline-amd64 redis:7.0.10; do
+  if docker image inspect "$img" >/dev/null 2>&1; then
+    arch=$(docker image inspect "$img" --format '{{.Architecture}}' 2>/dev/null || echo '?')
+    printf '   %-44s %s\n' "$img" "$arch"
+  else
+    printf '   %-44s [缺失]\n' "$img"; MISSING=1
+  fi
 done
+[ "$MISSING" -eq 1 ] && { echo "!! 有镜像缺失 —— images.tar 不完整？"; exit 1; }
 
 [ "$LOAD_ONLY" -eq 1 ] && { echo "load-only 完成。"; exit 0; }
 
