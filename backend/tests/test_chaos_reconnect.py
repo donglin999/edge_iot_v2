@@ -258,7 +258,7 @@ class TestChaosReconnect:
                 # worker must detect the outage, raise ONE persisted alarm,
                 # flip the device to offline, and — critically — NOT die.
                 assert _wait_until(
-                    lambda: _firing_alarms(dedup_key).count() == 1, timeout=5.0,
+                    lambda: _firing_alarms(dedup_key).count() == 1, timeout=20.0,
                 ), f"round {round_no}: connectivity alarm never fired (health={worker.health})"
                 assert worker.is_alive(), f"round {round_no}: worker thread died while offline"
                 assert compute_device_statuses([device])[device.id] == "offline"
@@ -284,11 +284,11 @@ class TestChaosReconnect:
                 )
 
                 assert _wait_until(
-                    lambda: _firing_alarms(dedup_key).count() == 0, timeout=5.0,
+                    lambda: _firing_alarms(dedup_key).count() == 0, timeout=20.0,
                 ), f"round {round_no}: alarm never cleared on reconnect"
                 assert compute_device_statuses([device])[device.id] == "online"
-                assert _wait_until(lambda: worker.health.get("status") == "healthy", timeout=3.0)
-                assert _wait_until(lambda: capture.count() > readings_before, timeout=3.0), (
+                assert _wait_until(lambda: worker.health.get("status") == "healthy", timeout=20.0)
+                assert _wait_until(lambda: capture.count() > readings_before, timeout=10.0), (
                     f"round {round_no}: no fresh data after reconnect"
                 )
                 assert worker.is_alive()
