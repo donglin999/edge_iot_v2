@@ -75,6 +75,10 @@ export interface PointHistoryResponse {
   end_time: string | null;
   count: number;
   data: DataPoint[];
+  /** full/window 模式元数据(旧后端无这些键,可选)。 */
+  downsampled?: boolean;
+  window_used?: string | null;
+  raw_count?: number | null;
 }
 
 export interface AcquisitionSession {
@@ -119,12 +123,17 @@ export async function fetchPointHistory(
   endTime?: string,
   limit = 1000,
   signal?: AbortSignal,
-  window?: string
+  window?: string,
+  full?: boolean
 ): Promise<PointHistoryResponse> {
   const params = new URLSearchParams({
     point_code: pointCode,
     limit: limit.toString(),
   });
+
+  if (full) {
+    params.append('full', '1');
+  }
 
   if (startTime) {
     params.append('start_time', startTime);

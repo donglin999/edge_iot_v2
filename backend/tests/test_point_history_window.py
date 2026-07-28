@@ -136,3 +136,80 @@ class TestPointHistoryWindowParam:
             f'|> limit(n: 1000) '
             f'|> sort(columns: ["_time"])'
         )
+
+
+# ---------------------------------------------------------------------------
+# full=1 自适应完整形态(count → 全量 or 极值包络)
+# ---------------------------------------------------------------------------
+
+
+def _query_full_via_mock(api_client, params, count_value):
+    """Mock storage:第一次 query 回 count,第二次回空数据;捕获两条 flux。"""
+    captured = []
+
+    class _FakeStorage:
+        def connect(self): pass
+        def disconnect(self): pass
+        def query(self, flux):
+            captured.append(flux)
+            if len(captured) == 1 and "count()" in flux:
+                return [{"_value": count_value}]
+            return []
+
+    with patch("storage.StorageRegistry.create", return_value=_FakeStorage()):
+        resp = api_client.get("/api/acquisition/sessions/point-history/", params)
+    return resp, captured
+
+
+@pytest.mark.django_db
+class TestFullAdaptiveMode:
+    def test_small_count_returns_untruncated_raw(self, api_client):
+        resp, flux = _query_full_via_mock(
+            api_client, {"point_code": "P1", "start_time": "-1h", "full": "1"},
+            count_value=500,
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.data["downsampled"] is False
+        assert resp.data["raw_count"] == 500
+        assert len(flux) == 2
+        assert "count()" in flux[0]
+        # 全量路径:无 limit 截尾、无聚合
+        assert "limit(" not in flux[1]
+        assert "aggregateWindow" not in flux[1]
+
+    def test_large_count_switches_to_minmax_envelope(self, api_client):
+        resp, flux = _query_full_via_mock(
+            api_client, {"point_code": "P1", "start_time": "-1h", "full": "1"},
+            count_value=50_000,
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.data["downsampled"] is True
+        assert resp.data["raw_count"] == 50_000
+        # 1h/1000 桶 → 3s 窗
+        assert resp.data["window_used"] == "3s"
+        env = flux[1]
+        assert "fn: min" in env and "fn: max" in env and "union(" in env
+        assert 'timeSrc: "_start"' in env
+
+    def test_explicit_window_wins_over_full(self, api_client):
+        resp, flux = _query_full_via_mock(
+            api_client,
+            {"point_code": "P1", "start_time": "-1h", "full": "1", "window": "30s"},
+            count_value=0,
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        # window 显式给定:走 last 降采样,不发 count 查询
+        assert len(flux) == 1
+        assert "fn: last" in flux[0]
+        assert resp.data["downsampled"] is True
+        assert resp.data["window_used"] == "30s"
+
+    def test_without_full_behavior_unchanged(self, api_client):
+        resp, flux = _query_full_via_mock(
+            api_client, {"point_code": "P1", "start_time": "-1h"},
+            count_value=0,
+        )
+        assert len(flux) == 1
+        assert "count()" not in flux[0]
+        assert "limit(n: 1000)" in flux[0]
+        assert resp.data["downsampled"] is False

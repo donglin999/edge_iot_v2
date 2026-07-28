@@ -105,7 +105,7 @@ const RANGE_TO_MS: Record<HistoryRange, number> = {
 };
 
 const DISPLAY_MODE_OPTIONS: Array<{ label: string; value: DisplayMode }> = [
-  { label: '全量数据', value: 'full' },
+  { label: '全量数据(自适应)', value: 'full' },
   { label: '自动降采样', value: 'auto' },
 ];
 
@@ -198,6 +198,10 @@ const DataVisualizationPage: React.FC = () => {
   const [latestLoading, setLatestLoading] = useState(false);
   const [historyRange, setHistoryRange] = useState<HistoryRange>('1h');
   const [displayMode, setDisplayMode] = useState<DisplayMode>('full');
+  // 全量(自适应)模式的响应元数据:服务端 count 后决定原样全量还是极值包络。
+  const [historyMeta, setHistoryMeta] = useState<{
+    downsampled: boolean; windowUsed: string | null; rawCount: number | null;
+  } | null>(null);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [exporting, setExporting] = useState(false);
 
@@ -718,7 +722,11 @@ const DataVisualizationPage: React.FC = () => {
                 ? `已降采样:每 ${historyWindow} 取最新一条`
                 : displayMode === 'auto'
                 ? '全量数据(当前范围数据量小,无需降采样)'
-                : '全量数据'}
+                : historyMeta?.downsampled
+                ? `完整形态:每 ${historyMeta.windowUsed} 取极值包络(原始 ${historyMeta.rawCount ?? '?'} 点,尖峰已保留)`
+                : historyMeta && historyMeta.rawCount !== null
+                ? `全量数据(${historyMeta.rawCount} 点)`
+                : '全量数据(完整时间段)'}
             </Text>
             <PointChart
               pointCode={selectedPoint.point_code}
@@ -727,6 +735,8 @@ const DataVisualizationPage: React.FC = () => {
               unit={selectedPoint.unit}
               refreshKey={historyRefreshKey}
               window={historyWindow ?? undefined}
+              full={displayMode === 'full'}
+              onMeta={setHistoryMeta}
               height={340}
             />
           </Space>

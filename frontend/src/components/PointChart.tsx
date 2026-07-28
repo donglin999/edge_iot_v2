@@ -47,6 +47,10 @@ interface PointChartProps {
    * 一条,减少传输与渲染压力;不传为全量数据(行为不变)。
    */
   window?: string;
+  /** 自适应完整形态:后端 count 后决定回全量还是极值包络(点数有上界)。 */
+  full?: boolean;
+  /** 响应元数据回调(副标题展示包络窗口/原始点数用)。 */
+  onMeta?: (meta: { downsampled: boolean; windowUsed: string | null; rawCount: number | null }) => void;
 }
 
 interface ChartPoint {
@@ -64,8 +68,13 @@ const PointChart: React.FC<PointChartProps> = ({
   height = 320,
   refreshKey = 0,
   window: aggWindow,
+  full,
+  onMeta,
 }) => {
   const [data, setData] = useState<ChartPoint[]>([]);
+  // onMeta 走 ref:父组件每次 render 传新函数,直接进依赖会让图表反复重取。
+  const onMetaRef = React.useRef(onMeta);
+  useEffect(() => { onMetaRef.current = onMeta; }, [onMeta]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -82,7 +91,13 @@ const PointChart: React.FC<PointChartProps> = ({
           1000,
           aborter.signal,
           aggWindow,
+          full,
         );
+        onMetaRef.current?.({
+          downsampled: !!res.downsampled,
+          windowUsed: res.window_used ?? null,
+          rawCount: res.raw_count ?? null,
+        });
         const rows: ChartPoint[] = (res.data || [])
           .map((dp) => {
             const numericValue =
@@ -119,7 +134,7 @@ const PointChart: React.FC<PointChartProps> = ({
     return () => {
       aborter.abort();
     };
-  }, [pointCode, startTime, endTime, refreshKey, aggWindow]);
+  }, [pointCode, startTime, endTime, refreshKey, aggWindow, full]);
 
   if (loading && data.length === 0) {
     return (

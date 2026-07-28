@@ -85,7 +85,7 @@ async function pickDisplayMode(
   // 展示模式选择器当前显示「全量数据」;副标题里也有同文案,用
   // selection-item 的 selector 精确定位选择器本体再点开选目标项。
   await user.click(
-    screen.getByText('全量数据', { selector: '.ant-select-selection-item' }),
+    screen.getByText('全量数据(自适应)', { selector: '.ant-select-selection-item' }),
   );
   await user.click(await screen.findByTitle(label));
 }
@@ -121,7 +121,9 @@ describe('历史图展示模式(全量 / 自动降采样)', () => {
     await selectPoint(user);
 
     expect(chartWindow()).toBe('');
-    expect(screen.getByText('全量数据', { selector: 'span.ant-typography' })).toBeTruthy();
+    expect(
+      screen.getByText('全量数据(完整时间段)', { selector: 'span.ant-typography' }),
+    ).toBeTruthy();
 
     await user.click(screen.getByRole('button', { name: /导出 CSV/ }));
     await waitFor(() => expect(fetchPointHistory).toHaveBeenCalled());

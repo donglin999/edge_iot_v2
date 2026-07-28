@@ -68,6 +68,34 @@ _FLUX_WINDOW_UNIT_MS = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000}
 _FLUX_WINDOW_MAX_MS = 24 * 3_600_000
 
 
+# ---- 自适应全量(full=1)模式的参数 ---------------------------------------
+# 原始点数不超过该值直接回全量;超过则切极值包络降采样。
+FULL_RAW_THRESHOLD = 2000
+# 包络模式的目标桶数:每桶出 min+max 两点,前端收到 ≈ 2×目标 上限的点。
+FULL_TARGET_BUCKETS = 1000
+
+_FLUX_DUR_SECONDS = {
+    "ns": 1e-9, "us": 1e-6, "ms": 1e-3,
+    "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0,
+}
+_FLUX_DUR_PARSE_RE = re.compile(r"^(-?)(\d+)(ns|us|ms|s|m|h|d|w)$")
+
+
+def _flux_bound_to_epoch(value: str, now_ts: float) -> float:
+    """把一个**已通过** ``_validate_flux_time_arg`` 的时间边界折算成 epoch 秒。
+
+    仅用于服务端计算范围时长(选包络窗口),不参与查询串拼接。
+    """
+    if value == "now()":
+        return now_ts
+    m = _FLUX_DUR_PARSE_RE.match(value)
+    if m:
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        return now_ts + sign * int(m.group(2)) * _FLUX_DUR_SECONDS[m.group(3)]
+    from datetime import datetime
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
 def _validate_flux_window(value: str) -> str:
     """Return ``value`` unchanged if it is a safe ``aggregateWindow`` duration
     (``^\\d+(ms|s|m|h)$`` with a sane, non-zero magnitude), else raise
@@ -722,6 +750,12 @@ class AcquisitionSessionViewSet(
         可选参数 ``window``(如 ``10s`` / ``1m``):按窗口取最新一条
         (InfluxDB ``aggregateWindow(fn: last)``)做服务端降采样,减少
         大时间范围下的传输与渲染压力。不传时行为与原来完全一致。
+
+        可选参数 ``full=1``(与 ``window`` 互斥,同时给时 window 优先):
+        自适应完整形态 —— 先 count():原始点 ≤ FULL_RAW_THRESHOLD 直接回
+        全量;超过则服务端按 ~FULL_TARGET_BUCKETS 个桶自动选窗口,每桶取
+        min+max **极值包络**(尖峰不丢),响应点数有上界,前端渲染永不爆。
+        响应新增 ``downsampled/window_used/raw_count`` 元数据。
         """
         point_code = request.query_params.get('point_code')
         if not point_code:
@@ -734,6 +768,7 @@ class AcquisitionSessionViewSet(
         end_time = request.query_params.get('end_time', 'now()')
         limit = int(request.query_params.get('limit', 1000))
         window = request.query_params.get('window')
+        full_mode = request.query_params.get('full') in ('1', 'true', 'yes')
 
         # SEC: strictly validate the range bounds before they reach the Flux
         # query. Only a whitelisted set of shapes is accepted; anything else is
@@ -794,10 +829,13 @@ class AcquisitionSessionViewSet(
         # 的,两边对不上)。改为:group() 把多序列(quality/cn_name tag 会拆表,
         # sort/limit 本是按表内生效的)合成一张表 → 倒序取前 N → 再升序还原给
         # 前端画图。
-        flux_query = (
+        base = (
             f'from(bucket:"{bucket}") '
             f'|> range(start: {safe_start}, stop: {safe_stop}) '
             f'|> filter(fn: (r) => r["_field"] == "{safe_point}") '
+        )
+        flux_query = (
+            f'{base}'
             f'{agg_clause}'
             f'|> group() '
             f'|> sort(columns: ["_time"], desc: true) '
@@ -805,10 +843,50 @@ class AcquisitionSessionViewSet(
             f'|> sort(columns: ["_time"])'
         )
 
+        downsampled = False
+        window_used = safe_window
+        raw_count = None
+
         storage = None
         try:
             storage = StorageRegistry.create("influxdb", influx_config)
             storage.connect()
+
+            # full 模式(无显式 window 时):count 决定走全量还是极值包络。
+            if full_mode and not safe_window:
+                count_records = storage.query(f'{base}|> group() |> count()')
+                raw_count = 0
+                for rec in count_records:
+                    raw_count += int(rec.get("_value") or 0)
+                if raw_count <= FULL_RAW_THRESHOLD:
+                    # 点数不多:一次性全量返回(不再截尾)。
+                    flux_query = (
+                        f'{base}'
+                        f'|> group() '
+                        f'|> sort(columns: ["_time"])'
+                    )
+                else:
+                    # 极值包络:窗口 = 范围时长/目标桶数,每桶 min+max 两点 ——
+                    # 尖峰谷值都保住,响应点数上界 ≈ 2×目标桶数。min 打在窗口
+                    # 起点、max 打在窗口终点,时间次序还原波形轮廓。
+                    now_ts = time.time()
+                    span_s = max(
+                        1.0,
+                        _flux_bound_to_epoch(safe_stop, now_ts)
+                        - _flux_bound_to_epoch(safe_start, now_ts),
+                    )
+                    win_s = max(1, int(span_s / FULL_TARGET_BUCKETS))
+                    window_used = f"{win_s}s"
+                    downsampled = True
+                    flux_query = (
+                        f'base = {base}|> group()\n'
+                        f'mn = base |> aggregateWindow(every: {window_used}, fn: min, '
+                        f'createEmpty: false, timeSrc: "_start")\n'
+                        f'mx = base |> aggregateWindow(every: {window_used}, fn: max, '
+                        f'createEmpty: false)\n'
+                        f'union(tables: [mn, mx]) |> group() |> sort(columns: ["_time"])'
+                    )
+
             records = storage.query(flux_query)
 
             data = []
@@ -844,6 +922,10 @@ class AcquisitionSessionViewSet(
                 "end_time": end_time,
                 "count": len(data),
                 "data": data,
+                # full/window 模式元数据(旧调用方不受影响,纯新增键)。
+                "downsampled": downsampled or bool(safe_window),
+                "window_used": window_used,
+                "raw_count": raw_count,
             })
 
         except Exception as e:  # noqa: BLE001
