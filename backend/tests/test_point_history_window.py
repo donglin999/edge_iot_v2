@@ -115,8 +115,12 @@ class TestPointHistoryWindowParam:
         assert resp.status_code == status.HTTP_400_BAD_REQUEST
         assert flux is None  # 非法参数绝不能触达 InfluxDB
 
-    def test_without_window_query_is_byte_identical(self, api_client):
-        """缺省时查询串必须与原实现逐字节一致(只加不改)。"""
+    def test_without_window_query_keeps_newest_n(self, api_client):
+        """缺省查询取**最新** N 条:group 合表 → 倒序 limit → 升序还原。
+
+        (原「逐字节一致」契约随截尾方向修复更新:升序 sort+limit 取的是最旧
+        N 条,现场高频推送下图的尾巴被砍 —— 2026-07-28 现场实锤。)
+        """
         resp, flux = _query_via_mock(
             api_client,
             {"point_code": "Temp_01", "start_time": "-2h", "end_time": "now()"},
@@ -127,6 +131,8 @@ class TestPointHistoryWindowParam:
             f'from(bucket:"{bucket}") '
             f'|> range(start: -2h, stop: now()) '
             f'|> filter(fn: (r) => r["_field"] == "Temp_01") '
-            f'|> sort(columns: ["_time"]) '
-            f'|> limit(n: 1000)'
+            f'|> group() '
+            f'|> sort(columns: ["_time"], desc: true) '
+            f'|> limit(n: 1000) '
+            f'|> sort(columns: ["_time"])'
         )

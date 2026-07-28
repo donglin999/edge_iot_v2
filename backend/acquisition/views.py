@@ -788,13 +788,21 @@ class AcquisitionSessionViewSet(
             if safe_window
             else ''
         )
+        # 截尾方向:limit 必须保留**最新**的 N 条。以前是升序 sort + limit,取的
+        # 是范围内**最旧**的 N 条 —— 现场推送密(单周期一串点)时,近 1 小时远超
+        # 1000 条,图的尾巴被砍掉、最新几分钟永远画不出来(latest-values 却是准
+        # 的,两边对不上)。改为:group() 把多序列(quality/cn_name tag 会拆表,
+        # sort/limit 本是按表内生效的)合成一张表 → 倒序取前 N → 再升序还原给
+        # 前端画图。
         flux_query = (
             f'from(bucket:"{bucket}") '
             f'|> range(start: {safe_start}, stop: {safe_stop}) '
             f'|> filter(fn: (r) => r["_field"] == "{safe_point}") '
             f'{agg_clause}'
-            f'|> sort(columns: ["_time"]) '
-            f'|> limit(n: {limit})'
+            f'|> group() '
+            f'|> sort(columns: ["_time"], desc: true) '
+            f'|> limit(n: {limit}) '
+            f'|> sort(columns: ["_time"])'
         )
 
         storage = None
