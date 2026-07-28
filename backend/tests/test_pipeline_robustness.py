@@ -442,3 +442,42 @@ class TestH7PayloadCap:
         for _g, m in layer.sent:
             assert m["data"]["chunk_count"] == 1
             assert len(m["data"]["readings"]) == 10
+
+    def test_batch_count_reports_pre_dedup_consumption_on_first_frame_only(self):
+        """batch_count = 周期内真实消费条数(去重前),只挂首帧。
+
+        UI 操作日志靠它报真实采集量 —— 以前按"每帧记 1",1Hz 限流下永远显示
+        「每秒收到 1 个测点」,与实际入库量差百倍(现场实锤)。
+        """
+        sink = self._make_sink()
+        # 同一测点多条 + 其他测点:去重后 readings 少于消费量
+        with sink._lock:
+            sink._buffer = [
+                Reading(point_code=f"pt{i % 3}", value=i, timestamp_ns=1, quality="good")
+                for i in range(30)
+            ]
+
+        sink._broadcast_once()
+
+        per_group = [m for g, m in sink._channel_layer.sent if g == "acquisition_session_1"]
+        assert len(per_group) == 1
+        assert per_group[0]["data"]["batch_count"] == 30       # 真实消费量
+        assert len(per_group[0]["data"]["readings"]) == 3      # 去重后
+
+    def test_batch_count_zero_on_non_first_chunks(self):
+        sink = self._make_sink()
+        n = _WS_MAX_READINGS_PER_MSG + 5
+        with sink._lock:
+            sink._buffer = [
+                Reading(point_code=f"pt{i}", value=i, timestamp_ns=1, quality="good")
+                for i in range(n)
+            ]
+
+        sink._broadcast_once()
+
+        per_group = sorted(
+            (m for g, m in sink._channel_layer.sent if g == "acquisition_session_1"),
+            key=lambda m: m["data"]["chunk_index"],
+        )
+        assert per_group[0]["data"]["batch_count"] == n
+        assert all(m["data"]["batch_count"] == 0 for m in per_group[1:])

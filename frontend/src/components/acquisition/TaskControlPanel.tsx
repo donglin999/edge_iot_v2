@@ -76,7 +76,7 @@ interface ConnectionEventPayload {
 
 interface SessionEventSubscriberProps {
   sessionId: number;
-  onDataPoint: (pointCode: string) => void;
+  onDataPointBatch: (count: number, pointCodes: string[]) => void;
   onStatusChange: (status: string) => void;
   onConnectionEvent: (payload: ConnectionEventPayload) => void;
 }
@@ -87,23 +87,36 @@ interface SessionEventSubscriberProps {
  */
 const SessionEventSubscriber: React.FC<SessionEventSubscriberProps> = ({
   sessionId,
-  onDataPoint,
+  onDataPointBatch,
   onStatusChange,
   onConnectionEvent,
 }) => {
-  const onDataPointRef = useRef(onDataPoint);
+  const onDataPointBatchRef = useRef(onDataPointBatch);
   const onStatusChangeRef = useRef(onStatusChange);
   const onConnectionEventRef = useRef(onConnectionEvent);
   useEffect(() => {
-    onDataPointRef.current = onDataPoint;
+    onDataPointBatchRef.current = onDataPointBatch;
     onStatusChangeRef.current = onStatusChange;
     onConnectionEventRef.current = onConnectionEvent;
-  }, [onDataPoint, onStatusChange, onConnectionEvent]);
+  }, [onDataPointBatch, onStatusChange, onConnectionEvent]);
 
   const handleMessage = (message: WebSocketMessage) => {
     if (message.type === 'data_point' || message.type === 'data_point_update') {
-      const payload = message.data as { point_code?: string } | null;
-      onDataPointRef.current(payload?.point_code ?? '');
+      // 新信封:readings[](去重后最新值)+ batch_count(周期内真实消费条数,
+      // 仅首帧携带)。旧单点结构 {point_code} 兼容按 1 计。
+      const payload = message.data as {
+        point_code?: string;
+        readings?: Array<{ point_code?: string }>;
+        batch_count?: number;
+      } | null;
+      if (payload?.readings) {
+        onDataPointBatchRef.current(
+          payload.batch_count ?? payload.readings.length,
+          payload.readings.map((r) => r.point_code ?? '').filter(Boolean),
+        );
+      } else {
+        onDataPointBatchRef.current(1, payload?.point_code ? [payload.point_code] : []);
+      }
       return;
     }
     if (
@@ -223,10 +236,10 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   }, [isRunning]);
 
   // Handlers for the WS subscriber
-  const handleWsDataPoint = (pointCode: string) => {
+  const handleWsDataPointBatch = (count: number, pointCodes: string[]) => {
     const buf = dataPointBufferRef.current;
-    buf.count += 1;
-    if (pointCode) buf.pointCodes.add(pointCode);
+    buf.count += count;
+    for (const code of pointCodes) buf.pointCodes.add(code);
   };
 
   const lastWsStatusRef = useRef<string | null>(null);
@@ -531,7 +544,7 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
         <SessionEventSubscriber
           key={`ws-${activeSession.id}`}
           sessionId={activeSession.id}
-          onDataPoint={handleWsDataPoint}
+          onDataPointBatch={handleWsDataPointBatch}
           onStatusChange={handleWsStatusChange}
           onConnectionEvent={handleWsConnectionEvent}
         />

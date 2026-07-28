@@ -794,6 +794,11 @@ class WebSocketSink(Sink):
                     "session_id": self.session.id,
                     "timestamp": datetime.now(tz=timezone.utc).isoformat(),
                     "readings": chunk,
+                    # 本广播周期内真实消费的读数条数(去重前)。UI 的操作日志用它
+                    # 报真实采集量——以前按"每帧记 1"统计,1Hz 限流下永远显示
+                    # "每秒 1 个测点",与实际入库量相差百倍。只挂在首帧,分帧
+                    # 重组时不重复计。
+                    "batch_count": len(batch) if idx == 0 else 0,
                     # Frame index hints let the client reassemble a drain
                     # that had to be split; single-frame pushes still carry
                     # them (0 / 1) so the shape is uniform.

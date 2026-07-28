@@ -167,12 +167,29 @@ const PointChart: React.FC<PointChartProps> = ({
     );
   }
 
+  // Y 轴自适应量程:从 0 起画会把「大基数小变化」压成直线(现场实锤:开合模
+  // 次数 5024→5052 在 0~6000 轴上完全不可见)。取数据 min/max 加 8% 边距;
+  // 完全平坦时按数值量级给一个最小跨度,保证连平线也居中可读。
+  const finiteValues = data.map((d) => d.value).filter((v) => Number.isFinite(v));
+  let yDomain: [number, number] | undefined;
+  if (finiteValues.length > 0) {
+    const lo = Math.min(...finiteValues);
+    const hi = Math.max(...finiteValues);
+    const span = hi - lo;
+    const pad = span > 0 ? span * 0.08 : Math.max(1, Math.abs(hi) * 0.01);
+    yDomain = [lo - pad, hi + pad];
+  }
+
   return (
     <ResponsiveContainer width="100%" height={height}>
       <LineChart data={data} margin={{ top: 10, right: 24, left: 0, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.06)" />
         <XAxis dataKey="label" tick={{ fontSize: 11 }} minTickGap={32} />
         <YAxis
+          domain={yDomain ?? ['auto', 'auto']}
+          tickFormatter={(v: number) =>
+            Math.abs(v) >= 1000 ? v.toLocaleString('en-US', { maximumFractionDigits: 1 }) : `${+v.toFixed(2)}`
+          }
           tick={{ fontSize: 11 }}
           label={
             unit
