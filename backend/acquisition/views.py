@@ -887,7 +887,26 @@ class AcquisitionSessionViewSet(
                         f'union(tables: [mn, mx]) |> group() |> sort(columns: ["_time"])'
                     )
 
-            records = storage.query(flux_query)
+            try:
+                records = storage.query(flux_query)
+            except Exception as agg_exc:  # noqa: BLE001
+                if not downsampled:
+                    raise
+                # 字符串测点 min/max 聚合会被 Flux 拒绝(不支持 string)。
+                # 回退普通「最新 N 条」查询,前端按文本形态另行展示。
+                logger.info(
+                    "point-history envelope query failed for %s (%s), "
+                    "falling back to raw newest-N", point_code, agg_exc,
+                )
+                downsampled = False
+                window_used = None
+                records = storage.query(
+                    f'{base}'
+                    f'|> group() '
+                    f'|> sort(columns: ["_time"], desc: true) '
+                    f'|> limit(n: {limit}) '
+                    f'|> sort(columns: ["_time"])'
+                )
 
             data = []
             for record in records:

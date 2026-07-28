@@ -213,3 +213,30 @@ class TestFullAdaptiveMode:
         assert "count()" not in flux[0]
         assert "limit(n: 1000)" in flux[0]
         assert resp.data["downsampled"] is False
+
+    def test_envelope_failure_falls_back_to_raw_newest_n(self, api_client):
+        """字符串测点:min/max 聚合被 Flux 拒 → 回退最新 N 条,不 500。"""
+        captured = []
+
+        class _FakeStorage:
+            def connect(self): pass
+            def disconnect(self): pass
+            def query(self, flux):
+                captured.append(flux)
+                if "count()" in flux:
+                    return [{"_value": 50_000}]
+                if "aggregateWindow" in flux:
+                    raise RuntimeError("unsupported input type for min: string")
+                return [{"_time": None, "_value": None}]
+
+        with patch("storage.StorageRegistry.create", return_value=_FakeStorage()):
+            resp = api_client.get(
+                "/api/acquisition/sessions/point-history/",
+                {"point_code": "S1", "start_time": "-1h", "full": "1"},
+            )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.data["downsampled"] is False
+        assert "error" not in resp.data
+        # 三条查询:count → 包络(失败) → 回退最新 N
+        assert len(captured) == 3
+        assert "limit(n: 1000)" in captured[2]

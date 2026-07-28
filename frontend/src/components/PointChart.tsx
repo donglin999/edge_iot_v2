@@ -13,6 +13,17 @@ import {
   YAxis,
 } from 'recharts';
 import dayjs from 'dayjs';
+
+import {
+  buildCategoricalSeries,
+  buildChangeEvents,
+  classifySeries,
+  toFiniteNumber,
+  type CategoricalSeries,
+  type ChangeEvent,
+  type RawRow,
+  type SeriesKind,
+} from './pointChartDisplay';
 import { Empty, Spin } from 'antd';
 import { fetchPointHistory } from '../services/dataApi';
 import { isAbortError } from '../services/http';
@@ -72,6 +83,10 @@ const PointChart: React.FC<PointChartProps> = ({
   onMeta,
 }) => {
   const [data, setData] = useState<ChartPoint[]>([]);
+  // 字符串测点画不了折线:保留原始行,按数据形态选阶梯状态图/变化记录列表。
+  const [seriesKind, setSeriesKind] = useState<SeriesKind>('numeric');
+  const [categorical, setCategorical] = useState<CategoricalSeries | null>(null);
+  const [changeEvents, setChangeEvents] = useState<ChangeEvent[]>([]);
   // onMeta 走 ref:父组件每次 render 传新函数,直接进依赖会让图表反复重取。
   const onMetaRef = React.useRef(onMeta);
   useEffect(() => { onMetaRef.current = onMeta; }, [onMeta]);
@@ -98,29 +113,41 @@ const PointChart: React.FC<PointChartProps> = ({
           windowUsed: res.window_used ?? null,
           rawCount: res.raw_count ?? null,
         });
-        const rows: ChartPoint[] = (res.data || [])
-          .map((dp) => {
-            const numericValue =
-              typeof dp.value === 'number'
-                ? dp.value
-                : typeof dp.value === 'boolean'
-                ? dp.value
-                  ? 1
-                  : 0
-                : parseFloat(String(dp.value));
-            return {
-              ts: new Date(dp.timestamp).getTime(),
-              label: dayjs(dp.timestamp).format('HH:mm:ss'),
-              value: Number.isFinite(numericValue) ? numericValue : NaN,
-              quality: dp.quality,
-            };
-          })
-          .filter((row) => Number.isFinite(row.value))
+        const rawRows: RawRow[] = (res.data || [])
+          .map((dp) => ({
+            ts: new Date(dp.timestamp).getTime(),
+            label: dayjs(dp.timestamp).format('HH:mm:ss'),
+            value: dp.value,
+            quality: dp.quality,
+          }))
           .sort((a, b) => a.ts - b.ts);
 
+        const kind = classifySeries(rawRows);
+
         if (!aborter.signal.aborted) {
-          // Downsample so the SVG line chart stays responsive on large ranges.
-          setData(downsample(rows, MAX_CHART_POINTS));
+          setSeriesKind(kind);
+          if (kind === 'categorical') {
+            setCategorical(buildCategoricalSeries(rawRows));
+            setChangeEvents([]);
+            setData([]);
+          } else if (kind === 'text') {
+            setChangeEvents(buildChangeEvents(rawRows));
+            setCategorical(null);
+            setData([]);
+          } else {
+            const rows: ChartPoint[] = rawRows
+              .map((r) => ({
+                ts: r.ts,
+                label: r.label,
+                value: toFiniteNumber(r.value),
+                quality: r.quality,
+              }))
+              .filter((row) => Number.isFinite(row.value));
+            setCategorical(null);
+            setChangeEvents([]);
+            // Downsample so the SVG line chart stays responsive on large ranges.
+            setData(downsample(rows, MAX_CHART_POINTS));
+          }
         }
       } catch (err) {
         if (!aborter.signal.aborted && !isAbortError(err)) {
@@ -155,6 +182,71 @@ const PointChart: React.FC<PointChartProps> = ({
     return (
       <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <Empty description={`加载失败: ${error}`} />
+      </div>
+    );
+  }
+
+  // 枚举型字符串:阶梯状态图,Y 轴刻度即状态文本。
+  if (seriesKind === 'categorical' && categorical && categorical.points.length > 0) {
+    const levels = categorical.levels;
+    return (
+      <div>
+        <div style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)', marginBottom: 4 }}>
+          文本型测点:按状态阶梯展示({levels.length} 种状态)
+        </div>
+        <ResponsiveContainer width="100%" height={height}>
+          <LineChart data={categorical.points} margin={{ top: 10, right: 24, left: 8, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.06)" />
+            <XAxis dataKey="label" tick={{ fontSize: 11 }} minTickGap={32} />
+            <YAxis
+              type="number"
+              domain={[-0.5, levels.length - 0.5]}
+              ticks={levels.map((_, i) => i)}
+              tickFormatter={(i: number) => levels[i] ?? ''}
+              tick={{ fontSize: 11 }}
+              width={Math.min(160, Math.max(48, 14 * Math.max(...levels.map((l) => l.length))))}
+            />
+            <Tooltip
+              formatter={(_v: number, _n, item) => [
+                (item?.payload as { text?: string })?.text ?? '',
+                '状态',
+              ]}
+              labelFormatter={(label) => `时间: ${label}`}
+            />
+            <Line
+              type="stepAfter"
+              dataKey="levelIndex"
+              stroke="#1677ff"
+              dot={false}
+              isAnimationActive={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    );
+  }
+
+  // 自由文本:变化记录列表(连续相同值去重,新变化在前)。
+  if (seriesKind === 'text' && changeEvents.length > 0) {
+    return (
+      <div style={{ height, overflowY: 'auto' }}>
+        <div style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)', marginBottom: 4 }}>
+          文本型测点:显示值变化记录(连续相同值已合并,共 {changeEvents.length} 次变化)
+        </div>
+        {changeEvents.map((e) => (
+          <div
+            key={e.ts + e.value}
+            style={{
+              display: 'flex', gap: 12, padding: '4px 8px', fontSize: 13,
+              borderBottom: '1px solid rgba(0,0,0,0.05)',
+            }}
+          >
+            <span style={{ color: 'rgba(0,0,0,0.45)', fontVariantNumeric: 'tabular-nums' }}>
+              {e.label}
+            </span>
+            <span style={{ wordBreak: 'break-all' }}>{e.value}</span>
+          </div>
+        ))}
       </div>
     );
   }
