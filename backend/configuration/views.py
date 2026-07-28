@@ -1003,7 +1003,9 @@ class PointViewSet(viewsets.ModelViewSet):
 class AcqTaskViewSet(viewsets.ModelViewSet):
     """采集任务管理：维护任务及其测点。"""
 
-    queryset = models.AcqTask.objects.prefetch_related("points").order_by("code")
+    # points__device 一并预取:serializer 的 device_protocol 要摸每个任务首测点
+    # 的设备协议,不预取会在 list 上打出 N+1。
+    queryset = models.AcqTask.objects.prefetch_related("points__device").order_by("code")
     serializer_class = serializers.AcqTaskSerializer
 
     @extend_schema(summary="查看任务关联的测点列表", responses=serializers.PointSerializer(many=True))

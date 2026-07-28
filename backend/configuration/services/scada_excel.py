@@ -92,7 +92,9 @@ TASK_COLUMNS: Tuple[ColumnSpec, ...] = (
                help_text="可留空。填了就在导入时自动创建采集任务(多设备时每台派生 task_code-设备名);"
                          "导入表单里显式传的 task_code 优先于此列", example="task-zs-scada"),
     ColumnSpec("task_name", "任务名称", help_text="可留空,留空取任务编码", example="中山 SCADA 采集"),
-    ColumnSpec("sample_rate_hz", "采样频率(Hz)", help_text="可留空,默认 1", example=1),
+    ColumnSpec("sample_rate_hz", "采样频率(Hz)",
+               help_text="scada 为推送驱动(拿到即消费),此列不影响消费节奏,留空即可(仅兼容保留)",
+               example=""),
 )
 
 POINT_COLUMNS: Tuple[ColumnSpec, ...] = (

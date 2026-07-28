@@ -134,8 +134,21 @@ class AcqTaskSerializer(serializers.ModelSerializer):
         min_value=Decimal("0.1"),
         max_value=Decimal("100"),
         required=False,
-        help_text="采集频率(Hz)，0.1~100，修改后将自动重启运行中的会话。",
+        help_text="采集频率(Hz)，0.1~100，修改后将自动重启运行中的会话。"
+                  "推模式协议(scada/mqtt)无此概念,该值被忽略(拿到即消费)。",
     )
+    # 任务绑定设备的协议(一任务一设备的既定约束)。前端用它判断是否推模式
+    # (scada/mqtt 不渲染「采样频率」控件,改显示「推送驱动」)。无测点时为 null。
+    device_protocol = serializers.SerializerMethodField()
+
+    def get_device_protocol(self, obj) -> str | None:
+        # 用 .all() 走 viewset 的 prefetch_related("points__device") 缓存;
+        # first()/切片会派生新 queryset 绕开缓存重新发查询(list 页 N+1)。
+        for point in obj.points.all():
+            if point.device_id is not None:
+                return point.device.protocol
+            break
+        return None
 
     class Meta:
         model = models.AcqTask
@@ -147,10 +160,11 @@ class AcqTaskSerializer(serializers.ModelSerializer):
             "sample_rate_hz",
             "is_active",
             "points",
+            "device_protocol",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ("id", "created_at", "updated_at")
+        read_only_fields = ("id", "device_protocol", "created_at", "updated_at")
 
     def validate(self, attrs):
         attrs = super().validate(attrs)

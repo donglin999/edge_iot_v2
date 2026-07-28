@@ -450,15 +450,27 @@ class AcquisitionService:
             # 不参与目标计算(不能按「每测点频率求和/取最高」,那和实际不符)。
             # 测点数用 device_groups(与真正在跑的 worker 同源),不用启动校验快照。
             point_count = sum(len(g.get("points", [])) for g in self.device_groups.values())
-            try:
-                sample_rate = float(self.task.sample_rate_hz)
-            except (TypeError, ValueError):
-                sample_rate = 0.0
-            meta["ingest_target_points_per_sec"] = round(sample_rate * point_count, 2)
-            meta["ingest_target_basis"] = {
-                "sample_rate_hz": sample_rate,
-                "point_count": point_count,
-            }
+            from acquisition.services.read_plan import QUEUE_DRAIN_PROTOCOLS
+
+            all_push = bool(self.device_groups) and all(
+                (g["device"].protocol or "").lower() in QUEUE_DRAIN_PROTOCOLS
+                for g in self.device_groups.values()
+            )
+            if all_push:
+                # 推模式没有采集频率概念,「频率×测点数」的目标速率无意义 ——
+                # 实际速率由对端推送节奏决定,不设目标,清掉可能残留的旧值。
+                meta.pop("ingest_target_points_per_sec", None)
+                meta["ingest_target_basis"] = {"mode": "push", "point_count": point_count}
+            else:
+                try:
+                    sample_rate = float(self.task.sample_rate_hz)
+                except (TypeError, ValueError):
+                    sample_rate = 0.0
+                meta["ingest_target_points_per_sec"] = round(sample_rate * point_count, 2)
+                meta["ingest_target_basis"] = {
+                    "sample_rate_hz": sample_rate,
+                    "point_count": point_count,
+                }
 
             meta["device_health"] = health_summary
             meta["last_health_update"] = timestamp

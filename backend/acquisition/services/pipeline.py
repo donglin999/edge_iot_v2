@@ -139,6 +139,20 @@ class ReadWorker(threading.Thread):
         self._failed_window_start: Optional[float] = None
         self._last_error: str = ""
 
+        # 推模式协议(mqtt/scada)没有「采集频率」概念:数据什么时候来由对端决定,
+        # worker 只需阻塞在接收队列上、拿到什么就消费什么。cycle_interval 置 0
+        # (循环不睡),节奏由 read_points 里第一条消息的阻塞 get(read_timeout)
+        # 提供 —— 空闲时安静等待,消息一到立即消费,吞吐上限不再被
+        # 「队列容量×频率」框死,延迟也从最多一个周期降到近实时。
+        # 拉模式协议(modbus/s7/opcua)保持按 sample_rate_hz 定周期轮询。
+        from acquisition.services.read_plan import QUEUE_DRAIN_PROTOCOLS
+
+        self.push_mode = (
+            (getattr(device, "protocol", "") or "").lower() in QUEUE_DRAIN_PROTOCOLS
+        )
+        if self.push_mode:
+            self.cycle_interval = 0.0
+
         # Derive a per-cycle protocol timeout once. At 20 Hz the default
         # 5 s timeout swallows ~100 cycles on a single hiccup; tighten it
         # so a stuck I/O fails fast and the next cycle gets a fresh shot.
@@ -146,11 +160,17 @@ class ReadWorker(threading.Thread):
         configured_timeout = float(metadata.get("timeout", 5.0))
         # Floor at 500 ms: anything tighter would abort slow-but-healthy
         # devices (serial RTU, multi-register reads) mid-transaction.
-        self._auto_timeout = max(0.5, min(configured_timeout, self.cycle_interval * 2))
+        # 推模式不与周期挂钩(cycle_interval=0 会把 min 打成 0.5s,反而截断
+        # 正常的队列阻塞等待),直接用配置值。
+        if self.push_mode:
+            self._auto_timeout = max(0.5, configured_timeout)
+        else:
+            self._auto_timeout = max(0.5, min(configured_timeout, self.cycle_interval * 2))
         logger.info(
-            "ReadWorker[%s] cycle=%.0fms timeout=%.0fms",
+            "ReadWorker[%s] %s timeout=%.0fms",
             self.device.code,
-            self.cycle_interval * 1000,
+            "push-mode(事件驱动,无采集周期)" if self.push_mode
+            else f"cycle={self.cycle_interval * 1000:.0f}ms",
             self._auto_timeout * 1000,
         )
 

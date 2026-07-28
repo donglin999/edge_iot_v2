@@ -51,9 +51,14 @@ export interface AcqTask {
   schedule: string;
   is_active: boolean;
   sample_rate_hz: number;
+  /** 任务绑定设备的协议(一任务一设备);无测点时为 null。scada/mqtt 为推模式,无采集频率概念。 */
+  device_protocol?: string | null;
   created_at: string;
   updated_at: string;
 }
+
+/** 推模式协议:数据由对端推送,拿到即消费,「采样频率」概念不适用。 */
+export const PUSH_PROTOCOLS = ['scada', 'mqtt'];
 
 export interface StartTaskRequest {
   task_id: number;

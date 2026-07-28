@@ -24,6 +24,7 @@ import {
 } from '@ant-design/icons';
 import type { AcqTask, AcquisitionSession } from '../../services/acquisitionApi';
 import {
+  PUSH_PROTOCOLS,
   startTask,
   stopSession,
   updateTaskSampleRate,
@@ -170,6 +171,8 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
   }, [task.sample_rate_hz]);
 
   const isRunning = !!(activeSession && activeSession.status === 'running');
+  // 推模式(scada/mqtt):没有采集频率概念,频率控件换成「推送驱动」说明。
+  const isPushDriven = PUSH_PROTOCOLS.includes(task.device_protocol ?? '');
 
   // 入库速率的展示已按用户要求移除(2026-07-24)。后端仍在 session.metadata 里
   // 维护 ingest_points_per_sec / ingest_target_points_per_sec,作为诊断数据可经
@@ -595,36 +598,49 @@ const TaskControlPanel: React.FC<TaskControlPanelProps> = ({
       </div>
 
       <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-primary, #e5e7eb)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <Text type="secondary" style={{ fontSize: 13, fontWeight: 500, minWidth: 72 }}>
-            采样频率
-          </Text>
-          <InputNumber
-            min={0.1}
-            max={100}
-            step={0.1}
-            precision={1}
-            value={sampleRateValue}
-            onChange={(val) => setSampleRateValue(val as number | null)}
-            addonAfter="Hz"
-            disabled={sampleRateSaving}
-            style={{ width: 140 }}
-          />
-          <Button
-            type="primary"
-            size="small"
-            loading={sampleRateSaving}
-            disabled={!sampleRateDirty || sampleRateSaving}
-            onClick={handleSaveSampleRate}
-          >
-            保存
-          </Button>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            {isRunning
-              ? '※ 保存后立即以新频率重启采集'
-              : '※ 修改后将影响新启动的会话'}
-          </Text>
-        </div>
+        {isPushDriven ? (
+          // 推模式(scada/mqtt):没有采集频率概念——对端什么时候推、worker 就
+          // 什么时候消费(阻塞在接收队列上,拿到即入库),不渲染频率控件。
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <Text type="secondary" style={{ fontSize: 13, fontWeight: 500, minWidth: 72 }}>
+              采集方式
+            </Text>
+            <Tooltip title="推模式协议:数据由设备/平台主动推送,采集线程实时消费(拿到什么存什么),不存在采样频率。入库节奏 = 对端推送节奏。">
+              <Tag color="blue">推送驱动 · 实时消费</Tag>
+            </Tooltip>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <Text type="secondary" style={{ fontSize: 13, fontWeight: 500, minWidth: 72 }}>
+              采样频率
+            </Text>
+            <InputNumber
+              min={0.1}
+              max={100}
+              step={0.1}
+              precision={1}
+              value={sampleRateValue}
+              onChange={(val) => setSampleRateValue(val as number | null)}
+              addonAfter="Hz"
+              disabled={sampleRateSaving}
+              style={{ width: 140 }}
+            />
+            <Button
+              type="primary"
+              size="small"
+              loading={sampleRateSaving}
+              disabled={!sampleRateDirty || sampleRateSaving}
+              onClick={handleSaveSampleRate}
+            >
+              保存
+            </Button>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {isRunning
+                ? '※ 保存后立即以新频率重启采集'
+                : '※ 修改后将影响新启动的会话'}
+            </Text>
+          </div>
+        )}
       </div>
 
       {activeSession && (

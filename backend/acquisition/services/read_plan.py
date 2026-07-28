@@ -350,7 +350,9 @@ def _build_modbus_plan(
 # 把队列清空,但只保留自己那一个测点的消息,其余测点的数据全被扔掉;后续各组
 # 再各自空等 read_timeout。中山现场 510 测点实测:MQTT 推送速率远高于入库
 # (0.4 点/秒),丢的就是这里。
-_QUEUE_DRAIN_PROTOCOLS = {"mqtt", "scada"}
+QUEUE_DRAIN_PROTOCOLS = {"mqtt", "scada"}
+# 兼容旧名(本文件内引用)。
+_QUEUE_DRAIN_PROTOCOLS = QUEUE_DRAIN_PROTOCOLS
 
 
 def _build_default_plan(device, points: List[Any]) -> List[ReadGroup]:

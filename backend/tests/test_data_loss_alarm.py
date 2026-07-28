@@ -207,3 +207,36 @@ class TestWorkerDropTracking:
 
         worker._track_dropped_messages()
         assert worker.health["dropped_messages"] == 35
+
+
+# ---------------------------------------------------------------------------
+# push mode: scada/mqtt 无采集频率概念
+# ---------------------------------------------------------------------------
+
+
+class TestPushModeWorker:
+    """推模式协议(mqtt/scada)事件驱动:循环不睡,节奏由队列阻塞 get 提供。"""
+
+    def _worker(self, protocol):
+        device = SimpleNamespace(
+            id=1, code="DEV-P", protocol=protocol, metadata={},
+            ip_address="127.0.0.1", port=502,
+        )
+        return ReadWorker(
+            device=device, points=[], sinks=[], sample_rate_hz=1.0,
+            shutdown_event=threading.Event(), health_dict={}, session=None,
+        )
+
+    def test_scada_and_mqtt_are_push_mode_with_zero_cycle(self):
+        for proto in ("scada", "mqtt"):
+            w = self._worker(proto)
+            assert w.push_mode is True
+            assert w.cycle_interval == 0.0
+            # 超时不与周期挂钩(否则 min(timeout, 0) 会截断队列阻塞等待)
+            assert w._auto_timeout == 5.0
+
+    def test_pull_protocols_keep_rate_based_cycle(self):
+        for proto in ("modbus_tcp", "siemens_s7", "opcua"):
+            w = self._worker(proto)
+            assert w.push_mode is False
+            assert w.cycle_interval == 1.0
