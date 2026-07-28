@@ -157,7 +157,19 @@ class AcquisitionService:
         # Stash the pipeline so helpers (watchdog) can reach it.
         self.pipeline = pipeline
         try:
-            while self._should_continue() and pipeline.is_alive():
+            while self._should_continue():
+                # worker 全死时不能立刻退出:_supervise_workers 会限次原地重启。
+                # 以前条件里带 pipeline.is_alive(),单设备会话(scada 就是)worker
+                # 一死循环先于 supervision 退出,原地重启逻辑形同虚设,只能靠
+                # 外层看门狗整会话重来。只有当所有设备都已判 fatal(重启预算
+                # 耗尽,复活无望)才真正退出。
+                if not pipeline.is_alive():
+                    revivable = any(
+                        w.device.id not in self._fatal_devices
+                        for w in pipeline.workers
+                    )
+                    if not revivable:
+                        break
                 time.sleep(0.5)
                 now = time.time()
                 if now - last_meta_update >= METADATA_WRITE_INTERVAL_S:
@@ -179,12 +191,33 @@ class AcquisitionService:
         }
 
     # ----------------------------------------------------------- helpers
+    #: refresh_from_db 连续失败多少次才放弃会话。SQLite 锁竞争的瞬时报错不该
+    #: 杀掉一个健康的采集会话(现场实测:锁忙时 refresh 抛错 → 会话「正常完成」
+    #: → 看门狗再拉起 → ~120s 一次的重启循环)。按 0.5s 循环节拍,20 次 ≈ 10s
+    #: 持续不可读才退出 —— 真正的库损坏/被删仍能停下来。
+    _MAX_REFRESH_FAILURES = 20
+
     def _should_continue(self) -> bool:
         """Re-read session status from the DB on every loop iteration."""
         try:
             self.session.refresh_from_db()
-        except Exception:  # noqa: BLE001
+        except acq_models.AcquisitionSession.DoesNotExist:
+            # 会话行被删了(设备/任务级联删除):明确该停,不是瞬时故障。
             return False
+        except Exception as exc:  # noqa: BLE001
+            self._refresh_failures = getattr(self, "_refresh_failures", 0) + 1
+            if self._refresh_failures >= self._MAX_REFRESH_FAILURES:
+                self.logger.error(
+                    "Session %s status refresh failed %d times in a row, giving up: %s",
+                    self.session.id, self._refresh_failures, exc,
+                )
+                return False
+            self.logger.warning(
+                "Session %s status refresh failed (%d/%d), continuing: %s",
+                self.session.id, self._refresh_failures, self._MAX_REFRESH_FAILURES, exc,
+            )
+            return True
+        self._refresh_failures = 0
         return self.session.status == acq_models.AcquisitionSession.STATUS_RUNNING
 
     def _run_startup_validation(self, pipeline: AcquisitionPipeline, timeout: float) -> None:
