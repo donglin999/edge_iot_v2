@@ -22,8 +22,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-CONTAINER_NAME = "edge-test-mosquitto"
-HOST_PORT = 18883
+# 专用容器名/端口,**必须**与长驻开发 broker(edge-test-mosquitto @18883,
+# host_protocol_mocks 和实机联调用)分开:本助手 start() 会 rm -f 同名孤儿容器、
+# stop() 也会删容器 —— 曾两次把长驻 broker 连锅端掉(全量测试跑完 broker 消失,
+# 实机采集莫名断连)。测试自生自灭,不碰长驻实例。
+CONTAINER_NAME = "edge-test-mosquitto-pytest"
+HOST_PORT = 18893
 IMAGE = "eclipse-mosquitto:2"
 
 # Repo-relative scratch dir (NOT /tmp — see module docstring for why).

@@ -3,7 +3,7 @@
 mock 的是**对端**(broker),协议侧全走真实 paho-mqtt CONNECT/SUBSCRIBE/收
 PUBLISH,解析走真正的 ``MQTTProtocol._parse_message``。broker 由
 ``acquisition.testing.mqtt_mock_broker.MosquittoMockBroker`` 起一个真实的
-docker mosquitto 容器(容器名 edge-test-mosquitto,宿主端口 18883)。
+docker mosquitto 容器(容器名 edge-test-mosquitto-pytest,宿主端口 18893,与长驻开发 broker 分离)。
 
 docker 不可用时整个文件跳过(不降级为假 broker —— MQTT 传输层的假替身在
 ``tests/mocks/transports.py``,那条路径已经被 ``test_e2e_all_protocols.py``
