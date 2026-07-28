@@ -3,8 +3,8 @@
 mock 的是**对端**(broker/网关),协议侧全走真实 paho-mqtt CONNECT/SUBSCRIBE/
 收 PUBLISH,解析走真正的 ``SCADAProtocol._parse_message``/``_extract_value``。
 broker 由 ``acquisition.testing.mqtt_mock_broker.MosquittoMockBroker`` 起一个
-真实的 docker mosquitto 容器(容器名 edge-test-mosquitto,复用 MQTT 用例同一个
-helper,宿主端口 18883)。
+真实的 docker mosquitto 容器(容器名 edge-test-mosquitto-pytest,复用 MQTT 用例同一个
+helper,宿主端口 18893)。
 
 真实网关负载结构参考 ``tests/test_e2e_all_protocols.py`` 的 ``SCRIPTS['scada']``
 (``data.propertyValue`` / ``data.time`` 毫秒时间戳 —— 6e15018 修的就是这个)。
@@ -259,7 +259,8 @@ class TestTopicTemplate:
     def test_default_template_per_point_topic(self, broker, publisher):
         proto = _connect_protocol(broker)
         try:
-            assert proto.subscribe_topic == _topic("+")
+            # property 层 # 单订阅(平台只授权到这一层;{code}/post 由正则反解)
+            assert proto.subscribe_topic == f"/sys/{PRODUCT_KEY}/device/{DEVICE_NAME}/thing/property/#"
             _publish_gateway(publisher, "CODE_A", "1")
             _publish_gateway(publisher, "CODE_B", "2")
             points = [

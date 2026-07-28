@@ -345,11 +345,21 @@ def _build_modbus_plan(
 # ---------------------------------------------------------------------------
 
 
+# 队列型推协议:read_points 的实现是「把共享接收队列整个抽干,再按传入的测点
+# 集合匹配」。这类协议**必须整设备一个读组**——按点拆组的话,第一组的 drain 会
+# 把队列清空,但只保留自己那一个测点的消息,其余测点的数据全被扔掉;后续各组
+# 再各自空等 read_timeout。中山现场 510 测点实测:MQTT 推送速率远高于入库
+# (0.4 点/秒),丢的就是这里。
+_QUEUE_DRAIN_PROTOCOLS = {"mqtt", "scada"}
+
+
 def _build_default_plan(device, points: List[Any]) -> List[ReadGroup]:
     """Fallback for protocols with no native batching (MQTT, OPC-UA v1, ...).
 
-    Each point becomes its own group; ``function_code`` / ``start_address`` /
-    ``register_count`` are left ``None`` because they are Modbus-specific.
+    Each point becomes its own group — except queue-drain protocols (see
+    ``_QUEUE_DRAIN_PROTOCOLS``), which get one group holding every point.
+    ``function_code`` / ``start_address`` / ``register_count`` are left
+    ``None`` because they are Modbus-specific.
     """
     proto_type = (getattr(device, "protocol", "") or "unknown").lower()
     out: List[ReadGroup] = []
@@ -387,4 +397,8 @@ def _build_default_plan(device, points: List[Any]) -> List[ReadGroup]:
                 extra={},
             )
         )
+
+    if proto_type in _QUEUE_DRAIN_PROTOCOLS and len(out) > 1:
+        merged = [m for g in out for m in g.points]
+        return [ReadGroup(protocol_type=proto_type, points=merged, extra={})]
     return out

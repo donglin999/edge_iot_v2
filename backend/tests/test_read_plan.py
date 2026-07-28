@@ -211,10 +211,13 @@ class TestModbusPlanDetails:
 
 
 class TestDefaultPlan:
-    """Non-Modbus protocols fall back to one-point-per-group."""
+    """Non-Modbus pull protocols fall back to one-point-per-group.
 
-    def test_mqtt_each_point_is_its_own_group(self):
-        device = _StubDevice(protocol="mqtt", metadata={})
+    (mqtt/scada 是队列型推协议,整设备一组 —— 见 TestQueueDrainProtocolsGetOneGroup。)
+    """
+
+    def test_opcua_each_point_is_its_own_group(self):
+        device = _StubDevice(protocol="opcua", metadata={})
         points = [
             _StubPoint("T1", "0", extra={"topic": "sensor/1"}),
             _StubPoint("T2", "0", extra={"topic": "sensor/2"}),
@@ -393,3 +396,79 @@ class TestStringAddressSurvivesThePlan:
         """别把 Modbus 的整数线址一起改坏。"""
         meta = self._plan("mqtt", "40001")
         assert meta.address == 40001
+
+
+class TestQueueDrainProtocolsGetOneGroup:
+    """队列型推协议(mqtt/scada)必须整设备一个读组。
+
+    这些协议的 read_points = 「抽干共享接收队列 + 按传入测点集合匹配」。按点
+    拆组时,第一组的 drain 清空队列却只保留自己那个测点的消息,其余测点的数据
+    全被扔掉;后续各组再各自空等 read_timeout。中山博创现场 510 测点实测:
+    MQTT 推送速率远高于入库速率(0.4 点/秒),丢的就是这里 —— 本地 2 测点的
+    mock 症状轻微,从未暴露。
+    """
+
+    def _plan(self, protocol, n=5):
+        from types import SimpleNamespace
+
+        device = SimpleNamespace(protocol=protocol, metadata={})
+        return ReadPlanBuilder.build(
+            device, [_StrAddrPoint(f"P{i:03d}", f"P{i:03d}") for i in range(n)]
+        )
+
+    def test_scada_all_points_collapse_into_one_group(self):
+        groups = self._plan("scada", n=510)
+        assert len(groups) == 1
+        assert len(groups[0].points) == 510
+        assert {m.code for m in groups[0].points} == {f"P{i:03d}" for i in range(510)}
+
+    def test_mqtt_all_points_collapse_into_one_group(self):
+        groups = self._plan("mqtt", n=7)
+        assert len(groups) == 1
+        assert len(groups[0].points) == 7
+
+    def test_pull_protocols_keep_per_point_groups(self):
+        """OPC-UA/S7 是请求-响应式,每点一组的既有行为不能被改坏。"""
+        assert len(self._plan("opcua", n=5)) == 5
+        assert len(self._plan("siemens_s7", n=5)) == 5
+
+    def test_single_point_stays_single_group(self):
+        assert len(self._plan("scada", n=1)) == 1
+
+
+class TestQueueDrainEndToEnd:
+    """验收点:scada 单周期 read_batch 消费队列里**所有**测点的消息。"""
+
+    def test_one_cycle_consumes_messages_for_every_point(self):
+        import json
+        from types import SimpleNamespace
+
+        from acquisition.protocols.scada import SCADAProtocol
+
+        proto = SCADAProtocol({
+            "source_ip": "127.0.0.1", "source_port": 1883,
+            "scada_product_key": "pk1", "scada_device_name": "DEV1",
+        })
+        proto.is_connected = True  # 不真连,直接喂队列
+
+        codes = [f"P{i:03d}" for i in range(6)]
+        for i, code in enumerate(codes):
+            proto.data_queue.put({
+                "topic": f"/sys/pk1/device/DEV1/thing/property/{code}/post",
+                "payload": json.dumps({"data": {
+                    "propertyCode": code, "propertyValue": float(i),
+                    "time": "1755653755532",
+                }}),
+                "timestamp": 1_755_653_755_532_000_000,
+                "qos": 0,
+            })
+
+        device = SimpleNamespace(protocol="scada", metadata={})
+        groups = ReadPlanBuilder.build(
+            device, [_StrAddrPoint(c, c) for c in codes]
+        )
+        assert len(groups) == 1
+
+        readings = proto.read_batch(groups[0])
+        got = {r.point_code: r.value for r in readings}
+        assert got == {c: float(i) for i, c in enumerate(codes)}
