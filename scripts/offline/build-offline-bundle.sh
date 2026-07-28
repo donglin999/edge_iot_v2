@@ -63,9 +63,17 @@ docker buildx build --provenance=false --sbom=false --platform "$PLATFORM" \
   -f deploy/offline/Dockerfile.web -t edge-iot/web:offline-amd64 --load .
 
 echo "==> [4/5] docker save -> images.tar (+ sha256, manifest)"
-# 基础镜像按目标架构拉取(本机可能只有 arm64 缓存,save 出去会在工控机上起不来)
+# 基础镜像按目标架构拉取(本机可能只有 arm64 缓存,save 出去会在工控机上起不来)。
+# registry 抖动(TLS timeout 等)时若本地已有该镜像,直接用本地副本继续 ——
+# docker save --platform 会挑出 amd64 变体,没有对应架构时 save 那步自然报错兜底。
 for img in "${BUNDLED_PULLED_IMAGES[@]}"; do
-  docker pull --platform "$PLATFORM" "$img"
+  if ! docker pull --platform "$PLATFORM" "$img"; then
+    if docker image inspect "$img" >/dev/null 2>&1; then
+      echo "!! 拉取 $img 失败(registry 不可达),使用本地已有副本继续"
+    else
+      echo "!! 拉取 $img 失败且本地无副本,无法继续"; exit 1
+    fi
+  fi
 done
 docker save --platform "$PLATFORM" "${BUILT_IMAGES[@]}" "${BUNDLED_PULLED_IMAGES[@]}" -o "$OUT/images.tar"
 ( cd "$OUT" && shasum -a 256 images.tar > images.tar.sha256 )
