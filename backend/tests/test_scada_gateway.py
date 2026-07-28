@@ -523,7 +523,7 @@ class TestProvision:
         self, api_client, site, gateway,
     ):
         """钉死入库结构:measurement=设备编号(device_a_tag),fields 含
-        测点编码=值 + cn_name=测点中文名(来自 Point.description)。
+        测点编码=值,tag cn_name=测点中文名(来自 Point.description,可按中文过滤)。
 
         走真实链路:provision → AcquisitionService 组装 device_groups(点 dict
         必须带 description)→ InfluxDBSink.consume 出的 staged point。
@@ -564,7 +564,9 @@ class TestProvision:
         # measurement = 设备编号(metadata["device_a_tag"]),不是 Device.code。
         assert staged["measurement"] == "A0201010001150403"
         assert staged["fields"]["N270400150027"] == 88.5
-        assert staged["fields"]["cn_name"] == "注射压力实际值"
+        # cn_name 是 tag(可在 Influx 里直接按中文名过滤查数),unit 仍是 field。
+        assert staged["tags"]["cn_name"] == "注射压力实际值"
+        assert "cn_name" not in staged["fields"]
         assert staged["fields"]["unit"] == "MPa"
         assert staged["time"] == 1755653755532000000
 

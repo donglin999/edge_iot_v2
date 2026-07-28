@@ -276,15 +276,16 @@ class TestInfluxDBSinkFormatting:
         assert len(sink._buffer) == 1
         formatted = sink._buffer[0]
         assert formatted["measurement"] == "SENSOR_001"
-        # M5: only low-cardinality dimensions are tags.
+        # M5 修订:cn_name 是 tag(按中文名过滤查数,1:1 于测点,序列数≈测点数);
+        # point_code 仍是 field key,unit 仍是 field。
         assert formatted["tags"]["device"] == "TEST_DEV"
-        assert set(formatted["tags"]) <= {"site", "device", "quality"}
+        assert set(formatted["tags"]) <= {"site", "device", "quality", "cn_name"}
+        assert formatted["tags"]["cn_name"] == "temperature"
         assert "point" not in formatted["tags"]
-        assert "cn_name" not in formatted["tags"]
         assert "unit" not in formatted["tags"]
-        # point_code is the field key; cn_name / unit are string fields.
+        # point_code is the field key; unit stays a string field.
         assert formatted["fields"]["TEMP_01"] == 25.5
-        assert formatted["fields"]["cn_name"] == template.name
+        assert "cn_name" not in formatted["fields"]
         assert formatted["fields"]["unit"] == "°C"
         assert formatted["time"] == 1234567890000000000
 

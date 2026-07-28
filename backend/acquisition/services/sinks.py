@@ -231,20 +231,22 @@ class InfluxDBSink(Sink):
 
         device_metadata = device.metadata or {}
         measurement = device_metadata.get("device_a_tag", device.code) or device.code
-        # M5 - cardinality control. Only low-cardinality dimensions belong in
-        # tags: the InfluxDB series index is the *product* of tag value counts.
-        # point_code is high-cardinality, so it is encoded as the field *key*
-        # instead of a tag. cn_name / unit are high-cardinality metadata that
-        # move to string fields - still queryable, but they no longer multiply
-        # the series index. quality is bounded (good/bad/uncertain).
+        # M5 - cardinality control. Only bounded dimensions belong in tags: the
+        # InfluxDB series index is the *product* of tag value counts. point_code
+        # is encoded as the field *key* instead of a tag; quality is bounded.
+        #
+        # cn_name(测点中文名)是 **tag**:用户要在 Influx Data Explorer 里直接按
+        # 中文名过滤查数(现场平台既有 schema 就是这么用的)。它与 point_code
+        # 1:1,序列数 ≈ 测点数(单设备几百),不是组合爆炸 —— 每条记录本就只带
+        # 自己那个测点的 field key,cn_name 只是给同一序列换个可读的检索维度。
         tags = {
             "site": device.site.code,
             "device": device.code,
             "quality": reading.quality,
         }
-        fields: Dict[str, Any] = {reading.point_code: scaled}
         if meta.get("template_name"):
-            fields["cn_name"] = meta["template_name"]
+            tags["cn_name"] = meta["template_name"]
+        fields: Dict[str, Any] = {reading.point_code: scaled}
         if meta.get("template_unit"):
             fields["unit"] = meta["template_unit"]
 

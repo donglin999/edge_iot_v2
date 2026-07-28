@@ -152,6 +152,20 @@ class ReadWorker(threading.Thread):
         )
         if self.push_mode:
             self.cycle_interval = 0.0
+        # ----- push-mode keep-alive(断流补写)---------------------------
+        # 推模式只在对端推送时才有新数据,但下游算法要的是连续序列。某测点超过
+        # keepalive_write_seconds 没有新推送时,用**最后一次真实值**按当前时间
+        # 补写一条(仅在连接在线时;离线不补 —— 不能把断线伪装成数据新鲜)。
+        # 默认 30s,设备 metadata 里 keepalive_write_seconds 可调,0 关闭。
+        _meta = getattr(device, "metadata", None) or {}
+        try:
+            self._keepalive_s = float(_meta.get("keepalive_write_seconds", 30.0))
+        except (TypeError, ValueError):
+            self._keepalive_s = 30.0
+        if not self.push_mode or self._keepalive_s < 0:
+            self._keepalive_s = 0.0
+        #: point_code -> [value, last_emit_monotonic](真实推送与补写都会刷新)
+        self._last_emitted: Dict[str, list] = {}
 
         # Derive a per-cycle protocol timeout once. At 20 Hz the default
         # 5 s timeout swallows ~100 cycles on a single hiccup; tighten it
@@ -278,6 +292,38 @@ class ReadWorker(threading.Thread):
 
         clear_system_alarm(f"connectivity:{self.device.code}")
         self._offline_alarm_raised = False
+
+    # ------------------------------------------------------ push keep-alive
+    def _emit_keepalive(self) -> None:
+        """推模式断流补写:超过 keepalive 窗口没新推送的测点,用最后真实值按
+        当前时间补写一条,让下游算法拿到连续序列。
+
+        只在连接在线的读路径里被调用(断线不补 —— 不能把离线伪装成数据新鲜);
+        只补出现过至少一次真实值的测点(没见过的无值可补);每补一次刷新该测点
+        的窗口,持续断流则每 keepalive 秒补一条。
+        """
+        if not self._keepalive_s or not self._last_emitted:
+            return
+        now_mono = time.monotonic()
+        now_ns = time.time_ns()
+        for code, entry in self._last_emitted.items():
+            if (now_mono - entry[1]) < self._keepalive_s:
+                continue
+            synthetic = Reading(
+                point_code=code,
+                value=entry[0],
+                timestamp_ns=now_ns,
+                quality="good",
+            )
+            for sink in self.sinks:
+                try:
+                    sink.consume(synthetic)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Sink %s.consume (keepalive) failed: %s",
+                        sink.__class__.__name__, exc,
+                    )
+            entry[1] = now_mono
 
     # ------------------------------------------------------ data-loss alarm
     #: 丢弃停止多久后自动清除数据丢弃告警(秒)。
@@ -495,6 +541,7 @@ class ReadWorker(threading.Thread):
                 # Window-based flush in the healthy path.
                 self._flush_failed_events()
                 self._track_dropped_messages()
+                self._emit_keepalive()
 
             elapsed = time.time() - cycle_start
             sleep = max(0.0, self.cycle_interval - elapsed)
@@ -529,6 +576,10 @@ class ReadWorker(threading.Thread):
                             "Sink %s.consume failed: %s",
                             sink.__class__.__name__, exc,
                         )
+                if self._keepalive_s and reading.quality == "good":
+                    self._last_emitted[reading.point_code] = [
+                        reading.value, time.monotonic(),
+                    ]
 
     def _record_failure(self, exc: Exception) -> None:
         last = self.health.get("last_success")

@@ -77,3 +77,72 @@ class TestSqliteTuning:
         # busy_timeout 必须生效。
         assert mode in ("wal", "memory")
         assert int(busy) >= 30000
+
+
+# ---------------------------------------------------------------------------
+# 推模式断流补写(keep-alive)
+# ---------------------------------------------------------------------------
+
+
+class _CaptureSink:
+    def __init__(self):
+        self.readings = []
+
+    def consume(self, reading):
+        self.readings.append(reading)
+
+
+class TestPushKeepalive:
+    """scada/mqtt 测点断流 30s(可配)后用最后真实值补写,保证下游序列连续。"""
+
+    def _worker(self, protocol="scada", metadata=None):
+        from acquisition.services.pipeline import ReadWorker
+        device = SimpleNamespace(
+            id=1, code="DEV-K", protocol=protocol, metadata=metadata or {},
+            ip_address="127.0.0.1", port=502,
+        )
+        sink = _CaptureSink()
+        w = ReadWorker(
+            device=device, points=[], sinks=[sink], sample_rate_hz=1.0,
+            shutdown_event=threading.Event(), health_dict={}, session=None,
+        )
+        return w, sink
+
+    def test_default_30s_for_push_disabled_for_pull(self):
+        w, _ = self._worker("scada")
+        assert w._keepalive_s == 30.0
+        w2, _ = self._worker("modbus_tcp")
+        assert w2._keepalive_s == 0.0
+
+    def test_metadata_override_and_zero_disables(self):
+        w, _ = self._worker("scada", {"keepalive_write_seconds": 5})
+        assert w._keepalive_s == 5.0
+        w2, _ = self._worker("scada", {"keepalive_write_seconds": 0})
+        assert w2._keepalive_s == 0.0
+
+    def test_stale_point_gets_synthetic_write_with_fresh_timestamp(self):
+        import time as _t
+        w, sink = self._worker("scada", {"keepalive_write_seconds": 30})
+        # 手工播种最后值:60s 前发过 42.5
+        w._last_emitted["P001"] = [42.5, _t.monotonic() - 60]
+        before_ns = _t.time_ns()
+        w._emit_keepalive()
+        assert len(sink.readings) == 1
+        r = sink.readings[0]
+        assert r.point_code == "P001" and r.value == 42.5 and r.quality == "good"
+        assert r.timestamp_ns >= before_ns  # 时间戳是"现在",不是原始推送时间
+        # 窗口被刷新:立刻再跑不重复补
+        w._emit_keepalive()
+        assert len(sink.readings) == 1
+
+    def test_fresh_point_not_rewritten(self):
+        import time as _t
+        w, sink = self._worker("scada")
+        w._last_emitted["P001"] = [1.0, _t.monotonic()]  # 刚发过
+        w._emit_keepalive()
+        assert sink.readings == []
+
+    def test_never_seen_point_has_nothing_to_repeat(self):
+        w, sink = self._worker("scada")
+        w._emit_keepalive()
+        assert sink.readings == []

@@ -393,10 +393,11 @@ class TestDataFormatting:
         written = mock_storage.get_written_data()
         assert len(written) == 1
         data = written[0]
-        # M5: cn_name / unit moved out of the (low-cardinality) tag set.
-        assert "cn_name" not in data["tags"]
+        # cn_name 回归 tag(用户要按中文名在 Influx 过滤;与 point_code 1:1,
+        # 序列数≈测点数,非组合爆炸)。unit 仍为 field。
         assert "unit" not in data["tags"]
-        assert data["fields"]["cn_name"] == "温度"
+        assert data["tags"]["cn_name"] == "温度"
+        assert "cn_name" not in data["fields"]
         assert data["fields"]["unit"] == "°C"
         # Template coefficient (0.1) is applied: raw 250 → 25.0.
         assert data["fields"]["TEMP"] == 25.0
