@@ -32,6 +32,32 @@ from . import import_paths, models, serializers, tasks
 logger = logging.getLogger(__name__)
 
 
+def _candidate_measurements(device) -> list[str]:
+    """设备在 InfluxDB 里可能使用的 measurement 名字（新旧兼容，只加不改）。
+
+    历史数据 measurement = device.code；scada 新入库切换为
+    device.metadata["device_a_tag"]（设备编号）。查询端需要同时命中两者，
+    这里返回去重后的候选列表（device.code 恒在首位）。
+    """
+    candidates = [device.code]
+    meta = device.metadata or {}
+    a_tag = meta.get("device_a_tag")
+    if isinstance(a_tag, str):
+        a_tag = a_tag.strip()
+        if a_tag and a_tag not in candidates:
+            candidates.append(a_tag)
+    return candidates
+
+
+def _measurement_filter_expr(measurements: list[str]) -> str:
+    """把候选 measurement 列表拼成 Flux filter 谓词（各自转义后 or 连接）。"""
+    parts = []
+    for m in measurements:
+        safe = m.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'r["_measurement"] == "{safe}"')
+    return " or ".join(parts)
+
+
 @extend_schema_view(
     list=extend_schema(summary="列出所有站点"),
     retrieve=extend_schema(summary="查看站点"),
@@ -662,14 +688,22 @@ class DeviceViewSet(viewsets.ModelViewSet):
             "bucket": getattr(dj_settings, "INFLUXDB_BUCKET", "default"),
         }
 
-        # device.code 来自数据库，仍要 escape 以防 Flux 注入
-        safe_measurement = device.code.replace("\\", "\\\\").replace('"', '\\"')
+        # device.code / metadata 来自数据库，仍要 escape 以防 Flux 注入。
+        # 兼容：历史数据在 device.code measurement，scada 新数据在
+        # metadata["device_a_tag"] measurement，两者 or 起来一起查。
+        measurements = _candidate_measurements(device)
+        measurement_expr = _measurement_filter_expr(measurements)
         bucket = influx_config["bucket"]
+        # 跨多个 measurement 时 group 只是把行拼进同一张表，行序不保证按
+        # _time 递增，last() 取的是表内最后一行——先显式 sort 才是"全局最新"。
+        # 单 measurement 时保持原查询不变（只加不改）。
+        sort_stage = '|> sort(columns: ["_time"]) ' if len(measurements) > 1 else ""
         flux_query = (
             f'from(bucket:"{bucket}") '
             f'|> range(start: -1h) '
-            f'|> filter(fn: (r) => r["_measurement"] == "{safe_measurement}") '
+            f'|> filter(fn: (r) => {measurement_expr}) '
             f'|> group(columns: ["_field"]) '
+            f'{sort_stage}'
             f'|> last()'
         )
 
@@ -852,12 +886,19 @@ class PointViewSet(viewsets.ModelViewSet):
                 storage.connect()
                 for dev_id, dev_points in points_by_device.items():
                     device = dev_points[0].device
-                    safe_measurement = device.code.replace("\\", "\\\\").replace('"', '\\"')
+                    # 兼容新旧 measurement（device.code + metadata.device_a_tag），
+                    # 见 _candidate_measurements / _measurement_filter_expr。
+                    measurements = _candidate_measurements(device)
+                    measurement_expr = _measurement_filter_expr(measurements)
+                    sort_stage = (
+                        '|> sort(columns: ["_time"]) ' if len(measurements) > 1 else ""
+                    )
                     flux_query = (
                         f'from(bucket:"{bucket}") '
                         f'|> range(start: -1h) '
-                        f'|> filter(fn: (r) => r["_measurement"] == "{safe_measurement}") '
+                        f'|> filter(fn: (r) => {measurement_expr}) '
                         f'|> group(columns: ["_field"]) '
+                        f'{sort_stage}'
                         f'|> last()'
                     )
                     field_map: dict = {}

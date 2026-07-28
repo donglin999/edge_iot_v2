@@ -6,9 +6,11 @@ Alibaba-Cloud-IoT style pattern::
 
     /sys/{product_key}/device/{device_name}/thing/property/{code}/post
 
-where ``{code}`` is the per-point measurement code (测点编码). We subscribe once,
-substituting the single-level wildcard ``+`` for ``{code}``, then map each
-inbound message back to the requested point.
+where ``{code}`` is the per-point measurement code (测点编码). We subscribe once
+at the property level — the template is truncated at ``{code}`` and ``#`` is
+appended (``.../thing/property/#``), because the 中山博创 platform only grants
+that subscription — then map each inbound ``{code}/post`` message back to the
+requested point (other suffixes under ``#`` are dropped).
 
 Real payload structure
 ----------------------
@@ -77,8 +79,8 @@ class SCADAProtocol(MQTTProtocol):
         category="iot",
         description=(
             "面向注塑机/小家电 SCADA 网关的 MQTT 采集协议:每个测点一个话题,"
-            "按 /sys/{product_key}/device/{device_name}/thing/property/{code}/post "
-            "模式订阅(用 + 通配 {code}),从话题反解测点编码并写入时序库。"
+            "按 /sys/{product_key}/device/{device_name}/thing/property/# "
+            "订阅(property 层 # 一次覆盖全部测点),按 {code}/post 反解测点编码并写入时序库。"
         ),
         supports_pause=True,
     )
@@ -160,15 +162,26 @@ class SCADAProtocol(MQTTProtocol):
     # Topic construction / reversal
     # ------------------------------------------------------------------ #
     def _build_subscribe_topic(self) -> str:
-        """Concrete subscribe topic: substitute identity, wildcard the code."""
+        """Concrete subscribe topic: substitute identity, wildcard the code.
+
+        中山博创现场平台只授权到 property 层的 ``#`` 订阅
+        (``/sys/{pk}/device/{dn}/thing/property/#``),因此模板在 ``{code}``
+        处截断、拼 ``#``:一个订阅覆盖该设备全部属性。收到的消息再由
+        :meth:`_build_topic_regex` 的精确 ``{code}/post`` 匹配挑出我们要的,
+        其余后缀(如 ``.../set``)在 :meth:`_parse_message` 里静默丢弃。
+        """
         if not self.topic_template:
             return ""
-        return (
+        topic = (
             self.topic_template
             .replace("{product_key}", self.product_key)
             .replace("{device_name}", self.device_name)
-            .replace("{code}", "+")
         )
+        idx = topic.find("{code}")
+        if idx < 0:
+            # Template carries no per-point segment — subscribe to it as-is.
+            return topic
+        return topic[:idx] + "#"
 
     def _build_topic_regex(self) -> "re.Pattern[str]":
         """Compile a regex where ``{code}`` is a capture group and the identity
@@ -204,7 +217,9 @@ class SCADAProtocol(MQTTProtocol):
             topic = message.get("topic", "") or ""
             match = self._topic_regex.match(topic)
             if not match:
-                # Topic doesn't belong to this device/template — ignore quietly.
+                # `#` 订阅会收到 property 层下所有后缀(如 .../set、多级子话题);
+                # 正则仍只认 {code}/post,其余丢弃。debug 级别,默认不刷屏。
+                self.logger.debug("SCADA topic %s does not match template, dropped", topic)
                 return []
             code = match.group("code")
 

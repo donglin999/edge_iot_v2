@@ -152,7 +152,11 @@ def test_import_creates_gateway_devices_and_points(api_client, db):
     assert device.protocol == "scada"
     assert device.name == "注塑机1"
     # The redundancy is gone: no broker/port/TLS/credentials duplicated per device.
-    assert device.metadata == {"scada_device_name": "A0201010001150403"}
+    # device_a_tag mirrors the device_name so Influx measurement = 设备编号.
+    assert device.metadata == {
+        "scada_device_name": "A0201010001150403",
+        "device_a_tag": "A0201010001150403",
+    }
 
     point = device.points.get(code="N270400150027")
     assert point.extra == {"data_type": "float", "unit": "MPa", "protocol": "scada"}

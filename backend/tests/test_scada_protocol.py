@@ -84,13 +84,20 @@ class TestRegistration:
 # Subscription
 # ---------------------------------------------------------------------------
 class TestSubscription:
-    def test_subscribe_topic_uses_wildcard_for_code(self):
+    def test_subscribe_topic_truncates_at_code_with_hash(self):
+        """平台只授权 property 层 `#`:模板在 {code} 处截断并拼 `#`。"""
         proto = make_proto()
         assert proto.subscribe_topic == (
             "/sys/123daffb91264286adcdf3bfe55194c7/device/"
-            "A0201010001150403/thing/property/+/post"
+            "A0201010001150403/thing/property/#"
         )
         assert proto.topics == [proto.subscribe_topic]
+
+    def test_subscribe_topic_without_code_placeholder_kept_as_is(self):
+        proto = make_proto(scada_topic_template="/custom/{product_key}/{device_name}/data")
+        assert proto.subscribe_topic == (
+            "/custom/123daffb91264286adcdf3bfe55194c7/A0201010001150403/data"
+        )
 
     def test_on_connect_subscribes_once(self):
         proto = make_proto(mqtt_qos=1)
@@ -140,6 +147,27 @@ class TestTopicMapping:
         proto = make_proto()
         out = proto._parse_message(msg({"value": 1}), [{"code": "SOMETHING_ELSE"}])
         assert out == []
+
+    @pytest.mark.parametrize("suffix_topic", [
+        # `#` 订阅会带进 property 层下的其他后缀 — 必须被精确正则丢弃。
+        TOPIC.replace("/post", "/set"),
+        TOPIC + "/reply",
+        TOPIC.rsplit("/post", 1)[0],  # 缺 /post 结尾
+    ])
+    def test_hash_subscription_extra_suffixes_dropped(self, suffix_topic):
+        from unittest.mock import patch
+
+        proto = make_proto()
+        # "acquisition" 日志树 propagate=False,caplog 收不到 —— 直接桩掉 logger。
+        with patch.object(proto, "logger") as mock_logger:
+            out = proto._parse_message(
+                msg({"value": 1}, topic=suffix_topic), [{"code": CODE}]
+            )
+        assert out == []
+        # 丢弃路径有 debug 日志;不打 warning/error(不刷屏)。
+        assert mock_logger.debug.called
+        assert not mock_logger.warning.called
+        assert not mock_logger.error.called
 
 
 # ---------------------------------------------------------------------------

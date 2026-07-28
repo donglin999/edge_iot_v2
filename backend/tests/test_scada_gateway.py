@@ -109,7 +109,7 @@ class TestBuildDeviceConfig:
         assert proto.broker_port == 8883
         assert proto.subscribe_topic == (
             "/sys/123daffb91264286adcdf3bfe55194c7/device/"
-            "A0201010001150403/thing/property/+/post"
+            "A0201010001150403/thing/property/#"
         )
 
     def test_non_gateway_device_config_is_unchanged(self, site):
@@ -390,8 +390,12 @@ class TestProvision:
         assert device.protocol == "scada"
         assert device.gateway == gateway
         assert device.name == "注塑机1"
-        # metadata carries ONLY the per-device name — the whole point of the gateway
-        assert device.metadata == {"scada_device_name": "A0201010001150403"}
+        # metadata carries the per-device name plus device_a_tag (measurement
+        # override so Influx rows land under the 设备编号) — no connection block.
+        assert device.metadata == {
+            "scada_device_name": "A0201010001150403",
+            "device_a_tag": "A0201010001150403",
+        }
         # mirrored off the gateway so existing list/搜索 UIs show something
         assert device.ip_address == gateway.source_ip
         assert device.port == gateway.source_port
@@ -514,6 +518,55 @@ class TestProvision:
 
         device = config_models.Device.objects.get(id=response.data["devices"][0]["id"])
         assert device.name == "A9"
+
+    def test_scada_reading_lands_with_device_measurement_and_cn_name(
+        self, api_client, site, gateway,
+    ):
+        """钉死入库结构:measurement=设备编号(device_a_tag),fields 含
+        测点编码=值 + cn_name=测点中文名(来自 Point.description)。
+
+        走真实链路:provision → AcquisitionService 组装 device_groups(点 dict
+        必须带 description)→ InfluxDBSink.consume 出的 staged point。
+        """
+        from unittest.mock import MagicMock, patch
+
+        from acquisition.services.acquisition_service import AcquisitionService
+        from acquisition.services.read_plan import Reading
+        from acquisition.services.sinks import InfluxDBSink
+
+        _provision(api_client, gateway, site=site)
+        task = config_models.AcqTask.objects.get(
+            code="task-zhongshan-A0201010001150403",
+        )
+        session = acq_models.AcquisitionSession.objects.create(
+            task=task, status=acq_models.AcquisitionSession.STATUS_RUNNING,
+        )
+        service = AcquisitionService(task, session)
+
+        # 组装处必须把 Point.description(中文名)带进 point dict——
+        # scada 测点没有模板,sink 的 cn_name 全靠这个键。
+        (group,) = service.device_groups.values()
+        by_code = {p["code"]: p for p in group["points"]}
+        assert by_code["N270400150027"]["description"] == "注射压力实际值"
+
+        storage = MagicMock()
+        storage.connect.return_value = True
+        with patch("storage.StorageRegistry.create", return_value=storage):
+            sink = InfluxDBSink(session, service.device_groups)
+
+        sink.consume(Reading(
+            point_code="N270400150027", value=88.5,
+            timestamp_ns=1755653755532000000, quality="good",
+        ))
+
+        assert len(sink._buffer) == 1
+        staged = sink._buffer[0]
+        # measurement = 设备编号(metadata["device_a_tag"]),不是 Device.code。
+        assert staged["measurement"] == "A0201010001150403"
+        assert staged["fields"]["N270400150027"] == 88.5
+        assert staged["fields"]["cn_name"] == "注射压力实际值"
+        assert staged["fields"]["unit"] == "MPa"
+        assert staged["time"] == 1755653755532000000
 
     def test_devices_is_required(self, api_client, gateway):
         response = api_client.post(

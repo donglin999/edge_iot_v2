@@ -88,6 +88,11 @@ class AcquisitionService:
                 "coefficient": float(point.template.coefficient) if point.template else 1.0,
                 "precision": int(point.template.precision) if point.template else 2,
             }
+            # Point.description(如 scada 测点的中文名)进入 point dict,
+            # InfluxDBSink 以 cn_name → description 的顺序取中文名写入 cn_name
+            # 字段(sinks.py)。没有模板的测点(scada provision 路径)全靠这里。
+            if point.description:
+                point_config.setdefault("description", point.description)
             if point.template:
                 point_config.setdefault("cn_name", point.template.name)
                 point_config.setdefault("unit", point.template.unit)

@@ -88,7 +88,14 @@ def provision(gateway: models.ScadaGateway, data: Dict[str, Any]) -> Dict[str, A
                 # acquisition time by ``build_device_config``.
                 "ip_address": gateway.source_ip,
                 "port": gateway.source_port,
-                "metadata": {"scada_device_name": device_name},
+                # ``device_a_tag`` mirrors the device_name so InfluxDBSink uses
+                # the 设备编号 as the measurement name (sinks.py reads
+                # metadata["device_a_tag"] with Device.code as fallback) —
+                # zero sink changes needed.
+                "metadata": {
+                    "scada_device_name": device_name,
+                    "device_a_tag": device_name,
+                },
             },
         )
         if was_created:
@@ -99,6 +106,7 @@ def provision(gateway: models.ScadaGateway, data: Dict[str, Any]) -> Dict[str, A
             # metadata overrides the operator added by hand.
             metadata = dict(device.metadata or {})
             metadata["scada_device_name"] = device_name
+            metadata["device_a_tag"] = device_name
             device.site = site
             device.gateway = gateway
             device.name = device_data.get("name") or device_name

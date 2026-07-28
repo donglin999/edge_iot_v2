@@ -54,6 +54,7 @@ const { Title, Text } = Typography;
 
 type RefreshInterval = 1000 | 3000 | 5000;
 type HistoryRange = '5m' | '1h' | '6h' | '24h';
+type SortMode = 'recent' | 'code' | 'name';
 
 interface Filter {
   taskId: number | null;
@@ -66,6 +67,20 @@ const REFRESH_OPTIONS: Array<{ label: string; value: RefreshInterval }> = [
   { label: '3s', value: 3000 },
   { label: '5s', value: 5000 },
 ];
+
+const SORT_OPTIONS: Array<{ label: string; value: SortMode }> = [
+  { label: '最近更新优先', value: 'recent' },
+  { label: '测点编码', value: 'code' },
+  { label: '中文名称', value: 'name' },
+];
+
+// 时间戳解析:null / 非法时间当成 -Infinity,在「最近更新优先」倒序里自然沉底
+// (从未有过数据的测点排最后)。
+const timestampMs = (iso: string | null): number => {
+  if (!iso) return Number.NEGATIVE_INFINITY;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+};
 
 const HISTORY_OPTIONS: Array<{ label: string; value: HistoryRange }> = [
   { label: '近 5 分钟', value: '5m' },
@@ -150,6 +165,7 @@ const DataVisualizationPage: React.FC = () => {
     pointCode: null,
   });
   const [pollInterval, setPollInterval] = useState<RefreshInterval>(3000);
+  const [sortMode, setSortMode] = useState<SortMode>('recent');
   const [tasks, setTasks] = useState<AcqTask[]>([]);
   const [tasksLoading, setTasksLoading] = useState(true);
   const [latestValues, setLatestValues] = useState<PointLatestValue[]>([]);
@@ -378,10 +394,36 @@ const DataVisualizationPage: React.FC = () => {
     }
   };
 
+  // 渲染层排序(useMemo),不动取数 / 轮询逻辑。Array.prototype.sort 是稳定
+  // 排序:比较值相同的测点保持接口返回的相对顺序,轮询刷新时卡片不会乱跳。
+  // 选中态按 point_code 匹配(filter.pointCode),与顺序无关,重排不丢选中。
+  const sortedValues = useMemo(() => {
+    const list = [...latestValues];
+    switch (sortMode) {
+      case 'recent':
+        list.sort((a, b) => timestampMs(b.timestamp) - timestampMs(a.timestamp));
+        break;
+      case 'code':
+        list.sort((a, b) =>
+          a.point_code.localeCompare(b.point_code, undefined, { numeric: true }),
+        );
+        break;
+      case 'name':
+        list.sort((a, b) =>
+          (a.point_name || a.point_code).localeCompare(
+            b.point_name || b.point_code,
+            'zh',
+          ),
+        );
+        break;
+    }
+    return list;
+  }, [latestValues, sortMode]);
+
   const matchingCount = latestValues.length;
 
-  // CTA target for the history empty state — first matching point.
-  const ctaPoint = latestValues[0] ?? null;
+  // CTA target for the history empty state — first point in display order.
+  const ctaPoint = sortedValues[0] ?? null;
 
   return (
     <NowProvider>
@@ -449,6 +491,15 @@ const DataVisualizationPage: React.FC = () => {
           <Col>
             <Space size={8}>
               <Text type="secondary" style={{ fontSize: 12 }}>
+                排序
+              </Text>
+              <Select<SortMode>
+                style={{ width: 140 }}
+                value={sortMode}
+                onChange={(v) => setSortMode(v)}
+                options={SORT_OPTIONS}
+              />
+              <Text type="secondary" style={{ fontSize: 12 }}>
                 刷新间隔
               </Text>
               <Segmented<RefreshInterval>
@@ -511,7 +562,7 @@ const DataVisualizationPage: React.FC = () => {
           <Empty description="当前筛选条件下没有测点" />
         ) : matchingCount > VIRTUALIZE_THRESHOLD ? (
           <VirtualPointGrid
-            points={latestValues}
+            points={sortedValues}
             renderCard={(p) => (
               <PointValueCard
                 point={p}
@@ -522,7 +573,7 @@ const DataVisualizationPage: React.FC = () => {
           />
         ) : (
           <Row gutter={[12, 12]}>
-            {latestValues.map((p) => (
+            {sortedValues.map((p) => (
               <Col key={`${p.device_id}-${p.point_code}`} xs={24} sm={12} md={8} xl={6}>
                 <PointValueCard
                   point={p}
