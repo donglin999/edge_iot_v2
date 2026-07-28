@@ -42,6 +42,11 @@ interface PointChartProps {
   height?: number;
   /** Bumping this value forces a re-fetch (e.g. after time-range change). */
   refreshKey?: number;
+  /**
+   * 服务端 last 降采样窗口(如 `10s` / `1m`)。传了则后端每窗口只回最新
+   * 一条,减少传输与渲染压力;不传为全量数据(行为不变)。
+   */
+  window?: string;
 }
 
 interface ChartPoint {
@@ -58,6 +63,7 @@ const PointChart: React.FC<PointChartProps> = ({
   unit,
   height = 320,
   refreshKey = 0,
+  window: aggWindow,
 }) => {
   const [data, setData] = useState<ChartPoint[]>([]);
   const [loading, setLoading] = useState(false);
@@ -75,6 +81,7 @@ const PointChart: React.FC<PointChartProps> = ({
           endTime,
           1000,
           aborter.signal,
+          aggWindow,
         );
         const rows: ChartPoint[] = (res.data || [])
           .map((dp) => {
@@ -112,7 +119,7 @@ const PointChart: React.FC<PointChartProps> = ({
     return () => {
       aborter.abort();
     };
-  }, [pointCode, startTime, endTime, refreshKey]);
+  }, [pointCode, startTime, endTime, refreshKey, aggWindow]);
 
   if (loading && data.length === 0) {
     return (

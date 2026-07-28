@@ -107,14 +107,19 @@ export interface SessionDataPointsResponse {
 }
 
 /**
- * Fetch point history data for visualization
+ * Fetch point history data for visualization.
+ *
+ * `window`(如 `10s` / `1m`)可选:传了则后端按窗口取最新一条
+ * (InfluxDB aggregateWindow fn=last)做服务端降采样;不传行为不变。
+ * 参数追加在 signal 之后,保持既有调用方签名兼容。
  */
 export async function fetchPointHistory(
   pointCode: string,
   startTime?: string,
   endTime?: string,
   limit = 1000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  window?: string
 ): Promise<PointHistoryResponse> {
   const params = new URLSearchParams({
     point_code: pointCode,
@@ -127,6 +132,10 @@ export async function fetchPointHistory(
 
   if (endTime) {
     params.append('end_time', endTime);
+  }
+
+  if (window) {
+    params.append('window', window);
   }
 
   const response = await fetchWithAbort(

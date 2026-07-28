@@ -57,6 +57,35 @@ def _validate_flux_time_arg(value: str) -> str:
     raise ValueError(repr(value))
 
 
+# SEC (Flux injection): the optional ``window`` param on the point-history
+# endpoint is interpolated into ``aggregateWindow(every: …)``. Only a bare
+# positive duration such as ``10s`` / ``5m`` is accepted — no signs, no
+# composite durations, nothing that could close the call and smuggle Flux in.
+_FLUX_WINDOW_RE = re.compile(r"^(\d+)(ms|s|m|h)$")
+_FLUX_WINDOW_UNIT_MS = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000}
+# Sanity bound: a last-downsampling window larger than 24h makes no sense for
+# this page (max range is 24h) and huge numbers are rejected outright.
+_FLUX_WINDOW_MAX_MS = 24 * 3_600_000
+
+
+def _validate_flux_window(value: str) -> str:
+    """Return ``value`` unchanged if it is a safe ``aggregateWindow`` duration
+    (``^\\d+(ms|s|m|h)$`` with a sane, non-zero magnitude), else raise
+    ``ValueError``. The returned value is safe to interpolate bare into a Flux
+    ``aggregateWindow(every: …)`` call."""
+    if value is None:
+        raise ValueError("窗口参数不能为空")
+    v = value.strip()
+    match = _FLUX_WINDOW_RE.match(v)
+    if not match:
+        raise ValueError(repr(value))
+    amount = int(match.group(1))
+    total_ms = amount * _FLUX_WINDOW_UNIT_MS[match.group(2)]
+    if amount <= 0 or total_ms > _FLUX_WINDOW_MAX_MS:
+        raise ValueError(repr(value))
+    return v
+
+
 def _update_session_locked(session, *, metadata_mutator=None, field_updates=None):
     """M1: re-read an AcquisitionSession under a row lock, mutate, save.
 
@@ -689,6 +718,10 @@ class AcquisitionSessionViewSet(
         查询测点历史数据 (from InfluxDB)
 
         GET /api/acquisition/sessions/point-history/?point_code=xxx&start_time=xxx&end_time=xxx&limit=1000
+
+        可选参数 ``window``(如 ``10s`` / ``1m``):按窗口取最新一条
+        (InfluxDB ``aggregateWindow(fn: last)``)做服务端降采样,减少
+        大时间范围下的传输与渲染压力。不传时行为与原来完全一致。
         """
         point_code = request.query_params.get('point_code')
         if not point_code:
@@ -700,6 +733,7 @@ class AcquisitionSessionViewSet(
         start_time = request.query_params.get('start_time', '-1h')
         end_time = request.query_params.get('end_time', 'now()')
         limit = int(request.query_params.get('limit', 1000))
+        window = request.query_params.get('window')
 
         # SEC: strictly validate the range bounds before they reach the Flux
         # query. Only a whitelisted set of shapes is accepted; anything else is
@@ -713,6 +747,19 @@ class AcquisitionSessionViewSet(
                 {"detail": f"非法的时间参数: {exc}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # SEC: same treatment for the optional downsampling window — it is
+        # interpolated into aggregateWindow(every: …), so only a whitelisted
+        # bare duration is accepted; anything else is rejected with 400.
+        safe_window = None
+        if window is not None:
+            try:
+                safe_window = _validate_flux_window(window)
+            except ValueError as exc:
+                return Response(
+                    {"detail": f"非法的窗口参数: {exc}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         from django.conf import settings as dj_settings
         from storage import StorageRegistry
@@ -732,10 +779,20 @@ class AcquisitionSessionViewSet(
         # M5: point_code is no longer a tag - it is the field *key*. Filter on
         # _field so only the numeric series is returned (cn_name / unit fields
         # are excluded).
+        # Optional last-downsampling: with ``window`` given, keep only the
+        # latest record per window. Placed after the filter and before
+        # sort/limit; without ``window`` the query below is byte-for-byte
+        # identical to what it always was (tests lock this).
+        agg_clause = (
+            f'|> aggregateWindow(every: {safe_window}, fn: last, createEmpty: false) '
+            if safe_window
+            else ''
+        )
         flux_query = (
             f'from(bucket:"{bucket}") '
             f'|> range(start: {safe_start}, stop: {safe_stop}) '
             f'|> filter(fn: (r) => r["_field"] == "{safe_point}") '
+            f'{agg_clause}'
             f'|> sort(columns: ["_time"]) '
             f'|> limit(n: {limit})'
         )

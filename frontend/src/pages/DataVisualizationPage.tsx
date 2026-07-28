@@ -55,6 +55,10 @@ const { Title, Text } = Typography;
 type RefreshInterval = 1000 | 3000 | 5000;
 type HistoryRange = '5m' | '1h' | '6h' | '24h';
 type SortMode = 'recent' | 'code' | 'name';
+// 历史图展示模式:full = 时间段全量数据(默认,行为不变);
+// auto = 自动降采样,按当前时间范围选窗口,后端每窗口只取最新一条
+// (InfluxDB aggregateWindow fn=last,类似 influx 的 last,减少渲染压力)。
+type DisplayMode = 'full' | 'auto';
 
 interface Filter {
   taskId: number | null;
@@ -98,6 +102,22 @@ const RANGE_TO_MS: Record<HistoryRange, number> = {
   '1h': 60 * 60 * 1000,
   '6h': 6 * 60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
+};
+
+const DISPLAY_MODE_OPTIONS: Array<{ label: string; value: DisplayMode }> = [
+  { label: '全量数据', value: 'full' },
+  { label: '自动降采样', value: 'auto' },
+];
+
+// 自动降采样模式下,时间范围 → last 降采样窗口的映射(null = 该范围数据量
+// 不大,仍走全量)。窗口取值让每个范围的返回条数都压在几百条量级:
+//   5 分钟 → 全量(1s 采样也才 300 条);
+//   1 小时 → 10s(≈360 条);6 小时 → 1m(≈360 条);24 小时 → 5m(≈288 条)。
+const RANGE_TO_WINDOW: Record<HistoryRange, string | null> = {
+  '5m': null,
+  '1h': '10s',
+  '6h': '1m',
+  '24h': '5m',
 };
 
 const qualityToBadge = (quality: string) => {
@@ -177,8 +197,13 @@ const DataVisualizationPage: React.FC = () => {
   const [latestError, setLatestError] = useState<string | null>(null);
   const [latestLoading, setLatestLoading] = useState(false);
   const [historyRange, setHistoryRange] = useState<HistoryRange>('1h');
+  const [displayMode, setDisplayMode] = useState<DisplayMode>('full');
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [exporting, setExporting] = useState(false);
+
+  // 当前生效的降采样窗口:全量模式恒为 null;自动降采样按范围查映射表。
+  const historyWindow =
+    displayMode === 'auto' ? RANGE_TO_WINDOW[historyRange] : null;
 
   // Use a ref so changing pollInterval doesn't kick off duplicate timers
   // mid-flight. The polling effect re-runs only on filter or interval change.
@@ -373,7 +398,15 @@ const DataVisualizationPage: React.FC = () => {
     try {
       const start = new Date(Date.now() - RANGE_TO_MS[historyRange]).toISOString();
       const end = new Date().toISOString();
-      const res = await fetchPointHistory(filter.pointCode, start, end, 10000);
+      // CSV 导出跟随当前展示模式:降采样时导出的就是图上那份降采样数据。
+      const res = await fetchPointHistory(
+        filter.pointCode,
+        start,
+        end,
+        10000,
+        undefined,
+        historyWindow ?? undefined,
+      );
       const headers = ['时间', '数值', '质量'];
       const rows = res.data.map((dp) => [
         new Date(dp.timestamp).toLocaleString('zh-CN'),
@@ -616,6 +649,15 @@ const DataVisualizationPage: React.FC = () => {
                   setHistoryRefreshKey((n) => n + 1);
                 }}
               />
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                展示
+              </Text>
+              <Select<DisplayMode>
+                style={{ width: 120 }}
+                value={displayMode}
+                onChange={(v) => setDisplayMode(v)}
+                options={DISPLAY_MODE_OPTIONS}
+              />
               <Button
                 icon={<DownloadOutlined />}
                 onClick={handleExport}
@@ -670,12 +712,21 @@ const DataVisualizationPage: React.FC = () => {
                 />
               </Col>
             </Row>
+            {/* 副标题:注明当前展示模式,降采样时讲清楚窗口粒度。 */}
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {historyWindow
+                ? `已降采样:每 ${historyWindow} 取最新一条`
+                : displayMode === 'auto'
+                ? '全量数据(当前范围数据量小,无需降采样)'
+                : '全量数据'}
+            </Text>
             <PointChart
               pointCode={selectedPoint.point_code}
               startTime={historyTimeRange.start}
               endTime={historyTimeRange.end}
               unit={selectedPoint.unit}
               refreshKey={historyRefreshKey}
+              window={historyWindow ?? undefined}
               height={340}
             />
           </Space>
