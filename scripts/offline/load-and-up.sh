@@ -80,6 +80,29 @@ for c in redis-iot migrate-iot django-iot celery-acq celery-short frontend-iot; 
   fi
 done
 
+# 旧版单体系统必须先让位:它与本系统用同一个账号连 SCADA broker,平台单会话
+# 限制下两边会 142「会话被接管」互踢,采集断断续续(muju 现场实锤:一个跑了
+# 10 天的旧 edge_iot 容器)。stop + restart=no 而非 rm:容器保留可回滚
+# (docker update --restart=unless-stopped <名> && docker start <名>),
+# 且机器重启后也不会自己复活回来抢会话。可用环境变量覆盖旧容器名单:
+#   LEGACY_CONTAINERS="old-a old-b" ./load-and-up.sh ...
+echo "==> 停用旧版采集系统(同账号会话互踢预防)"
+for c in ${LEGACY_CONTAINERS:-edge_iot}; do
+  if docker ps --format '{{.Names}}' | grep -qx "$c"; then
+    docker update --restart=no "$c" >/dev/null 2>&1 || true
+    docker stop "$c" >/dev/null 2>&1 \
+      && echo "   已停用旧版容器 $c(保留未删;回滚: docker update --restart=unless-stopped $c && docker start $c)"
+  elif docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
+    docker update --restart=no "$c" >/dev/null 2>&1 || true
+    echo "   旧版容器 $c 已是停止状态(已禁用其自启)"
+  fi
+done
+# 应急直采脚本(scada_collect.py)残留进程同样抢会话,一并清。
+if pgrep -f "scada_collect" >/dev/null 2>&1; then
+  pkill -f "scada_collect" 2>/dev/null || true
+  echo "   已停止残留的 scada_collect 应急直采脚本"
+fi
+
 # 自动识别 compose：优先 v2 插件（docker compose），回退 v1（docker-compose）
 if docker compose version >/dev/null 2>&1; then
   DC=(docker compose)
