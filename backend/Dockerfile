@@ -12,11 +12,14 @@ RUN apt-get update && apt-get install -y \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt /app/
+# Copy requirements and the shared Python 3.10 resolution baseline.
+COPY requirements.txt constraints-py310.txt /app/
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir \
+    --constraint constraints-py310.txt \
+    --requirement requirements.txt \
+    && python -m pip check
 
 # Copy project
 COPY . /app/
