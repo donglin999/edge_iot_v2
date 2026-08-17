@@ -107,6 +107,8 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-tKwtme7RYKb3c9LmBxxVKhWv-MF9TT9XTXFdlm5Q6eU6Q1RS0Ywjk2ND8a1S_CQUcpaNeEHWJwk9NQFnzJZa1g==}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-Midea}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-Record}
+      # 失败批次与配置库共用持久卷；容器重建后仍可继续回放。
+      - INFLUX_SPILL_DB_PATH=${INFLUX_SPILL_DB_PATH:-/data/influx_spill.sqlite3}
     depends_on:
       redis: {condition: service_healthy}
       migrate: {condition: service_completed_successfully}

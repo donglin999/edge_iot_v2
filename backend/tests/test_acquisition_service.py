@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 import pytest
+from django.test import override_settings
 
 from acquisition import models as acq_models
 from acquisition.services.acquisition_service import AcquisitionService
@@ -371,6 +372,7 @@ class TestInfluxDBSinkInitialization:
     on without a storage).
     """
 
+    @override_settings(INFLUX_SPILL_DB_PATH="/data/influx_spill.sqlite3")
     def test_init_storage_success_returns_connected_handle(
         self, create_task, create_session,
     ):
@@ -387,6 +389,7 @@ class TestInfluxDBSinkInitialization:
         create.assert_called_once()
         # First positional argument is the registered name "influxdb".
         assert create.call_args.args[0] == "influxdb"
+        assert create.call_args.args[1]["spill_db_path"] == "/data/influx_spill.sqlite3"
         assert sink._storage is mock_storage
         mock_storage.connect.assert_called_once()
 

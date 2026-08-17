@@ -113,8 +113,14 @@ docker compose ps        # 各服务 Up / healthy
 ## 4. 升级 / 保留数据
 
 - **InfluxDB 数据**：在你自管的宿主机 InfluxDB 里，与本包生命周期无关，升级不受影响。
-- **保留 SQLite 配置库**：默认库烤在镜像内（全新装）。要保留既有配置，按
-  `docker-compose.yml` 里 django 服务的注释挂载磁盘上的 `db.sqlite3`。**红线：绝不覆盖已存在的库。**
+- **保留 SQLite 数据**：配置库 `/data/db.sqlite3` 与 Influx 失败落盘队列
+  `/data/influx_spill.sqlite3` 都位于 `app-db` 持久卷，容器重建不会丢失。
+  **红线：升级时绝不删除或覆盖该卷。**
+- **失败队列语义**：一个 spill 文件只能对应同一套 Influx org/bucket/token；恢复写入采用
+  at-least-once，进程在 Influx 已确认但尚未删除队列项时崩溃，重启后可能重放最后一批。
+  正常采集点均带原始时间戳，可依靠 Influx 的 series + timestamp 覆盖语义收敛；不要把
+  不带时间戳的自定义写入与该队列混用。异步写入在失败回调执行前发生硬崩溃，仍可能留下
+  一个未落盘窗口，因此现场必须同时监控采集心跳与 `dropped_messages`。
 - 升级：`docker load` 新 `images.tar` 后 `docker compose up -d` 即可。
 
 ## 5. 常见问题
