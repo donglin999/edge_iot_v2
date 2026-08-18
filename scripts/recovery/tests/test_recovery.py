@@ -256,6 +256,45 @@ class InfluxKnownValueTests(unittest.TestCase):
             with self.assertRaises(influx_value_check.ValueCheckError):
                 influx_value_check.verify_known_value(str(link), "42.5")
 
+    def test_rejects_same_inode_mutation_even_when_mtime_is_restored(self):
+        bad_csv = "#datatype,string,long,double\n,result,table,_value\n,,0,41.5\n"
+        good_csv = "#datatype,string,long,double\n,result,table,_value\n,,0,42.5\n"
+        self.assertEqual(len(bad_csv), len(good_csv))
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "query.csv"
+            path.write_text(bad_csv, encoding="utf-8")
+            original = path.stat()
+            real_read = os.read
+            mutated = False
+
+            def mutate_before_read(descriptor, size):
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    with path.open("r+b", buffering=0) as stream:
+                        stream.write(good_csv.encode("utf-8"))
+                        os.fsync(stream.fileno())
+                    os.utime(
+                        path,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
+                return real_read(descriptor, size)
+
+            with mock.patch.object(
+                influx_value_check.os,
+                "read",
+                side_effect=mutate_before_read,
+            ), self.assertRaisesRegex(
+                influx_value_check.ValueCheckError,
+                "changed while it was read",
+            ):
+                influx_value_check.verify_known_value(str(path), "42.5")
+
+            self.assertTrue(mutated)
+            self.assertEqual(path.stat().st_ino, original.st_ino)
+            self.assertEqual(path.stat().st_mtime_ns, original.st_mtime_ns)
+            self.assertNotEqual(path.stat().st_ctime_ns, original.st_ctime_ns)
+
 
 class EvidenceIOTests(unittest.TestCase):
     def test_atomic_creation_rejects_preexisting_directory(self):

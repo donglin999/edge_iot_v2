@@ -52,8 +52,12 @@ def _read_regular_file(path: Path) -> str:
             (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
             or after.st_size != before.st_size
             or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_ctime_ns != before.st_ctime_ns
             or (current_after.st_dev, current_after.st_ino)
             != (before.st_dev, before.st_ino)
+            or current_after.st_size != before.st_size
+            or current_after.st_mtime_ns != before.st_mtime_ns
+            or current_after.st_ctime_ns != before.st_ctime_ns
         ):
             raise ValueCheckError("query result changed while it was read")
     finally:
