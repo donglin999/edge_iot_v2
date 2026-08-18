@@ -6,10 +6,6 @@
     "/api/acquisition/"
   ],
   "canonical_route_count": 62,
-  "format_suffix_aliases": {
-    "present": true,
-    "rule": "Every DefaultRouter route also accepts a DRF .<format> alias; canonical paths below omit duplicates."
-  },
   "platform_routes": [
     {
       "path": "/api/auth/login/",

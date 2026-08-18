@@ -24,7 +24,7 @@
           "task_name"
         ]
       },
-      "client_to_server": "Frames are accepted and ignored."
+      "client_to_server": {"behavior": "ignored", "reply_frames": 0}
     },
     {
       "path": "/ws/acquisition/global/",
@@ -37,19 +37,18 @@
         "item_keys": ["session_id", "started_at", "status", "task_code", "task_id"],
         "maximum_sessions": 50
       },
-      "client_to_server": "Frames are accepted and ignored."
+      "client_to_server": {"behavior": "ignored", "reply_frames": 0}
     }
   ],
   "transport": {
-    "authentication": "none",
+    "consumer_authorization_enforced": false,
     "channel_backend": "channels_redis.core.RedisChannelLayer",
     "channel_capacity": 1500,
     "channel_message_expiry_seconds": 10,
     "event_id": false,
     "sequence": false,
     "resume_cursor": false,
-    "replay": false,
-    "delivery_semantics": "best-effort live delivery; reconnect requires REST/Influx resynchronization"
+    "replay": false
   },
   "forwarded_events": [
     {
@@ -139,7 +138,7 @@
     },
     {
       "id": "WS-LEGACY-004",
-      "behavior": "WebSocket routes have no authentication or authorization.",
+      "behavior": "The ASGI middleware attaches an auth context, but both WebSocket consumers accept connections without enforcing user authorization.",
       "migration_rule": "Coordinate the M8 auth change with browser token transport and close-code behavior."
     }
   ]

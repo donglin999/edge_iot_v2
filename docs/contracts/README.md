@@ -17,7 +17,14 @@
 HTTP 状态变化和信封变化一律属于破坏性变更。
 
 JSON fixture 使用合成标识，不包含现场 IP、账号、密码或 token。Excel 快照只记录
-字段定义，不提交导出的二进制工作簿。
+字段定义，不提交导出的二进制工作簿。生产 `FieldSpec.example` 中设备、产品、IP、
+用户名等标识类示例在快照中统一替换为明显的 synthetic/TEST-NET 值；字段名、标签、
+类型、必填、默认值、选项和帮助文本仍逐字段精确冻结。
+
+M1 只冻结三套 Excel 的 schema/header、模板内存解析、整数 cell、MIME 与 multipart
+字段。数据库级“导出→导入两次”、外部记录保留、upsert 和“一设备一任务”尚未形成
+三家族一致的可执行闭环，因此本版 fixture 不声明这些语义；它们是后续迁移门禁缺口，
+不能从模板解析测试推导出来。
 
 ## 当前最重要的 legacy 行为
 
@@ -27,7 +34,8 @@ JSON fixture 使用合成标识，不包含现场 IP、账号、密码或 token�
 - WS 没有序号、游标和重放，断线后必须靠 REST/Influx 回补；
 - session/global 对同类数据分别使用 `data_point` / `data_point_update`；
 - v2 是双表头，SCADA/legacy 是单表头，三者错误字段也不同；
-- 当前 REST 与 WS 都没有应用级鉴权；认证/RBAC 留到 M8 做协调切换；
+- 当前 REST 没有应用级鉴权；WS 中间件会附加用户上下文，但两个 consumer 都不执行
+  授权判断；认证/RBAC 留到 M8 做协调切换；
 - 部分 Excel 导出可能携带明文凭证，fixture 仅允许合成值；修复必须设计
   “脱敏显示 + 留空保留原密钥”等显式语义。
 

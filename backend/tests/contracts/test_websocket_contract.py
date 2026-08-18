@@ -18,6 +18,16 @@ from configuration import models as configuration_models
 from .helpers import REPOSITORY_ROOT, load_contract
 
 
+_NON_EVENT_PUBLIC_METHODS = {
+    "AcquisitionConsumer": {
+        "connect", "disconnect", "receive", "get_session_status",
+    },
+    "GlobalAcquisitionConsumer": {
+        "connect", "disconnect", "receive", "get_active_sessions",
+    },
+}
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.messages: list[dict] = []
@@ -50,7 +60,9 @@ def test_websocket_routes_and_channel_delivery_window() -> None:
     patterns = [str(pattern.pattern) for pattern in routing.websocket_urlpatterns]
     assert patterns == [item["django_regex"] for item in contract["paths"]]
 
-    layer = settings.CHANNEL_LAYERS["default"]["CONFIG"]
+    channel = settings.CHANNEL_LAYERS["default"]
+    assert channel["BACKEND"] == contract["transport"]["channel_backend"]
+    layer = channel["CONFIG"]
     assert layer["expiry"] == contract["transport"]["channel_message_expiry_seconds"]
     assert layer["capacity"] == contract["transport"]["channel_capacity"]
 
@@ -64,15 +76,36 @@ def test_outbound_event_variants_match_frozen_envelopes() -> None:
     payload = {"sentinel": "contract"}
     alarm = {"id": 99, "message": "synthetic"}
 
+    expected_handlers = {
+        (variant["consumer"], variant["handler"])
+        for variant in contract["forwarded_events"]
+    }
+    actual_handlers = set()
+    for class_name, consumer_class in classes.items():
+        public_callables = {
+            name
+            for name, value in consumer_class.__dict__.items()
+            if not name.startswith("_") and callable(value)
+        }
+        non_events = _NON_EVENT_PUBLIC_METHODS[class_name]
+        assert non_events <= public_callables
+        actual_handlers.update(
+            (class_name, name) for name in public_callables - non_events
+        )
+    assert actual_handlers == expected_handlers
+
     for variant in contract["forwarded_events"]:
         method = getattr(classes[variant["consumer"]], variant["handler"])
         event = {"data": payload, "event": "created", "alarm": alarm}
         frame = _dispatch(method, event)
         assert frame == variant["example_frame"]
+        for key in ("event_id", "sequence", "resume_cursor"):
+            assert contract["transport"][key] is False
+            assert key not in frame
 
 
 @pytest.mark.django_db(transaction=True)
-def test_both_on_connect_frames_are_built_by_production_consumers() -> None:
+def test_both_on_connect_frames_are_built_by_production_consumers(monkeypatch) -> None:
     contract = load_contract("websocket-v1.json")
     task = configuration_models.AcqTask.objects.create(
         code="ws-contract-task",
@@ -83,12 +116,15 @@ def test_both_on_connect_frames_are_built_by_production_consumers() -> None:
         status=acquisition_models.AcquisitionSession.STATUS_RUNNING,
         started_at=timezone.now(),
     )
-    consumers._status_cache.clear()
+    original_cache = consumers._status_cache
+    original_cache_snapshot = dict(original_cache)
 
     session_consumer = consumers.AcquisitionConsumer()
     session_consumer.scope = {
         "url_route": {"kwargs": {"session_id": str(session.id)}}
     }
+    assert "user" not in session_consumer.scope
+    assert contract["transport"]["consumer_authorization_enforced"] is False
     session_consumer.channel_layer = _ChannelLayer()
     session_consumer.channel_name = "contract-session-channel"
     session_frames: list[dict] = []
@@ -101,7 +137,13 @@ def test_both_on_connect_frames_are_built_by_production_consumers() -> None:
 
     session_consumer.accept = accept_session
     session_consumer.send = send_session
-    async_to_sync(session_consumer.connect)()
+    with monkeypatch.context() as cache_patch:
+        isolated_cache: dict = {}
+        cache_patch.setattr(consumers, "_status_cache", isolated_cache)
+        async_to_sync(session_consumer.connect)()
+        assert isolated_cache
+    assert consumers._status_cache is original_cache
+    assert original_cache == original_cache_snapshot
 
     session_rule = contract["paths"][0]["on_connect"]
     assert len(session_frames) == 1
@@ -112,6 +154,8 @@ def test_both_on_connect_frames_are_built_by_production_consumers() -> None:
     assert sorted(session_frame[session_rule["payload_key"]]) == session_rule[
         "payload_keys"
     ]
+    for key in ("event_id", "sequence", "resume_cursor"):
+        assert key not in session_frame
 
     acquisition_models.AcquisitionSession.objects.bulk_create([
         acquisition_models.AcquisitionSession(
@@ -122,6 +166,8 @@ def test_both_on_connect_frames_are_built_by_production_consumers() -> None:
         for _ in range(50)
     ])
     global_consumer = consumers.GlobalAcquisitionConsumer()
+    global_consumer.scope = {}
+    assert "user" not in global_consumer.scope
     global_consumer.channel_layer = _ChannelLayer()
     global_consumer.channel_name = "contract-global-channel"
     global_frames: list[dict] = []
@@ -145,6 +191,25 @@ def test_both_on_connect_frames_are_built_by_production_consumers() -> None:
     assert isinstance(rows, list)
     assert len(rows) == global_rule["maximum_sessions"]
     assert all(sorted(row) == global_rule["item_keys"] for row in rows)
+    for key in ("event_id", "sequence", "resume_cursor"):
+        assert key not in global_frame
+
+
+def test_client_frames_are_ignored_and_replay_is_absent() -> None:
+    contract = load_contract("websocket-v1.json")
+    assert contract["transport"]["replay"] is False
+    assert contract["transport"]["resume_cursor"] is False
+    classes = (consumers.AcquisitionConsumer, consumers.GlobalAcquisitionConsumer)
+    for path_rule, consumer_class in zip(contract["paths"], classes, strict=True):
+        recorder = _Recorder()
+        asyncio.run(
+            consumer_class.receive(
+                recorder,
+                text_data=json.dumps({"resume_cursor": "synthetic-cursor"}),
+            )
+        )
+        assert path_rule["client_to_server"]["behavior"] == "ignored"
+        assert len(recorder.messages) == path_rule["client_to_server"]["reply_frames"]
 
 
 def test_data_batch_is_built_by_production_websocket_sink() -> None:
@@ -182,6 +247,8 @@ def test_data_batch_is_built_by_production_websocket_sink() -> None:
             sorted(reading) == contract["reading_keys"]
             for reading in payload["readings"]
         )
+        for key in ("event_id", "sequence", "resume_cursor"):
+            assert key not in envelope
 
 
 def test_browser_reconnect_and_resync_rules_are_explicitly_pinned() -> None:
@@ -192,5 +259,16 @@ def test_browser_reconnect_and_resync_rules_are_explicitly_pinned() -> None:
 
     assert f"autoReconnect = {str(contract['hook_default_auto_reconnect']).lower()}" in hook
     assert f"reconnectInterval = {contract['fixed_delay_ms']}" in hook
-    assert "autoReconnect: false" in panel
+    assert "}, reconnectIntervalRef.current);" in hook
+    assert contract["backoff"] is False
+    assert contract["jitter"] is False
+    assert contract["maximum_attempts"] is None
+    assert "Math.random(" not in hook
+    assert "reconnectattempt" not in hook.lower()
+    global_call = page.split("const { status: wsStatus } = useWebSocket({", 1)[1].split(
+        "});", 1
+    )[0]
+    assert contract["global_socket_auto_reconnect"] is True
+    assert "autoReconnect" not in global_call
+    assert f"autoReconnect: {str(contract['session_panel_auto_reconnect']).lower()}" in panel
     assert f"setInterval(poll, {contract['rest_resync_poll_ms']})" in page

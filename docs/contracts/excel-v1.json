@@ -72,7 +72,7 @@
             "default": null,
             "choices": null,
             "help_text": "如 /dev/ttyUSB0 或 COM3",
-            "example": "/dev/ttyUSB0"
+            "example": "/dev/synthetic-contract-port"
           },
           {
             "name": "baudrate",
@@ -317,7 +317,7 @@
             "default": null,
             "choices": null,
             "help_text": "",
-            "example": "192.168.1.100"
+            "example": "192.0.2.10"
           },
           {
             "name": "source_port",
@@ -748,7 +748,7 @@
             "default": null,
             "choices": null,
             "help_text": "OPC-UA 服务端点,以 opc.tcp:// 开头",
-            "example": "opc.tcp://192.168.1.50:4840"
+            "example": "opc.tcp://192.0.2.20:4840"
           },
           {
             "name": "security_policy",
@@ -832,7 +832,7 @@
             "default": null,
             "choices": null,
             "help_text": "OPC-UA 节点 ID,例如 'ns=2;s=...' 或 'i=85'",
-            "example": "ns=2;s=Channel1.Device1.Tag1"
+            "example": "ns=2;s=SyntheticDevice.SyntheticTag"
           },
           {
             "name": "data_type",
@@ -916,7 +916,7 @@
             "default": null,
             "choices": null,
             "help_text": "",
-            "example": "192.168.1.10"
+            "example": "192.0.2.10"
           },
           {
             "name": "source_port",
@@ -1092,7 +1092,7 @@
         "default": null,
         "choices": null,
         "help_text": "如 /dev/ttyUSB0 或 COM3",
-        "example": "/dev/ttyUSB0"
+        "example": "/dev/synthetic-contract-port"
       },
       {
         "name": "baudrate",
@@ -1186,7 +1186,7 @@
         "default": null,
         "choices": null,
         "help_text": "测点唯一标识,如 'temp_01'",
-        "example": "temp_01"
+        "example": "synthetic-point-001"
       },
       {
         "name": "address",
@@ -1261,7 +1261,7 @@
         "default": null,
         "choices": null,
         "help_text": "",
-        "example": "温度"
+        "example": "synthetic-description"
       },
       {
         "name": "coefficient",
@@ -1281,7 +1281,7 @@
         "default": null,
         "choices": null,
         "help_text": "",
-        "example": "192.168.1.100"
+        "example": "192.0.2.10"
       },
       {
         "name": "source_port",
@@ -1405,7 +1405,7 @@
         "default": null,
         "choices": null,
         "help_text": "OPC-UA 服务端点,以 opc.tcp:// 开头",
-        "example": "opc.tcp://192.168.1.50:4840"
+        "example": "opc.tcp://192.0.2.20:4840"
       },
       {
         "name": "security_policy",
@@ -1447,7 +1447,7 @@
         "default": null,
         "choices": null,
         "help_text": "话题中的 {product_key} 段",
-        "example": "123daffb91264286adcdf3bfe55194c7"
+        "example": "synthetic-product-key"
       },
       {
         "name": "scada_device_name",
@@ -1457,7 +1457,7 @@
         "default": null,
         "choices": null,
         "help_text": "话题中的 {device_name} 段",
-        "example": "A0201010001150403"
+        "example": "synthetic-device-001"
       },
       {
         "name": "scada_topic_template",
@@ -1549,14 +1549,6 @@
       "data_type",
       "unit"
     ]
-  },
-  "semantic_rules": {
-    "v2": "Two display/key header rows; parse English row 2; one device row per device; one point row per point; transactional synchronous upsert; one task per device; errors include kind.",
-    "legacy": "Single English header row, multi-protocol wide sheet, ImportJob validation/apply workflow, retained for stored files.",
-    "scada": "Single English header row with Chinese comments; shared gateway row plus device/point rows; synchronous transactional upsert; errors include protocol but not sheet/kind.",
-    "integer_cells": "Integer-kind fields must remain Excel integers and must not acquire a .0 suffix.",
-    "round_trip": "Generated workbooks parse again entirely in memory; an unchanged export re-imports idempotently and no rows outside the workbook are implicitly deleted.",
-    "credential_values": "The fixture records schema metadata only. Secret defaults are empty and examples are null/placeholders; tests use an unmistakably synthetic in-memory sentinel to prove plaintext round-trip behavior without committing a usable credential."
   },
   "known_legacy_defects": [
     {

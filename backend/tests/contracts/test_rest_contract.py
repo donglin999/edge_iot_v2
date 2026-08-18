@@ -40,7 +40,7 @@ def test_limit_offset_and_drf_error_envelopes() -> None:
     ])
 
     default_page = client.get("/api/config/sites/")
-    assert default_page.status_code == 200
+    assert default_page.status_code == contract["generic_statuses"]["list"]
     assert len(default_page.data["results"]) == contract["pagination"]["default_limit"]
     assert type(default_page.data["count"]) is int
     assert isinstance(default_page.data["next"], str)
@@ -58,12 +58,14 @@ def test_limit_offset_and_drf_error_envelopes() -> None:
     assert len(page.data["results"]) == 1
 
     invalid = client.post("/api/config/sites/", {"code": "", "name": ""}, format="json")
-    assert invalid.status_code == 400
+    assert invalid.status_code == contract["generic_statuses"]["validation_error"]
+    assert invalid.status_code == contract["error_families"]["drf_validation"]["status"]
     assert sorted(invalid.data) == contract["error_families"]["drf_validation"]["top_level_keys"]
     assert all(isinstance(messages, list) for messages in invalid.data.values())
 
     missing = client.get("/api/config/sites/999999/")
-    assert missing.status_code == 404
+    assert missing.status_code == contract["generic_statuses"]["not_found"]
+    assert missing.status_code == contract["error_families"]["drf_not_found"]["status"]
     assert list(missing.data) == contract["error_families"]["drf_not_found"]["top_level_keys"]
     assert isinstance(missing.data["detail"], str)
 
@@ -78,6 +80,7 @@ def test_generic_model_lifecycle_statuses() -> None:
         format="json",
     )
     assert created.status_code == statuses["create"]
+    assert client.get("/api/config/sites/").status_code == statuses["list"]
     site_id = created.data["id"]
     assert client.get(f"/api/config/sites/{site_id}/").status_code == statuses["retrieve"]
     assert client.put(
@@ -91,6 +94,22 @@ def test_generic_model_lifecycle_statuses() -> None:
         format="json",
     ).status_code == statuses["partial_update"]
     assert client.delete(f"/api/config/sites/{site_id}/").status_code == statuses["destroy"]
+
+
+def test_endpoint_specific_detail_family_covers_both_status_variants() -> None:
+    family = load_contract("rest-v1.json")["error_families"]["detail"]
+    client = APIClient()
+    responses = [
+        client.get("/api/acquisition/protocols/synthetic-missing/"),
+        client.get(
+            "/api/acquisition/protocols/template/",
+            {"protocols": "synthetic-missing"},
+        ),
+    ]
+    assert sorted(response.status_code for response in responses) == family["status"]
+    for response in responses:
+        assert list(response.data) == family["top_level_keys"]
+        assert isinstance(response.data["detail"], str)
 
 
 def test_decimal_fields_are_fixed_precision_json_strings() -> None:
