@@ -1,6 +1,21 @@
 import { fetchWithAbort } from './http';
 import { fetchAllPages, withLimitOffset } from './pagination';
 
+/**
+ * Scope contract of the existing Django endpoints used by this page.
+ * The task list keeps the legacy `site_code` query for API compatibility, but
+ * the current list action ignores it. Task list, device list and active
+ * sessions therefore have to be labelled global instead of implying a unified
+ * site view.
+ */
+export const DASHBOARD_DATA_SCOPE = {
+  siteCode: 'default',
+  taskOverview: 'default-site',
+  taskList: 'global',
+  devices: 'global',
+  activeSessions: 'global',
+} as const;
+
 export interface DashboardTaskRun {
   task: string;
   status: string;

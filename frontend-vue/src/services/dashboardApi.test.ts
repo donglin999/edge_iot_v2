@@ -1,4 +1,5 @@
 import {
+  DASHBOARD_DATA_SCOPE,
   fetchDashboardActiveSessions,
   fetchDashboardDevices,
   fetchDashboardOverview,
@@ -16,6 +17,16 @@ afterEach(() => {
 });
 
 describe('dashboard API', () => {
+  it('declares the mixed scope supported by the current Django contracts', () => {
+    expect(DASHBOARD_DATA_SCOPE).toEqual({
+      siteCode: 'default',
+      taskOverview: 'default-site',
+      taskList: 'global',
+      devices: 'global',
+      activeSessions: 'global',
+    });
+  });
+
   it('keeps overview and active-session URLs exact and forwards AbortSignal', async () => {
     const controller = new AbortController();
     const fetchMock = vi
@@ -46,7 +57,7 @@ describe('dashboard API', () => {
     );
   });
 
-  it('walks every task page without dropping the site filter', async () => {
+  it('preserves the legacy task-list URL while declaring its current global scope', async () => {
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(
@@ -67,6 +78,7 @@ describe('dashboard API', () => {
       );
 
     await expect(fetchDashboardTasks()).resolves.toHaveLength(2);
+    expect(DASHBOARD_DATA_SCOPE.taskList).toBe('global');
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       '/api/config/tasks/?site_code=default&limit=1000&offset=0',

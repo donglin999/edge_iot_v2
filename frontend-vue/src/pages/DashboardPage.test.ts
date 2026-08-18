@@ -99,10 +99,14 @@ describe('DashboardPage', () => {
     expect(screen.getAllByText('task-a')).toHaveLength(2);
     expect(screen.getByText('worker-a')).toBeInTheDocument();
     expect(screen.getByText('成功')).toBeInTheDocument();
-    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('任务总数4');
-    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('启用任务3');
-    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('运行中会话2');
-    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('设备在线2/ 3');
+    expect(screen.getByText(
+      '任务概览与最近运行：默认站点（site_code=default）；任务列表、设备与运行会话：全局接口口径。',
+    )).toBeInTheDocument();
+    expect(screen.getByText('全局任务列表')).toBeInTheDocument();
+    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('默认站点任务总数4');
+    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('默认站点启用任务3');
+    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('全局运行中会话2');
+    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('全局设备在线2/ 3');
   });
 
   it('keeps successful sections visible and identifies a failed section', async () => {
@@ -112,7 +116,7 @@ describe('DashboardPage', () => {
 
     expect(await screen.findByText('部分数据加载失败：设备')).toBeInTheDocument();
     expect(screen.getAllByText('task-a')).toHaveLength(2);
-    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('设备在线0/ 0');
+    expect(screen.getByTestId('dashboard-page')).toHaveTextContent('全局设备在线0/ 0');
   });
 
   it('renders explicit task and run empty states', async () => {

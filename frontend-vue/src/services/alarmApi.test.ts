@@ -1,6 +1,7 @@
 import { apiClient } from './apiClient';
 import {
   acknowledgeAlarm,
+  alarmRuleRangeError,
   createAlarmRule,
   deleteAlarmRule,
   fetchAlarmRules,
@@ -122,4 +123,78 @@ describe('alarm API', () => {
       signal: controller.signal,
     });
   });
+
+  it.each(['between', 'outside'] as const)(
+    'requires threshold_high for %s rules before issuing HTTP',
+    async (operator) => {
+      const postMock = vi.spyOn(apiClient, 'post');
+      const payload: AlarmRuleWritePayload = {
+        name: '区间规则',
+        point_code: 'temperature',
+        device_code: '',
+        operator,
+        threshold: 10,
+        threshold_high: null,
+        severity: 'warning',
+        is_active: true,
+        description: '',
+      };
+
+      expect(alarmRuleRangeError(payload)).toBe('区间规则必须填写阈值上限');
+      await expect(createAlarmRule(payload)).rejects.toThrow('区间规则必须填写阈值上限');
+      expect(postMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['between', 'outside'] as const)(
+    'rejects an inverted %s range before issuing HTTP',
+    async (operator) => {
+      const patchMock = vi.spyOn(apiClient, 'patch');
+      const payload: AlarmRuleWritePayload = {
+        name: '倒置区间',
+        point_code: 'pressure',
+        device_code: '',
+        operator,
+        threshold: 20,
+        threshold_high: 10,
+        severity: 'critical',
+        is_active: true,
+        description: '',
+      };
+
+      expect(alarmRuleRangeError(payload)).toBe('阈值上限不能小于阈值下限');
+      await expect(updateAlarmRule(3, payload)).rejects.toThrow(
+        '阈值上限不能小于阈值下限',
+      );
+      expect(patchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['between', 'outside'] as const)(
+    'preserves a valid %s payload exactly',
+    async (operator) => {
+      const payload: AlarmRuleWritePayload = {
+        name: '有效区间',
+        point_code: 'temperature',
+        device_code: 'plc-1',
+        operator,
+        threshold: 10,
+        threshold_high: 20,
+        severity: 'warning',
+        is_active: true,
+        description: '范围测试',
+      };
+      const postMock = vi
+        .spyOn(apiClient, 'post')
+        .mockResolvedValue({ data: { id: 21, ...payload } } as never);
+
+      await createAlarmRule(payload);
+
+      expect(postMock).toHaveBeenCalledWith(
+        '/acquisition/alarm-rules/',
+        payload,
+        { signal: undefined },
+      );
+    },
+  );
 });

@@ -7,6 +7,8 @@ export type AlarmStatus = 'firing' | 'acked' | 'cleared';
 export type AlarmStatusFilter = 'all' | AlarmStatus;
 export type AlarmOperator = 'gt' | 'ge' | 'lt' | 'le' | 'eq' | 'ne' | 'between' | 'outside';
 
+const RANGE_OPERATORS: ReadonlySet<AlarmOperator> = new Set(['between', 'outside']);
+
 export interface AlarmRecord {
   id: number;
   rule: number | null;
@@ -38,6 +40,25 @@ export interface AlarmRule extends AlarmRuleWritePayload {
   id: number;
   created_at?: string;
   updated_at?: string;
+}
+
+export function isRangeAlarmOperator(operator: AlarmOperator): boolean {
+  return RANGE_OPERATORS.has(operator);
+}
+
+export function alarmRuleRangeError(
+  payload: Pick<AlarmRuleWritePayload, 'operator' | 'threshold' | 'threshold_high'>,
+): string | null {
+  if (!isRangeAlarmOperator(payload.operator)) return null;
+  if (payload.threshold == null) return '区间规则必须填写阈值下限';
+  if (payload.threshold_high == null) return '区间规则必须填写阈值上限';
+  if (payload.threshold_high < payload.threshold) return '阈值上限不能小于阈值下限';
+  return null;
+}
+
+function assertValidAlarmRuleRange(payload: AlarmRuleWritePayload): void {
+  const validationError = alarmRuleRangeError(payload);
+  if (validationError) throw new Error(validationError);
 }
 
 export async function fetchAlarms(
@@ -83,6 +104,7 @@ export async function createAlarmRule(
   payload: AlarmRuleWritePayload,
   signal?: AbortSignal,
 ): Promise<AlarmRule> {
+  assertValidAlarmRuleRange(payload);
   const response = await apiClient.post<AlarmRule>(
     '/acquisition/alarm-rules/',
     payload,
@@ -96,6 +118,7 @@ export async function updateAlarmRule(
   payload: AlarmRuleWritePayload,
   signal?: AbortSignal,
 ): Promise<AlarmRule> {
+  assertValidAlarmRuleRange(payload);
   const response = await apiClient.patch<AlarmRule>(
     `/acquisition/alarm-rules/${id}/`,
     payload,

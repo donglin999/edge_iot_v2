@@ -15,14 +15,18 @@ import {
 
 import AlarmsPage from './AlarmsPage.vue';
 
-vi.mock('@/services/alarmApi', () => ({
-  acknowledgeAlarm: vi.fn(),
-  createAlarmRule: vi.fn(),
-  deleteAlarmRule: vi.fn(),
-  fetchAlarmRules: vi.fn(),
-  fetchAlarms: vi.fn(),
-  updateAlarmRule: vi.fn(),
-}));
+vi.mock('@/services/alarmApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/alarmApi')>();
+  return {
+    ...actual,
+    acknowledgeAlarm: vi.fn(),
+    createAlarmRule: vi.fn(),
+    deleteAlarmRule: vi.fn(),
+    fetchAlarmRules: vi.fn(),
+    fetchAlarms: vi.fn(),
+    updateAlarmRule: vi.fn(),
+  };
+});
 
 const alarmRecords: AlarmRecord[] = [
   {
@@ -114,38 +118,125 @@ describe('AlarmsPage', () => {
     pending.resolve(alarmRecords);
 
     expect(await screen.findByText('当前有 1 个未确认告警')).toBeInTheDocument();
-    expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    await waitFor(() => {
+      expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    });
     expect(screen.getByText('温度高')).toBeInTheDocument();
-    expect(screen.getByText('设备连接中断')).toBeInTheDocument();
+    expect(await screen.findByText('设备连接中断')).toBeInTheDocument();
     expect(screen.getByText('连接')).toBeInTheDocument();
     expect(screen.getByText('91.2')).toBeInTheDocument();
   });
 
-  it('filters records and acknowledges a firing alarm with a refresh', async () => {
+  it('renders alarm results without waiting for the rule request', async () => {
+    const pendingRules = deferred<AlarmRule[]>();
+    vi.mocked(fetchAlarmRules).mockReturnValueOnce(pendingRules.promise);
+
+    render(TestHost);
+
+    expect(await screen.findByText('当前有 1 个未确认告警')).toBeInTheDocument();
+    expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('tab', { name: '阈值规则 (0)' })).toBeInTheDocument();
+
+    pendingRules.resolve(alarmRules);
+    await waitFor(() => {
+      expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    });
+    expect(screen.getByRole('tab', { name: '阈值规则 (1)' })).toBeInTheDocument();
+  });
+
+  it('renders rule results without waiting for the alarm request', async () => {
+    const pendingAlarms = deferred<AlarmRecord[]>();
+    vi.mocked(fetchAlarms).mockReturnValueOnce(pendingAlarms.promise);
+
+    render(TestHost);
+
+    expect(await screen.findByRole('tab', { name: '阈值规则 (1)' })).toBeInTheDocument();
+    expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('tab', { name: '告警记录 (0)' })).toBeInTheDocument();
+
+    pendingAlarms.resolve(alarmRecords);
+    expect(await screen.findByText('当前有 1 个未确认告警')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    });
+  });
+
+  it('replaces rows with the real acked-only response when filtering', async () => {
     render(TestHost);
     await screen.findByText('当前有 1 个未确认告警');
 
+    vi.mocked(fetchAlarms).mockResolvedValueOnce([alarmRecords[1]!]);
     await fireEvent.click(screen.getByRole('radio', { name: '已确认' }));
     await waitFor(() => {
       expect(fetchAlarms).toHaveBeenLastCalledWith('acked', expect.any(AbortSignal));
     });
+    await waitFor(() => {
+      expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    });
 
+    expect(screen.getByText('设备连接中断')).toBeInTheDocument();
+    expect(screen.queryByText('温度高')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '确认告警 1' })).not.toBeInTheDocument();
+    expect(screen.queryByText('当前有 1 个未确认告警')).not.toBeInTheDocument();
+  });
+
+  it('acknowledges from the firing view and refreshes to the acked state', async () => {
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+
+    vi.mocked(fetchAlarms).mockResolvedValueOnce(
+      alarmRecords.map((alarm) => ({ ...alarm, status: 'acked' })),
+    );
     await fireEvent.click(screen.getByRole('button', { name: '确认告警 1' }));
     await waitFor(() => {
       expect(acknowledgeAlarm).toHaveBeenCalledWith(1, expect.any(AbortSignal));
     });
-    expect(fetchAlarms).toHaveBeenCalledTimes(3);
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: '确认告警 1' })).not.toBeInTheDocument();
+    });
+    expect(fetchAlarms).toHaveBeenCalledTimes(2);
   });
 
-  it('shows the load failure without leaving the page in a busy state', async () => {
+  it('keeps rules available when alarm loading fails', async () => {
     vi.mocked(fetchAlarms).mockRejectedValueOnce(new Error('network down'));
 
     render(TestHost);
 
     expect(
-      await screen.findByText('告警数据加载失败：network down'),
+      await screen.findByText('告警记录加载失败：network down'),
     ).toBeInTheDocument();
     expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    expect(screen.getByRole('tab', { name: '阈值规则 (1)' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '告警记录 (0)' })).toBeInTheDocument();
+  });
+
+  it('keeps alarms available when rule loading fails', async () => {
+    vi.mocked(fetchAlarmRules).mockRejectedValueOnce(new Error('rules offline'));
+
+    render(TestHost);
+
+    expect(
+      await screen.findByText('告警规则加载失败：rules offline'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('当前有 1 个未确认告警')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '告警记录 (2)' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '阈值规则 (0)' })).toBeInTheDocument();
+  });
+
+  it('clears old rows when a new status filter fails', async () => {
+    render(TestHost);
+    await screen.findByText('温度高');
+
+    vi.mocked(fetchAlarms).mockRejectedValueOnce(new Error('acked unavailable'));
+    await fireEvent.click(screen.getByRole('radio', { name: '已确认' }));
+
+    expect(
+      await screen.findByText('告警记录加载失败：acked unavailable'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('温度高')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '确认告警 1' })).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '告警记录 (0)' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '阈值规则 (1)' })).toBeInTheDocument();
   });
 
   it('renders explicit alarm and rule empty states', async () => {
@@ -189,6 +280,50 @@ describe('AlarmsPage', () => {
           is_active: true,
           description: '压力超过安全值',
         },
+        expect.any(AbortSignal),
+      );
+    });
+  });
+
+  it('validates and submits a between rule as an ordered interval', async () => {
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
+
+    const dialog = await screen.findByRole('dialog');
+    await fireEvent.update(within(dialog).getByLabelText('规则名称'), '温度区间');
+    await fireEvent.update(within(dialog).getByLabelText('测点编码'), 'temperature');
+    await fireEvent.mouseDown(within(dialog).getByLabelText('操作符'));
+    await fireEvent.click(await screen.findByText('∈ 区间内'));
+    await fireEvent.update(within(dialog).getByLabelText('阈值'), '20');
+
+    const saveButton = within(dialog).getByRole('button', { name: /保\s*存/ });
+    await fireEvent.click(saveButton);
+    expect(
+      await within(dialog).findByText('区间规则必须填写阈值上限'),
+    ).toBeInTheDocument();
+    expect(createAlarmRule).not.toHaveBeenCalled();
+
+    await fireEvent.update(within(dialog).getByLabelText('阈值上限（区间）'), '10');
+    await fireEvent.click(saveButton);
+    expect(
+      await within(dialog).findByText('阈值上限不能小于阈值下限'),
+    ).toBeInTheDocument();
+    expect(createAlarmRule).not.toHaveBeenCalled();
+
+    await fireEvent.update(within(dialog).getByLabelText('阈值上限（区间）'), '25');
+    await fireEvent.click(saveButton);
+    await waitFor(() => {
+      expect(createAlarmRule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: '温度区间',
+          point_code: 'temperature',
+          operator: 'between',
+          threshold: 20,
+          threshold_high: 25,
+        }),
         expect.any(AbortSignal),
       );
     });

@@ -163,7 +163,9 @@ onBeforeUnmount(() => {
       <div>
         <div class="page-kicker">系统概览</div>
         <ATypographyTitle :level="3" class="page-title">数据采集平台</ATypographyTitle>
-        <ATypographyText type="secondary">实时监控和管理 IoT 设备数据采集</ATypographyText>
+        <ATypographyText type="secondary">
+          任务概览与最近运行：默认站点（site_code=default）；任务列表、设备与运行会话：全局接口口径。
+        </ATypographyText>
       </div>
       <AButton
         aria-label="刷新概览"
@@ -186,20 +188,20 @@ onBeforeUnmount(() => {
     <div class="metric-grid dashboard-section">
       <div>
         <ACard :bordered="false" :loading="initialLoading">
-          <AStatistic title="任务总数" :value="overview?.total_tasks ?? 0">
+          <AStatistic title="默认站点任务总数" :value="overview?.total_tasks ?? 0">
             <template #prefix><DatabaseOutlined /></template>
           </AStatistic>
         </ACard>
       </div>
       <div>
         <ACard :bordered="false" :loading="initialLoading">
-          <AStatistic title="启用任务" :value="overview?.active_tasks ?? 0" />
+          <AStatistic title="默认站点启用任务" :value="overview?.active_tasks ?? 0" />
         </ACard>
       </div>
       <div>
         <ACard :bordered="false" :loading="initialLoading">
           <AStatistic
-            title="运行中会话"
+            title="全局运行中会话"
             :value="runningCount"
             :value-style="{ color: runningCount > 0 ? '#52c41a' : undefined }"
           >
@@ -210,7 +212,7 @@ onBeforeUnmount(() => {
       <div>
         <ACard :bordered="false" :loading="initialLoading">
           <AStatistic
-            title="设备在线"
+            title="全局设备在线"
             :value="deviceStats.online"
             :suffix="`/ ${deviceStats.total}`"
             :value-style="{
@@ -225,7 +227,7 @@ onBeforeUnmount(() => {
 
     <div class="content-grid dashboard-section">
       <div>
-        <ACard :bordered="false" title="任务列表">
+        <ACard :bordered="false" title="全局任务列表">
           <template #extra>
             <RouterLink to="/acquisition">采集控制 <RightOutlined /></RouterLink>
           </template>
@@ -260,7 +262,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div>
-        <ACard :bordered="false" title="最近运行">
+        <ACard :bordered="false" title="默认站点最近运行">
           <AEmpty
             v-if="!initialLoading && !overview?.recent_runs.length"
             description="暂无运行记录 —— 启动采集任务后在此显示"

@@ -36,10 +36,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 
 import {
   acknowledgeAlarm,
+  alarmRuleRangeError,
   createAlarmRule,
   deleteAlarmRule,
   fetchAlarmRules,
   fetchAlarms,
+  isRangeAlarmOperator,
   updateAlarmRule,
   type AlarmRecord,
   type AlarmRule,
@@ -149,10 +151,13 @@ function blankRule(): AlarmRuleForm {
 const { message, modal } = AntApp.useApp();
 const alarms = ref<AlarmRecord[]>([]);
 const rules = ref<AlarmRule[]>([]);
-const loading = ref(true);
+const alarmLoading = ref(true);
+const ruleLoading = ref(true);
 const statusFilter = ref<AlarmStatusFilter>('all');
 const activeTab = ref<'alarms' | 'rules'>('alarms');
-const errorMessage = ref<string | null>(null);
+const alarmErrorMessage = ref<string | null>(null);
+const ruleErrorMessage = ref<string | null>(null);
+const actionErrorMessage = ref<string | null>(null);
 const acknowledgingId = ref<number | null>(null);
 const deletingRuleId = ref<number | null>(null);
 const savingRule = ref(false);
@@ -165,9 +170,11 @@ const mutationController = new AbortController();
 let loadController: AbortController | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+const loading = computed(() => alarmLoading.value || ruleLoading.value);
 const firingCount = computed(
   () => alarms.value.filter((alarm) => alarm.status === 'firing').length,
 );
+const rangeOperator = computed(() => isRangeAlarmOperator(ruleForm.operator));
 
 function statusMeta(status: string) {
   return STATUS_META[status] ?? { label: status || '未知', badge: 'default' as const };
@@ -207,33 +214,54 @@ function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : '未知错误';
 }
 
+function validateThresholdHigh(): Promise<void> {
+  const validationError = alarmRuleRangeError(rulePayload());
+  if (!validationError || validationError === '区间规则必须填写阈值下限') {
+    return Promise.resolve();
+  }
+  return Promise.reject(new Error(validationError));
+}
+
 async function refresh(): Promise<void> {
   loadController?.abort();
   const request = new AbortController();
   loadController = request;
-  loading.value = true;
-  errorMessage.value = null;
+  alarmLoading.value = true;
+  ruleLoading.value = true;
+  alarmErrorMessage.value = null;
+  ruleErrorMessage.value = null;
 
-  try {
-    const [alarmRecords, alarmRules] = await Promise.all([
-      fetchAlarms(statusFilter.value, request.signal),
-      fetchAlarmRules(request.signal),
-    ]);
-    if (request.signal.aborted || loadController !== request) return;
-    alarms.value = alarmRecords;
-    rules.value = alarmRules;
-  } catch (error) {
-    if (!request.signal.aborted && loadController === request) {
-      errorMessage.value = `告警数据加载失败：${errorDetail(error)}`;
-    }
-  } finally {
-    if (!request.signal.aborted && loadController === request) {
-      loading.value = false;
-    }
-  }
+  const isCurrentRequest = () => !request.signal.aborted && loadController === request;
+  const alarmRequest = fetchAlarms(statusFilter.value, request.signal)
+    .then((records) => {
+      if (isCurrentRequest()) alarms.value = records;
+    })
+    .catch((error: unknown) => {
+      if (!isCurrentRequest()) return;
+      alarms.value = [];
+      alarmErrorMessage.value = `告警记录加载失败：${errorDetail(error)}`;
+    })
+    .finally(() => {
+      if (isCurrentRequest()) alarmLoading.value = false;
+    });
+  const ruleRequest = fetchAlarmRules(request.signal)
+    .then((alarmRules) => {
+      if (isCurrentRequest()) rules.value = alarmRules;
+    })
+    .catch((error: unknown) => {
+      if (!isCurrentRequest()) return;
+      rules.value = [];
+      ruleErrorMessage.value = `告警规则加载失败：${errorDetail(error)}`;
+    })
+    .finally(() => {
+      if (isCurrentRequest()) ruleLoading.value = false;
+    });
+
+  await Promise.allSettled([alarmRequest, ruleRequest]);
 }
 
 async function ackAlarm(id: number): Promise<void> {
+  actionErrorMessage.value = null;
   acknowledgingId.value = id;
   try {
     await acknowledgeAlarm(id, mutationController.signal);
@@ -241,7 +269,7 @@ async function ackAlarm(id: number): Promise<void> {
     await refresh();
   } catch (error) {
     if (!mutationController.signal.aborted) {
-      errorMessage.value = `确认告警失败：${errorDetail(error)}`;
+      actionErrorMessage.value = `确认告警失败：${errorDetail(error)}`;
     }
   } finally {
     if (!mutationController.signal.aborted) acknowledgingId.value = null;
@@ -291,6 +319,7 @@ async function saveRule(): Promise<void> {
     return;
   }
 
+  actionErrorMessage.value = null;
   savingRule.value = true;
   try {
     if (editingRule.value) {
@@ -308,7 +337,7 @@ async function saveRule(): Promise<void> {
     await refresh();
   } catch (error) {
     if (!mutationController.signal.aborted) {
-      errorMessage.value = `保存规则失败：${errorDetail(error)}`;
+      actionErrorMessage.value = `保存规则失败：${errorDetail(error)}`;
     }
   } finally {
     if (!mutationController.signal.aborted) savingRule.value = false;
@@ -316,6 +345,7 @@ async function saveRule(): Promise<void> {
 }
 
 async function performDeleteRule(rule: AlarmRule): Promise<void> {
+  actionErrorMessage.value = null;
   deletingRuleId.value = rule.id;
   try {
     await deleteAlarmRule(rule.id, mutationController.signal);
@@ -323,7 +353,7 @@ async function performDeleteRule(rule: AlarmRule): Promise<void> {
     await refresh();
   } catch (error) {
     if (!mutationController.signal.aborted) {
-      errorMessage.value = `删除规则失败：${errorDetail(error)}`;
+      actionErrorMessage.value = `删除规则失败：${errorDetail(error)}`;
       throw error;
     }
   } finally {
@@ -340,7 +370,13 @@ function confirmDeleteRule(rule: AlarmRule): void {
   });
 }
 
-watch(statusFilter, () => void refresh());
+watch(statusFilter, () => {
+  // A new filter is a new result set. Never label rows from the previous
+  // filter as if they belonged to the new one while the request is pending.
+  alarms.value = [];
+  alarmErrorMessage.value = null;
+  void refresh();
+});
 
 onMounted(() => {
   void refresh();
@@ -383,11 +419,27 @@ onBeforeUnmount(() => {
     </ACard>
 
     <AAlert
-      v-if="errorMessage"
+      v-if="alarmErrorMessage"
       class="page-alert"
       type="error"
       show-icon
-      :message="errorMessage"
+      :message="alarmErrorMessage"
+    />
+
+    <AAlert
+      v-if="ruleErrorMessage"
+      class="page-alert"
+      type="error"
+      show-icon
+      :message="ruleErrorMessage"
+    />
+
+    <AAlert
+      v-if="actionErrorMessage"
+      class="page-alert"
+      type="error"
+      show-icon
+      :message="actionErrorMessage"
     />
 
     <AAlert
@@ -410,7 +462,7 @@ onBeforeUnmount(() => {
             row-key="id"
             :columns="alarmColumns"
             :data-source="alarms"
-            :loading="loading"
+            :loading="alarmLoading"
             :pagination="{ pageSize: 15, hideOnSinglePage: true }"
             :locale="{ emptyText: '无告警' }"
             :scroll="{ x: 1100 }"
@@ -464,7 +516,7 @@ onBeforeUnmount(() => {
             row-key="id"
             :columns="ruleColumns"
             :data-source="rules"
-            :loading="loading"
+            :loading="ruleLoading"
             :pagination="{ pageSize: 15, hideOnSinglePage: true }"
             :locale="{ emptyText: '尚未创建任何规则，点击右上「新建规则」开始' }"
             :scroll="{ x: 780 }"
@@ -570,7 +622,13 @@ onBeforeUnmount(() => {
             </AFormItem>
           </ACol>
           <ACol :xs="24" :md="8">
-            <AFormItem name="threshold_high" label="阈值上限（区间）">
+            <AFormItem
+              name="threshold_high"
+              label="阈值上限（区间）"
+              :required="rangeOperator"
+              :rules="[{ validator: validateThresholdHigh, trigger: ['change', 'blur'] }]"
+              extra="between/outside 必填，且不得小于阈值。"
+            >
               <AInputNumber v-model:value="ruleForm.threshold_high" class="full-width" />
             </AFormItem>
           </ACol>
