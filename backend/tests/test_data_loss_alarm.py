@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from acquisition import models as acq_models
+from acquisition.services import reporting
 from acquisition.protocols.mqtt import MQTTProtocol
 from acquisition.services import pipeline as pipeline_mod
 from acquisition.services.pipeline import ReadWorker
@@ -207,6 +208,46 @@ class TestWorkerDropTracking:
 
         worker._track_dropped_messages()
         assert worker.health["dropped_messages"] == 35
+
+    def test_failed_alarm_transitions_are_retried(self, monkeypatch):
+        worker = _make_worker()
+        proto = _PushProto()
+        worker.protocol = proto
+        raises = iter((None, object()))
+        clears = iter((None, 1))
+        monotonic_now = 100.0
+
+        monkeypatch.setattr(
+            reporting, "raise_system_alarm", lambda **_kwargs: next(raises),
+        )
+        monkeypatch.setattr(
+            reporting, "clear_system_alarm", lambda _dedup_key: next(clears),
+        )
+        monkeypatch.setattr(
+            pipeline_mod.time, "monotonic", lambda: monotonic_now,
+        )
+
+        proto.dropped_messages = 1
+        worker._track_dropped_messages()
+        assert worker._drop_alarm_raised is False
+        worker._track_dropped_messages()
+        assert worker._drop_alarm_raised is False
+
+        monotonic_now = 101.0
+        worker._track_dropped_messages()
+        assert worker._drop_alarm_raised is True
+
+        worker._last_drop_increase_at = time.time() - (
+            ReadWorker.DROP_ALARM_CLEAR_WINDOW_S + 1
+        )
+        worker._track_dropped_messages()
+        assert worker._drop_alarm_raised is True
+        worker._track_dropped_messages()
+        assert worker._drop_alarm_raised is True
+
+        monotonic_now = 102.0
+        worker._track_dropped_messages()
+        assert worker._drop_alarm_raised is False
 
 
 # ---------------------------------------------------------------------------

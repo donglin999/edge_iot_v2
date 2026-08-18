@@ -21,6 +21,7 @@ import pytest
 
 from acquisition import models as acq_models
 from acquisition.services import pipeline as pipeline_mod
+from acquisition.services import reporting
 from acquisition.services.pipeline import ReadWorker
 
 # pytest fixtures (create_session, ...)
@@ -299,3 +300,46 @@ class TestOfflineAlarmHelpers:
         assert acq_models.Alarm.objects.filter(
             dedup_key="connectivity:U-3",
         ).count() == 2
+
+    def test_failed_raise_keeps_guard_open_for_retry(self, monkeypatch):
+        worker = _make_worker(device_code="U-4")
+        outcomes = iter((None, object()))
+        calls = 0
+
+        def flaky_raise(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return next(outcomes)
+
+        monkeypatch.setattr(reporting, "raise_system_alarm", flaky_raise)
+
+        worker._raise_offline_alarm()
+        assert worker._offline_alarm_raised is False
+        worker._raise_offline_alarm()
+        assert worker._offline_alarm_raised is True
+        assert calls == 2
+
+    def test_failed_clear_stays_armed_and_retries_after_backoff(self, monkeypatch):
+        worker = _make_worker(device_code="U-5")
+        worker._offline_alarm_raised = True
+        outcomes = iter((None, 1))
+        calls = 0
+
+        def flaky_clear(_dedup_key):
+            nonlocal calls
+            calls += 1
+            return next(outcomes)
+
+        now = 100.0
+        monkeypatch.setattr(reporting, "clear_system_alarm", flaky_clear)
+        monkeypatch.setattr(pipeline_mod.time, "monotonic", lambda: now)
+
+        worker._clear_offline_alarm()
+        assert worker._offline_alarm_raised is True
+        worker._clear_offline_alarm()
+        assert calls == 1
+
+        now = 101.0
+        worker._clear_offline_alarm()
+        assert worker._offline_alarm_raised is False
+        assert calls == 2

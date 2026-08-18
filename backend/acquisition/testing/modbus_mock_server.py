@@ -134,6 +134,7 @@ class ModbusMockServer:
 
     # ------------------------------------------------------------------
     def start(self) -> None:
+        self._stop.clear()
         self._server.start()
         self._updater = threading.Thread(target=self._update_loop, daemon=True)
         self._updater.start()
@@ -144,6 +145,12 @@ class ModbusMockServer:
             self._server.stop()
         except Exception:  # noqa: BLE001
             pass
+        updater = self._updater
+        if updater is not None and updater is not threading.current_thread():
+            updater.join(timeout=2.0)
+            if updater.is_alive():
+                raise RuntimeError("Modbus mock updater did not stop")
+        self._updater = None
 
     # ------------------------------------------------------------------ writes
     def _slave(self, slave_id: Optional[int]):
