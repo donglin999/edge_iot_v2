@@ -135,36 +135,109 @@ class ModbusMockServer:
 
     # ------------------------------------------------------------------
     def start(self, timeout: float = 2.0) -> None:
-        """Start the TCP server and return only after its socket accepts.
+        """Start the TCP server and return only after *its own* socket accepts.
 
         ``modbus_tk.TcpServer.start()`` only launches a background thread; its
         bind/listen happens later in that thread.  Callers used to race that
         bind and occasionally saw ``ConnectionRefusedError`` immediately
         after ``start()`` (most visibly in the parameterized datatype suite).
+
+        A successful TCP connect alone is not a sufficient readiness signal:
+        another process can win the free-port race and answer that probe while
+        the modbus-tk thread is still alive but about to fail its own bind.
+        Therefore readiness is tied to the exact thread and listening socket
+        created by this ``TcpServer`` instance, both before and after the probe.
         """
         self._stop.clear()
-        self._server.start()
-        deadline = time.monotonic() + timeout
-        connect_host = "127.0.0.1" if self.host in {"", "0.0.0.0", "::"} else self.host
-        last_error: OSError | None = None
-        while time.monotonic() < deadline:
+        started_thread = getattr(self._server, "_thread", None)
+        try:
+            if not isinstance(started_thread, threading.Thread):
+                raise RuntimeError("modbus_tk server has no startable thread")
+            self._server.start()
+            deadline = time.monotonic() + timeout
+            connect_host = "127.0.0.1" if self.host in {"", "0.0.0.0", "::"} else self.host
+            last_error: OSError | None = None
+            while time.monotonic() < deadline:
+                listener, listener_error = self._own_listener(started_thread)
+                if listener is None:
+                    last_error = listener_error
+                else:
+                    try:
+                        with socket.create_connection((connect_host, self.port), timeout=0.1):
+                            confirmed, confirm_error = self._own_listener(started_thread)
+                            if confirmed is listener:
+                                break
+                            last_error = confirm_error or OSError(
+                                "modbus_tk listener changed during readiness probe"
+                            )
+                    except OSError as exc:
+                        last_error = exc
+                time.sleep(0.01)
+            else:
+                raise OSError(
+                    f"Modbus mock server did not listen on {connect_host}:{self.port} "
+                    f"within {timeout:.1f}s: {last_error}"
+                )
+            self._updater = threading.Thread(target=self._update_loop, daemon=True)
+            self._updater.start()
+        except BaseException:
+            # modbus-tk does not call _do_exit() when _do_init()/bind fails;
+            # stopping alone can therefore retain its failed socket.  Our
+            # stop() explicitly closes every socket owned by this instance.
+            self.stop()
+            raise
+
+    def _own_listener(
+        self, started_thread: threading.Thread
+    ) -> Tuple[socket.socket | None, OSError | None]:
+        """Return this server's listener only while its start thread is stable."""
+        current_thread = getattr(self._server, "_thread", None)
+        if current_thread is not started_thread or not started_thread.is_alive():
+            return None, OSError("modbus_tk server thread exited before readiness")
+
+        listener = getattr(self._server, "_sock", None)
+        if not isinstance(listener, socket.socket):
+            return None, OSError("modbus_tk server has not created its socket")
+        try:
+            if listener.fileno() < 0:
+                return None, OSError("modbus_tk server socket is closed")
+            bound = listener.getsockname()
+            if len(bound) < 2 or int(bound[1]) != self.port:
+                return None, OSError(
+                    f"modbus_tk server socket is bound to the wrong address: {bound}"
+                )
+        except OSError as exc:
+            return None, exc
+        # TcpServer._do_init() appends its listener to _sockets only after
+        # bind() and listen() both succeed.  Identity (rather than equality)
+        # ensures a foreign listener on the same address cannot satisfy this.
+        server_sockets = getattr(self._server, "_sockets", ())
+        if not any(candidate is listener for candidate in server_sockets):
+            return None, OSError("modbus_tk server socket is not listening")
+        return listener, None
+
+    def _close_server_sockets(self) -> None:
+        """Close sockets retained by modbus-tk after any startup failure."""
+        candidates = list(getattr(self._server, "_sockets", ()))
+        listener = getattr(self._server, "_sock", None)
+        if listener is not None:
+            candidates.append(listener)
+
+        seen: set[int] = set()
+        for candidate in candidates:
+            identity = id(candidate)
+            if identity in seen:
+                continue
+            seen.add(identity)
             try:
-                with socket.create_connection((connect_host, self.port), timeout=0.1):
-                    server_thread = getattr(self._server, "_thread", None)
-                    if server_thread is None or server_thread.is_alive():
-                        break
-                    last_error = OSError("modbus_tk server thread exited before readiness")
-            except OSError as exc:
-                last_error = exc
-            time.sleep(0.01)
-        else:
-            self._server.stop()
-            raise OSError(
-                f"Modbus mock server did not listen on {connect_host}:{self.port} "
-                f"within {timeout:.1f}s: {last_error}"
-            )
-        self._updater = threading.Thread(target=self._update_loop, daemon=True)
-        self._updater.start()
+                candidate.close()
+            except (AttributeError, OSError):
+                pass
+
+        # Keep modbus-tk's private state consistent with _do_exit() so a
+        # failed object can be started again and no closed descriptors linger.
+        self._server._sockets = []
+        self._server._sock = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -172,8 +245,14 @@ class ModbusMockServer:
             self._server.stop()
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            self._close_server_sockets()
         updater = self._updater
-        if updater is not None and updater is not threading.current_thread():
+        if (
+            updater is not None
+            and updater is not threading.current_thread()
+            and updater.is_alive()
+        ):
             updater.join(timeout=2.0)
             if updater.is_alive():
                 raise RuntimeError("Modbus mock updater did not stop")

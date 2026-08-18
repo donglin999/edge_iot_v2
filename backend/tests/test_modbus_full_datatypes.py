@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 import time
 from contextlib import closing
 from typing import Optional
@@ -98,6 +99,90 @@ def test_mock_server_start_returns_only_after_tcp_is_ready(monkeypatch):
         assert attempts >= 3
         with real_create_connection((srv.host, srv.port), timeout=0.5):
             pass
+    finally:
+        srv.stop()
+
+
+def _assert_mock_server_stopped(srv: ModbusMockServer) -> None:
+    assert srv._stop.is_set()
+    assert srv._updater is None
+    assert not srv._server._thread.is_alive()
+    assert srv._server._sock is None
+    assert srv._server._sockets == []
+
+
+def test_mock_server_rejects_foreign_listener_and_cleans_failed_bind(monkeypatch):
+    """A process winning the free-port race must not satisfy readiness."""
+    real_create_connection = socket.create_connection
+    port = _free_port()
+    foreign_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    foreign_listener.bind(("127.0.0.1", port))
+    foreign_listener.listen(5)
+
+    srv = ModbusMockServer(host="127.0.0.1", port=port, slave_ids=[1])
+    real_do_init = srv._server._do_init
+    bind_attempted = threading.Event()
+    failed_sockets = []
+
+    def delayed_failed_bind():
+        # Keep the modbus-tk thread alive long enough for the foreign listener
+        # to expose a connect-only readiness check, then attempt the real bind.
+        time.sleep(0.05)
+        bind_attempted.set()
+        try:
+            real_do_init()
+        finally:
+            failed_sockets.append(srv._server._sock)
+
+    monkeypatch.setattr(srv._server, "_do_init", delayed_failed_bind)
+    try:
+        with pytest.raises(OSError, match="did not listen"):
+            srv.start(timeout=0.2)
+
+        assert bind_attempted.is_set()
+        assert len(failed_sockets) == 1
+        assert failed_sockets[0].fileno() == -1
+        _assert_mock_server_stopped(srv)
+
+        # Cleanup is scoped to the failed modbus-tk instance; it must not
+        # disturb the unrelated process that owns the contested port.
+        with real_create_connection(("127.0.0.1", port), timeout=0.5):
+            pass
+    finally:
+        srv.stop()
+        foreign_listener.close()
+
+
+def test_mock_server_probe_timeout_closes_own_listener(monkeypatch):
+    """Even a post-bind readiness failure must close the owned listener."""
+    port = _free_port()
+    srv = ModbusMockServer(host="127.0.0.1", port=port, slave_ids=[1])
+    real_do_init = srv._server._do_init
+    owned_sockets = []
+
+    def capture_listener():
+        real_do_init()
+        owned_sockets.append(srv._server._sock)
+
+    def refuse_probe(*args, **kwargs):
+        raise ConnectionRefusedError("synthetic readiness failure")
+
+    monkeypatch.setattr(srv._server, "_do_init", capture_listener)
+    monkeypatch.setattr(
+        "acquisition.testing.modbus_mock_server.socket.create_connection",
+        refuse_probe,
+    )
+
+    try:
+        with pytest.raises(OSError, match="did not listen"):
+            srv.start(timeout=0.05)
+
+        assert len(owned_sockets) == 1
+        assert owned_sockets[0].fileno() == -1
+        _assert_mock_server_stopped(srv)
+        # The exact port can be rebound, proving the listener was released.
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+            probe.bind(("127.0.0.1", port))
     finally:
         srv.stop()
 
