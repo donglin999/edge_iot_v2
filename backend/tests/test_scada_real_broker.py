@@ -36,6 +36,14 @@ PRODUCT_KEY = "123daffb91264286adcdf3bfe55194c7"
 DEVICE_NAME = "A0201010001150403"
 
 
+def _wait_for_publisher_connection(pub, *, timeout: float = 10.0) -> None:
+    """Wait until paho has processed CONNACK before publishing test traffic."""
+    deadline = time.monotonic() + timeout
+    while not pub.is_connected() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pub.is_connected(), "publisher did not reconnect before the deadline"
+
+
 def _topic(code: str, product_key: str = PRODUCT_KEY, device_name: str = DEVICE_NAME) -> str:
     return f"/sys/{product_key}/device/{device_name}/thing/property/{code}/post"
 
@@ -63,12 +71,12 @@ def publisher(broker):
     pub = mqtt.Client()
     pub.connect(broker.host, broker.host_port, keepalive=10)
     pub.loop_start()
-    deadline = time.time() + 5
-    while not pub.is_connected() and time.time() < deadline:
-        time.sleep(0.05)
-    yield pub
-    pub.loop_stop()
-    pub.disconnect()
+    try:
+        _wait_for_publisher_connection(pub, timeout=5.0)
+        yield pub
+    finally:
+        pub.loop_stop()
+        pub.disconnect()
 
 
 def _publish_gateway(
@@ -359,8 +367,9 @@ class TestLegacyFallbackShapes:
 
 
 class TestReconnection:
-    def test_health_check_false_then_recovers(self, broker, publisher):
+    def test_health_check_false_then_recovers(self, broker):
         proto = _connect_protocol(broker)
+        recovered_publisher = None
         try:
             assert proto.health_check() is True
 
@@ -375,9 +384,20 @@ class TestReconnection:
             assert proto.connect() is True
             assert proto.health_check() is True
 
-            _publish_gateway(publisher, "AFTER_RECOVERY", "1")
+            # The publisher is only a test-data injector.  Create it after the
+            # broker restart and wait for CONNACK so this assertion measures
+            # SCADAProtocol recovery rather than paho's background reconnect
+            # timing for an unrelated, previously disconnected fixture.
+            recovered_publisher = mqtt.Client()
+            recovered_publisher.connect(broker.host, broker.host_port, keepalive=10)
+            recovered_publisher.loop_start()
+            _wait_for_publisher_connection(recovered_publisher)
+            _publish_gateway(recovered_publisher, "AFTER_RECOVERY", "1")
             res = _wait_and_read(proto, [{"code": "AFTER_RECOVERY", "data_type": "int"}])
             r = _by_code(res, "AFTER_RECOVERY")
             assert r is not None and r["value"] == 1
         finally:
+            if recovered_publisher is not None:
+                recovered_publisher.loop_stop()
+                recovered_publisher.disconnect()
             proto.disconnect()
