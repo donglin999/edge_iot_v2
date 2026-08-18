@@ -72,6 +72,19 @@ const alarmRules: AlarmRule[] = [
   },
 ];
 
+const inactiveRangeDraft: AlarmRule = {
+  id: 22,
+  name: '温度区间草稿',
+  point_code: 'temperature',
+  device_code: '',
+  operator: 'between',
+  threshold: null,
+  threshold_high: null,
+  severity: 'warning',
+  is_active: false,
+  description: '阈值待补充',
+};
+
 const TestHost = defineComponent({
   name: 'AlarmsPageTestHost',
   setup: () => () => h(AntApp, null, { default: () => h(AlarmsPage) }),
@@ -329,6 +342,74 @@ describe('AlarmsPage', () => {
     const updateSignal = vi.mocked(updateAlarmRule).mock.calls[0]![2];
     expect(updateSignal).toBeInstanceOf(AbortSignal);
     expect(updateSignal?.aborted).toBe(false);
+  });
+
+  it('creates an inactive range draft without requiring either threshold', async () => {
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
+
+    const dialog = await screen.findByRole('dialog');
+    await fireEvent.update(within(dialog).getByLabelText('规则名称'), '停用区间草稿');
+    await fireEvent.update(within(dialog).getByLabelText('测点编码'), 'temperature');
+    await fireEvent.mouseDown(within(dialog).getByLabelText('操作符'));
+    await fireEvent.click(await screen.findByText('∈ 区间内'));
+    await fireEvent.click(within(dialog).getByRole('switch', { name: '启用规则' }));
+    await fireEvent.update(within(dialog).getByLabelText('描述'), '稍后补充阈值');
+    await fireEvent.click(within(dialog).getByRole('button', { name: /保\s*存/ }));
+
+    await waitFor(() => {
+      expect(createAlarmRule).toHaveBeenCalledWith(
+        {
+          name: '停用区间草稿',
+          point_code: 'temperature',
+          device_code: '',
+          operator: 'between',
+          threshold: null,
+          threshold_high: null,
+          severity: 'warning',
+          is_active: false,
+          description: '稍后补充阈值',
+        },
+        expect.any(AbortSignal),
+      );
+    });
+  });
+
+  it('edits an existing inactive range draft without forcing thresholds', async () => {
+    vi.mocked(fetchAlarmRules).mockResolvedValueOnce([inactiveRangeDraft]);
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await fireEvent.click(
+      screen.getByRole('button', { name: '编辑规则 温度区间草稿' }),
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('switch', { name: '启用规则' })).not.toBeChecked();
+    await fireEvent.update(within(dialog).getByLabelText('描述'), '继续保持停用');
+    await fireEvent.click(within(dialog).getByRole('button', { name: /保\s*存/ }));
+
+    await waitFor(() => {
+      expect(updateAlarmRule).toHaveBeenCalledWith(
+        22,
+        {
+          name: '温度区间草稿',
+          point_code: 'temperature',
+          device_code: '',
+          operator: 'between',
+          threshold: null,
+          threshold_high: null,
+          severity: 'warning',
+          is_active: false,
+          description: '继续保持停用',
+        },
+        expect.any(AbortSignal),
+      );
+    });
   });
 
   it('deletes a rule only after the confirmation dialog is accepted', async () => {

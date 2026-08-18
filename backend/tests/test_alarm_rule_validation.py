@@ -1,5 +1,7 @@
 """Server-side range validation for alarm-rule writes."""
 
+import math
+
 import pytest
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -9,6 +11,11 @@ from acquisition.views import AlarmRuleSerializer
 
 
 ALARM_RULES_URL = "/api/acquisition/alarm-rules/"
+NON_FINITE_STRINGS = ("NaN", "Infinity", "-Infinity")
+FINITE_FIELD_ERRORS = (
+    ("threshold", "阈值必须是有限数字。"),
+    ("threshold_high", "阈值上限必须是有限数字。"),
+)
 
 
 def rule_payload(**overrides):
@@ -83,6 +90,22 @@ def test_serializer_keeps_single_threshold_and_inactive_draft_compatible():
     assert inactive_draft.is_valid(), inactive_draft.errors
 
 
+@pytest.mark.parametrize(("field_name", "expected_message"), FINITE_FIELD_ERRORS)
+@pytest.mark.parametrize("value", NON_FINITE_STRINGS)
+def test_serializer_rejects_non_finite_thresholds_even_for_inactive_drafts(
+    field_name,
+    expected_message,
+    value,
+):
+    serializer = AlarmRuleSerializer(data=rule_payload(
+        is_active=False,
+        **{field_name: value},
+    ))
+
+    assert not serializer.is_valid()
+    assert serializer.errors[field_name] == [expected_message]
+
+
 def test_serializer_accepts_equal_range_bounds():
     serializer = AlarmRuleSerializer(data=rule_payload(
         threshold=20, threshold_high=20,
@@ -115,6 +138,26 @@ def test_api_create_rejects_active_range_without_upper_bound(api_client, operato
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert "threshold_high" in response.data
+    assert not acq_models.AlarmRule.objects.exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("field_name", "expected_message"), FINITE_FIELD_ERRORS)
+@pytest.mark.parametrize("value", NON_FINITE_STRINGS)
+def test_api_create_rejects_non_finite_threshold_without_writing(
+    api_client,
+    field_name,
+    expected_message,
+    value,
+):
+    response = api_client.post(
+        ALARM_RULES_URL,
+        rule_payload(**{field_name: value}),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.data[field_name] == [expected_message]
     assert not acq_models.AlarmRule.objects.exists()
 
 
@@ -153,6 +196,31 @@ def test_api_full_update_rejects_inverted_range_without_mutating_rule(api_client
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(("field_name", "expected_message"), FINITE_FIELD_ERRORS)
+@pytest.mark.parametrize("value", NON_FINITE_STRINGS)
+def test_api_full_update_rejects_non_finite_threshold_without_mutating_rule(
+    api_client,
+    field_name,
+    expected_message,
+    value,
+):
+    rule = acq_models.AlarmRule.objects.create(**rule_payload())
+
+    response = api_client.put(
+        f"{ALARM_RULES_URL}{rule.pk}/",
+        rule_payload(name="不应保存", **{field_name: value}),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.data[field_name] == [expected_message]
+    rule.refresh_from_db()
+    assert rule.name == "温度区间"
+    assert rule.threshold == 10
+    assert rule.threshold_high == 20
+
+
+@pytest.mark.django_db
 def test_api_partial_update_rejects_effective_inverted_range(api_client):
     rule = acq_models.AlarmRule.objects.create(**rule_payload())
 
@@ -166,6 +234,56 @@ def test_api_partial_update_rejects_effective_inverted_range(api_client):
     assert "threshold_high" in response.data
     rule.refresh_from_db()
     assert rule.threshold == 10
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("field_name", "expected_message"), FINITE_FIELD_ERRORS)
+@pytest.mark.parametrize("value", NON_FINITE_STRINGS)
+def test_api_partial_update_rejects_non_finite_threshold_without_mutating_rule(
+    api_client,
+    field_name,
+    expected_message,
+    value,
+):
+    rule = acq_models.AlarmRule.objects.create(**rule_payload())
+
+    response = api_client.patch(
+        f"{ALARM_RULES_URL}{rule.pk}/",
+        {"name": "不应保存", field_name: value},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.data[field_name] == [expected_message]
+    rule.refresh_from_db()
+    assert rule.name == "温度区间"
+    assert rule.threshold == 10
+    assert rule.threshold_high == 20
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("field_name", "expected_message"), FINITE_FIELD_ERRORS)
+def test_api_partial_update_validates_unchanged_effective_thresholds(
+    api_client,
+    field_name,
+    expected_message,
+):
+    rule = acq_models.AlarmRule.objects.create(**rule_payload(
+        is_active=False,
+        **{field_name: math.inf},
+    ))
+
+    response = api_client.patch(
+        f"{ALARM_RULES_URL}{rule.pk}/",
+        {"description": "不应保存"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.data[field_name] == [expected_message]
+    rule.refresh_from_db()
+    assert rule.description == "安全区间"
+    assert math.isinf(getattr(rule, field_name))
 
 
 @pytest.mark.django_db

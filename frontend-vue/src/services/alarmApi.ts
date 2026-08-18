@@ -47,9 +47,12 @@ export function isRangeAlarmOperator(operator: AlarmOperator): boolean {
 }
 
 export function alarmRuleRangeError(
-  payload: Pick<AlarmRuleWritePayload, 'operator' | 'threshold' | 'threshold_high'>,
+  payload: Pick<
+    AlarmRuleWritePayload,
+    'operator' | 'threshold' | 'threshold_high' | 'is_active'
+  >,
 ): string | null {
-  if (!isRangeAlarmOperator(payload.operator)) return null;
+  if (!payload.is_active || !isRangeAlarmOperator(payload.operator)) return null;
   if (payload.threshold == null) return '区间规则必须填写阈值下限';
   if (payload.threshold_high == null) return '区间规则必须填写阈值上限';
   if (payload.threshold_high < payload.threshold) return '阈值上限不能小于阈值下限';

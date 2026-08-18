@@ -616,7 +616,8 @@ onBeforeUnmount(() => {
             <AFormItem
               name="threshold"
               label="阈值"
-              :rules="[{ required: true, message: '请输入阈值' }]"
+              :required="ruleForm.is_active"
+              :rules="ruleForm.is_active ? [{ required: true, message: '请输入阈值' }] : []"
             >
               <AInputNumber v-model:value="ruleForm.threshold" class="full-width" />
             </AFormItem>
@@ -625,7 +626,7 @@ onBeforeUnmount(() => {
             <AFormItem
               name="threshold_high"
               label="阈值上限（区间）"
-              :required="rangeOperator"
+              :required="ruleForm.is_active && rangeOperator"
               :rules="[{ validator: validateThresholdHigh, trigger: ['change', 'blur'] }]"
               extra="between/outside 必填，且不得小于阈值。"
             >

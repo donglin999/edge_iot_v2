@@ -171,6 +171,44 @@ describe('alarm API', () => {
   );
 
   it.each(['between', 'outside'] as const)(
+    'preserves an incomplete inactive %s draft for create and update',
+    async (operator) => {
+      const payload: AlarmRuleWritePayload = {
+        name: '停用草稿',
+        point_code: 'temperature',
+        device_code: '',
+        operator,
+        threshold: null,
+        threshold_high: null,
+        severity: 'warning',
+        is_active: false,
+        description: '稍后补充阈值',
+      };
+      const postMock = vi
+        .spyOn(apiClient, 'post')
+        .mockResolvedValue({ data: { id: 31, ...payload } } as never);
+      const patchMock = vi
+        .spyOn(apiClient, 'patch')
+        .mockResolvedValue({ data: { id: 31, ...payload } } as never);
+
+      expect(alarmRuleRangeError(payload)).toBeNull();
+      await createAlarmRule(payload);
+      await updateAlarmRule(31, payload);
+
+      expect(postMock).toHaveBeenCalledWith(
+        '/acquisition/alarm-rules/',
+        payload,
+        { signal: undefined },
+      );
+      expect(patchMock).toHaveBeenCalledWith(
+        '/acquisition/alarm-rules/31/',
+        payload,
+        { signal: undefined },
+      );
+    },
+  );
+
+  it.each(['between', 'outside'] as const)(
     'preserves a valid %s payload exactly',
     async (operator) => {
       const payload: AlarmRuleWritePayload = {

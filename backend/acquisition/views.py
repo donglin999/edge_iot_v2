@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from typing import Dict, Any
@@ -1148,11 +1149,19 @@ class AlarmRuleSerializer(drf_serializers.ModelSerializer):
         attrs = super().validate(attrs)
         operator = self._effective_value(attrs, "operator")
         is_active = self._effective_value(attrs, "is_active")
+        threshold = self._effective_value(attrs, "threshold")
+        threshold_high = self._effective_value(attrs, "threshold_high")
+
+        for field_name, value, message in (
+            ("threshold", threshold, "阈值必须是有限数字。"),
+            ("threshold_high", threshold_high, "阈值上限必须是有限数字。"),
+        ):
+            if value is not None and not math.isfinite(value):
+                raise drf_serializers.ValidationError({field_name: message})
+
         if not is_active or operator not in self.RANGE_OPERATORS:
             return attrs
 
-        threshold = self._effective_value(attrs, "threshold")
-        threshold_high = self._effective_value(attrs, "threshold_high")
         if threshold is None:
             raise drf_serializers.ValidationError({
                 "threshold": "启用的区间规则必须填写阈值下限。",
