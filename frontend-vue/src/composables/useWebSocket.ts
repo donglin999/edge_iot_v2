@@ -33,7 +33,18 @@ export enum WebSocketStatus {
   ERROR = 'error',
 }
 
-const normalizeUrl = (url: string) => url.replace(/^http/, 'ws');
+export function resolveWebSocketUrl(
+  url: string,
+  baseUrl = window.location.href,
+): string {
+  const resolved = new URL(url, baseUrl);
+  if (resolved.protocol === 'http:') resolved.protocol = 'ws:';
+  if (resolved.protocol === 'https:') resolved.protocol = 'wss:';
+  if (resolved.protocol !== 'ws:' && resolved.protocol !== 'wss:') {
+    throw new TypeError(`Unsupported WebSocket protocol: ${resolved.protocol}`);
+  }
+  return resolved.toString();
+}
 
 export function useWebSocket(options: UseWebSocketOptions) {
   const status = ref(WebSocketStatus.DISCONNECTED);
@@ -79,7 +90,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     status.value = WebSocketStatus.CONNECTING;
 
     try {
-      const candidate = new WebSocket(normalizeUrl(toValue(options.url)));
+      const candidate = new WebSocket(resolveWebSocketUrl(toValue(options.url)));
       socket.value = candidate;
 
       candidate.onopen = () => {

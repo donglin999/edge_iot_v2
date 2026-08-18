@@ -1,7 +1,7 @@
 import { effectScope, nextTick, ref } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { useWebSocket, WebSocketStatus } from './useWebSocket';
+import { resolveWebSocketUrl, useWebSocket, WebSocketStatus } from './useWebSocket';
 
 class FakeWebSocket {
   static readonly CONNECTING = 0;
@@ -79,6 +79,18 @@ describe('useWebSocket', () => {
     expect(ws.sent).toEqual(['{"cursor":9}']);
 
     scope.stop();
+  });
+
+  it('resolves relative /ws paths against the page origin and upgrades HTTPS', () => {
+    expect(resolveWebSocketUrl('/ws/global/', 'http://console.test/devices')).toBe(
+      'ws://console.test/ws/global/',
+    );
+    expect(resolveWebSocketUrl('/ws/global/', 'https://console.test/devices')).toBe(
+      'wss://console.test/ws/global/',
+    );
+    expect(() => resolveWebSocketUrl('ftp://console.test/ws')).toThrow(
+      'Unsupported WebSocket protocol',
+    );
   });
 
   it('reconnects after the configured delay, but not after scope disposal', () => {
@@ -178,6 +190,7 @@ describe('useWebSocket', () => {
     const scope = effectScope();
     const api = scope.run(() => useWebSocket({ url: '/ws/global/', onMessage }))!;
     const ws = FakeWebSocket.instances[0]!;
+    expect(ws.url).toBe(`ws://${window.location.host}/ws/global/`);
     ws.open();
 
     ws.message('{not-json');
