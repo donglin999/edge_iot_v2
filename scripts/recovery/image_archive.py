@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -36,6 +38,44 @@ def _validate_parent(path: Path) -> tuple[int, int]:
     return _identity(metadata)
 
 
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _regular_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _assert_parent_identity(
+    path: Path, descriptor: int, expected: tuple[int, int]
+) -> None:
+    descriptor_stat = os.fstat(descriptor)
+    path_stat = os.lstat(path)
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or stat.S_ISLNK(path_stat.st_mode)
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or _identity(descriptor_stat) != expected
+        or _identity(path_stat) != expected
+    ):
+        raise ArchiveError("archive parent changed during held-fd operation")
+
+
+def _open_parent(path: Path, expected: tuple[int, int]) -> int:
+    descriptor = os.open(path, _directory_flags())
+    try:
+        _assert_parent_identity(path, descriptor, expected)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _validate_new_file(path_value: str, suffix: str) -> Path:
     path = Path(os.path.abspath(Path(path_value).expanduser()))
     if path.suffix != suffix:
@@ -63,17 +103,22 @@ def _open_regular(path: Path) -> tuple[int, tuple[int, int]]:
 
 def _sha256_fd(descriptor: int, expected: tuple[int, int]) -> str:
     before = os.fstat(descriptor)
-    if _identity(before) != expected:
+    if not stat.S_ISREG(before.st_mode) or _identity(before) != expected:
         raise ArchiveError("held archive descriptor changed identity")
-    os.lseek(descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
-    while True:
-        block = os.read(descriptor, 1024 * 1024)
+    offset = 0
+    while offset < before.st_size:
+        block = os.pread(descriptor, min(1024 * 1024, before.st_size - offset), offset)
         if not block:
-            break
+            raise ArchiveError("held archive ended while hashing")
         digest.update(block)
+        offset += len(block)
     after = os.fstat(descriptor)
-    if _identity(after) != expected or after.st_size != before.st_size:
+    if (
+        _identity(after) != expected
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
         raise ArchiveError("archive changed while hashing")
     return digest.hexdigest()
 
@@ -109,20 +154,138 @@ def _run(
         raise ArchiveError("Docker command failed; output suppressed")
 
 
-def _publish_held_file(stage: Path, descriptor: int, expected: tuple[int, int], target: Path) -> None:
-    if _identity(os.fstat(descriptor)) != expected or _identity(os.lstat(stage)) != expected:
-        raise ArchiveError("staging file identity changed before publication")
+def _ctypes_function(name: str):
+    library = ctypes.CDLL(None, use_errno=True)
     try:
-        os.link(stage, target, follow_symlinks=False)
+        return getattr(library, name)
+    except AttributeError as exc:
+        raise OSError(errno.ENOTSUP, f"{name} is unavailable") from exc
+
+
+def _call_linkat(
+    source_descriptor: int,
+    source_name: bytes,
+    destination_parent_descriptor: int,
+    destination_name: bytes,
+    flags: int,
+) -> None:
+    linkat = _ctypes_function("linkat")
+    linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    linkat.restype = ctypes.c_int
+    if linkat(
+        source_descriptor,
+        source_name,
+        destination_parent_descriptor,
+        destination_name,
+        flags,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number))
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _linux_publish_fd(
+    source_descriptor: int, parent_descriptor: int, destination_name: str
+) -> None:
+    encoded_name = os.fsencode(destination_name)
+    try:
+        _call_linkat(source_descriptor, b"", parent_descriptor, encoded_name, 0x1000)
+        return
+    except FileExistsError:
+        raise
+    except OSError as direct_error:
+        if not Path("/proc/self/fd").is_dir():
+            raise direct_error
+        try:
+            _call_linkat(
+                -100,
+                os.fsencode(f"/proc/self/fd/{source_descriptor}"),
+                parent_descriptor,
+                encoded_name,
+                0x400,
+            )
+            return
+        except FileExistsError:
+            raise
+        except OSError as fallback_error:
+            raise OSError(
+                fallback_error.errno,
+                f"linkat fd publication failed ({direct_error}); fallback failed: {fallback_error}",
+            ) from fallback_error
+
+
+def _darwin_publish_fd(
+    source_descriptor: int, parent_descriptor: int, destination_name: str
+) -> None:
+    fclonefileat = _ctypes_function("fclonefileat")
+    fclonefileat.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    fclonefileat.restype = ctypes.c_int
+    if fclonefileat(
+        source_descriptor, parent_descriptor, os.fsencode(destination_name), 0
+    ) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number))
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _platform_publish_fd(
+    source_descriptor: int, parent_descriptor: int, destination_name: str
+) -> None:
+    # This is the same fd-authoritative no-replace strategy used and heavily
+    # race-tested by scripts/backup/sqlite_backup.py.
+    if sys.platform.startswith("linux"):
+        _linux_publish_fd(source_descriptor, parent_descriptor, destination_name)
+        return
+    if sys.platform == "darwin":
+        _darwin_publish_fd(source_descriptor, parent_descriptor, destination_name)
+        return
+    raise OSError(errno.ENOTSUP, "fd-based no-replace publication is unsupported")
+
+
+def _publish_held_file(
+    descriptor: int,
+    expected_identity: tuple[int, int],
+    expected_digest: str,
+    target: Path,
+    parent_descriptor: int,
+    parent_identity: tuple[int, int],
+) -> None:
+    """Publish the held inode, never the mutable mkstemp pathname."""
+    _assert_parent_identity(target.parent, parent_descriptor, parent_identity)
+    if _sha256_fd(descriptor, expected_identity) != expected_digest:
+        raise ArchiveError("held staging digest changed before publication")
+    try:
+        _platform_publish_fd(descriptor, parent_descriptor, target.name)
     except FileExistsError as exc:
         raise ArchiveError("refusing to overwrite archive output") from exc
-    if _identity(os.lstat(target)) != expected:
-        raise ArchiveError("published file identity does not match held staging file")
-    directory = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise ArchiveError(f"fd-safe no-replace publication failed: {exc}") from exc
+
+    published_descriptor: Optional[int] = None
     try:
-        os.fsync(directory)
+        published_descriptor = os.open(
+            target.name, _regular_flags(), dir_fd=parent_descriptor
+        )
+        published_stat = os.fstat(published_descriptor)
+        path_stat = os.stat(
+            target.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        published_identity = _identity(published_stat)
+        if (
+            not stat.S_ISREG(published_stat.st_mode)
+            or _identity(path_stat) != published_identity
+        ):
+            raise ArchiveError("published path did not bind to one regular file")
+        if _sha256_fd(published_descriptor, published_identity) != expected_digest:
+            raise ArchiveError("published file digest does not match held staging file")
+        os.fsync(published_descriptor)
     finally:
-        os.close(directory)
+        if published_descriptor is not None:
+            os.close(published_descriptor)
+    os.fsync(parent_descriptor)
+    _assert_parent_identity(target.parent, parent_descriptor, parent_identity)
 
 
 def save_archive(args: argparse.Namespace) -> dict[str, object]:
@@ -136,12 +299,16 @@ def save_archive(args: argparse.Namespace) -> dict[str, object]:
     if archive.parent != checksum.parent:
         raise ArchiveError("archive and checksum must share one private parent")
     parent_identity = _validate_parent(archive.parent)
+    parent_descriptor = _open_parent(archive.parent, parent_identity)
 
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".m0-images-", suffix=".tar", dir=archive.parent)
-    stage = Path(temporary_name)
-    os.fchmod(descriptor, 0o600)
-    stage_identity = _identity(os.fstat(descriptor))
+    descriptor: Optional[int] = None
     try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".m0-images-", suffix=".tar", dir=archive.parent
+        )
+        stage = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        stage_identity = _identity(os.fstat(descriptor))
         _run(
             [args.docker_bin, "image", "save", *image_ids],
             stdout=descriptor,
@@ -153,7 +320,14 @@ def save_archive(args: argparse.Namespace) -> dict[str, object]:
         digest = _sha256_fd(descriptor, stage_identity)
         if _validate_parent(archive.parent) != parent_identity:
             raise ArchiveError("archive parent changed during image save")
-        _publish_held_file(stage, descriptor, stage_identity, archive)
+        _publish_held_file(
+            descriptor,
+            stage_identity,
+            digest,
+            archive,
+            parent_descriptor,
+            parent_identity,
+        )
 
         document = {
             "format_version": 1,
@@ -171,14 +345,22 @@ def save_archive(args: argparse.Namespace) -> dict[str, object]:
             payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
             _write_all(checksum_descriptor, payload)
             os.fsync(checksum_descriptor)
+            checksum_digest = _sha256_fd(checksum_descriptor, checksum_identity)
             _publish_held_file(
-                checksum_stage, checksum_descriptor, checksum_identity, checksum
+                checksum_descriptor,
+                checksum_identity,
+                checksum_digest,
+                checksum,
+                parent_descriptor,
+                parent_identity,
             )
         finally:
             os.close(checksum_descriptor)
         return {"operation": "save", "archive_sha256": digest, "image_ids": list(image_ids)}
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
 
 
 def load_archive(args: argparse.Namespace) -> dict[str, object]:

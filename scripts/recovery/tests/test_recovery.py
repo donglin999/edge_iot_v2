@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 RECOVERY_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,7 @@ def load_module(name: str, filename: str):
 safety = load_module("m0_safety", "safety.py")
 archive = load_module("m0_image_archive", "image_archive.py")
 smoke = load_module("m0_stack_smoke", "stack_smoke.py")
+celery_smoke = load_module("m0_celery_smoke", "celery_smoke.py")
 
 
 class SafetyTests(unittest.TestCase):
@@ -165,6 +167,50 @@ class ArchiveTests(unittest.TestCase):
                     )
                 )
 
+    def test_stage_path_replacement_cannot_redirect_fd_publication(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            os.chmod(root, 0o700)
+            docker = self._fake_docker(root)
+            ids = ["sha256:" + character * 64 for character in "abc"]
+            archive_path = root / "images.tar"
+            checksum_path = root / "images.json"
+            moved_stage = root / "held-stage-moved"
+            attacker_bytes = b"attacker-path-content"
+            held_bytes = b"held-fd-image-archive"
+            real_publish = archive._platform_publish_fd
+            replaced_path = None
+
+            def replace_stage_then_publish(source_fd, parent_fd, destination_name):
+                nonlocal replaced_path
+                if destination_name == archive_path.name:
+                    stages = list(root.glob(".m0-images-*.tar"))
+                    self.assertEqual(len(stages), 1)
+                    replaced_path = stages[0]
+                    stages[0].rename(moved_stage)
+                    stages[0].write_bytes(attacker_bytes)
+                return real_publish(source_fd, parent_fd, destination_name)
+
+            with mock.patch.object(
+                archive,
+                "_platform_publish_fd",
+                side_effect=replace_stage_then_publish,
+            ):
+                archive.save_archive(
+                    argparse.Namespace(
+                        image_id=ids,
+                        path=str(archive_path),
+                        checksum=str(checksum_path),
+                        docker_bin=str(docker),
+                        timeout=10.0,
+                    )
+                )
+
+            self.assertIsNotNone(replaced_path)
+            self.assertEqual(replaced_path.read_bytes(), attacker_bytes)
+            self.assertEqual(moved_stage.read_bytes(), held_bytes)
+            self.assertEqual(archive_path.read_bytes(), held_bytes)
+
 
 class SmokeHelpersTests(unittest.TestCase):
     def test_result_list_supports_paginated_and_plain_shapes(self):
@@ -176,6 +222,44 @@ class SmokeHelpersTests(unittest.TestCase):
     def test_websocket_rejects_non_loopback_target(self):
         with self.assertRaises(smoke.SmokeError):
             smoke.websocket_first_message("http://example.com:80")
+
+    def test_celery_reports_bind_exact_node_and_queue(self):
+        node = "m0-acq@m0ci-run-123456-acq"
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            ping = root / "ping.json"
+            queues = root / "queues.json"
+            ping.write_text(
+                '{"m0-acq@m0ci-run-123456-acq":{"ok":"pong"}}',
+                encoding="utf-8",
+            )
+            queues.write_text(
+                '{"m0-acq@m0ci-run-123456-acq":[{"name":"acquisition"}]}',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                celery_smoke.validate_reports(ping, queues, node, "acquisition"),
+                {"node": node, "ping": "pong", "active_queue": "acquisition"},
+            )
+
+            ping.write_text(
+                '{"m0-acq@m0ci-run-123456-acq":{"ok":"pong"},'
+                '"unexpected@worker":{"ok":"pong"}}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(celery_smoke.CelerySmokeError):
+                celery_smoke.validate_reports(ping, queues, node, "acquisition")
+
+            ping.write_text(
+                '{"m0-acq@m0ci-run-123456-acq":{"ok":"pong"}}',
+                encoding="utf-8",
+            )
+            queues.write_text(
+                '{"m0-acq@m0ci-run-123456-acq":[{"name":"short"}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(celery_smoke.CelerySmokeError):
+                celery_smoke.validate_reports(ping, queues, node, "acquisition")
 
 
 if __name__ == "__main__":

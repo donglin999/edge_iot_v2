@@ -9,15 +9,18 @@
 ## 隔离边界
 
 - Compose project 必须匹配 `m0ci-…` 且在启动前不存在任何同 project 容器、卷或网络。
-- Compose 文件不允许 `container_name`、`network_mode: host` 或 external resource；唯一网络是
-  `internal: true` 的 bridge。
+- Compose 文件不允许 `container_name`、`network_mode: host` 或 external resource；应用网络是
+  `internal: true` 的 bridge。DinD 另建仅属于本 project 的 internal bridge，并在结束时按
+  Docker 返回的 network ID 精确删除。
 - Web 与 Influx 的随机宿主端口只绑定 `127.0.0.1`。Redis、Django、Celery 不发布端口。
 - SQLite、Influx data/config 都使用 project 私有新卷。退出 trap 只删除这个已验证 project
   的资源，从不调用 prune，也不按模糊名称删除资源。
 - 所有镜像必须先显式 prepare；演练收到的引用只能是六个 `sha256:<64 hex>` immutable ID。
   Compose 每个服务均设置 `pull_policy: never`，演练阶段不 build、不 pull。
 - evidence 必须是指定私有根目录的全新直接子目录，名称包含 project，创建后权限精确为
-  `0700`。随机 Influx token 文件为 `0600`，不上传为 CI artifact。
+  `0700`。随机 Influx token 以 `0600` 独立放在 allowed-root，不位于 evidence 可写树内，
+  trap 只在 device/inode 一致时删除。Django secret 与 Influx 初始化密码同样逐次随机生成。
+- 所有服务都有 CPU、memory、pids 上限；DinD 额外使用 `768m/1.5 CPU/512 pids` 上限。
 
 ## 实际验证链
 
@@ -26,19 +29,24 @@
 2. 使用现有 `scripts/backup/sqlite_backup.py` 对 WAL 安全在线备份，再恢复到全新
    `/data/restored.sqlite3`；回滚服务只读取恢复文件。
 3. 在全新 InfluxDB OSS 2.x 写入纳秒时间戳的 `temperature=42.5`，使用现有 wrapper 做
-   real backup、checksum verify，并 restore 到事前不存在的 `m0-restored` bucket；再次查询
-   精确已知值。
+   real backup、checksum verify；restore 前用 `--limit 0` 成功枚举 org 全部 bucket 并在本地
+   精确确认 `m0-restored` 不存在，再恢复到该新 bucket 并查询精确已知值。
 4. 将 backend、web、Redis 三个 immutable ID 通过 held-fd 写入新 tar 并生成 SHA-256
-   scope 文档；held-fd 复验后将其 load 到独立、空白 DinD daemon，并逐个 inspect 原 ID。
+   scope 文档；Linux 使用 `linkat(fd)`、Darwin 使用 `fclonefileat(fd)`，不解析可变 staging
+   pathname。held-fd 复验后将其 load 到独立、空白 DinD daemon，并逐个 inspect 原 ID。
 5. 用恢复后的 SQLite、恢复后的 Influx bucket 以及 SHA-pinned backend/web/Redis 启动回滚栈。
    对每个运行容器重新核对顶层 `.Image`。
 6. 经 Nginx 真实执行 SPA HTTP、Site/Session/DataPoint/Alarm API、RFC 6455 WebSocket upgrade
-   与首帧内容检查；同时检查 Celery worker ping。
+   与恢复后初始首帧读取。这只证明**恢复后的静态事实源可读**，不声称验证实时采集、动态告警
+   或消息推送链路。
+7. 分别定向完整唯一节点名检查 acquisition 与 short 两个 Celery worker 的 ping，并检查
+   `active_queues` 确实为 `acquisition` / `short`，不以单个模糊 `pong` 代替双 worker 验收。
 
 成功证据在 `summary.json` 汇总；CI artifact 还保留 SQLite/Influx wrapper 报告、archive
-checksum 文档、DinD load 报告和全栈 smoke 报告。大体积镜像 tar 与一次性 token 明确排除
-上传。Influx restore wrapper 按安全设计保留只读 restore staging，随 project/evidence 生命周期
-结束，不会触碰源 bucket。
+checksum 文档、DinD load 报告和静态事实源 smoke 报告。大体积镜像 tar 不上传；token 从未
+进入 evidence。上传前会对所有候选普通文件进行三项一次性凭据的精确字节扫描，只有完整演练
+成功且扫描无命中才调用 artifact action。Influx restore wrapper 按安全设计保留只读 restore
+staging，随 project/evidence 生命周期结束，不会触碰源 bucket。
 
 ## 本地运行
 

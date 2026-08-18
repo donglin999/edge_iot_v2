@@ -1,7 +1,7 @@
 x-backend-environment: &backend-environment
   DJANGO_SETTINGS_MODULE: control_plane.settings
   DJANGO_DB_NAME: /data/restored.sqlite3
-  SECRET_KEY: m0-ci-disposable-secret-not-for-production
+  SECRET_KEY: ${M0_DJANGO_SECRET_KEY:?ephemeral Django secret required}
   DEBUG: "False"
   ALLOWED_HOSTS: 127.0.0.1,localhost,web,django
   REDIS_HOST: redis
@@ -15,8 +15,24 @@ x-backend-environment: &backend-environment
   INFLUXDB_BUCKET: m0-restored
   INFLUX_SPILL_DB_PATH: /data/influx-spill.sqlite3
 
+x-light-limits: &light-limits
+  mem_limit: 128m
+  cpus: 0.50
+  pids_limit: 128
+
+x-backend-limits: &backend-limits
+  mem_limit: 512m
+  cpus: 1.00
+  pids_limit: 256
+
+x-influx-limits: &influx-limits
+  mem_limit: 768m
+  cpus: 1.50
+  pids_limit: 512
+
 services:
   redis:
+    <<: *light-limits
     image: ${M0_REDIS_IMAGE_ID:?immutable Redis ID required}
     pull_policy: never
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -28,12 +44,13 @@ services:
       retries: 30
 
   influx:
+    <<: *influx-limits
     image: ${M0_INFLUX_IMAGE_ID:?immutable Influx ID required}
     pull_policy: never
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: m0-ci-admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: m0-ci-disposable-password
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${M0_INFLUX_INIT_PASSWORD:?ephemeral init password required}
       DOCKER_INFLUXDB_INIT_ORG: m0-ci
       DOCKER_INFLUXDB_INIT_BUCKET: m0-source
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${M0_INFLUX_TOKEN:?ephemeral drill token required}
@@ -53,6 +70,7 @@ services:
       retries: 60
 
   volume-init:
+    <<: *backend-limits
     image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
     pull_policy: never
     profiles: [prep]
@@ -64,6 +82,7 @@ services:
     networks: [drill]
 
   migrate:
+    <<: *backend-limits
     image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
     pull_policy: never
     profiles: [prep]
@@ -76,6 +95,7 @@ services:
     networks: [drill]
 
   seed:
+    <<: *backend-limits
     image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
     pull_policy: never
     profiles: [prep]
@@ -89,6 +109,7 @@ services:
     networks: [drill]
 
   recovery-tool:
+    <<: *backend-limits
     image: ${M0_TOOL_IMAGE_ID:?immutable recovery tool ID required}
     pull_policy: never
     profiles: [tools]
@@ -104,6 +125,7 @@ services:
     networks: [drill]
 
   django:
+    <<: *backend-limits
     image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
     pull_policy: never
     user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
@@ -125,11 +147,13 @@ services:
       retries: 60
 
   celery-acq:
+    <<: *backend-limits
     image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
     pull_policy: never
     user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
     environment: *backend-environment
-    command: ["celery", "-A", "control_plane", "worker", "-l", "warning", "--pool=solo", "--concurrency=1", "-Q", "acquisition", "-n", "m0-acq@%h"]
+    hostname: "${COMPOSE_PROJECT_NAME:?project required}-acq"
+    command: ["celery", "-A", "control_plane", "worker", "-l", "warning", "--pool=solo", "--concurrency=1", "-Q", "acquisition", "-n", "m0-acq@${COMPOSE_PROJECT_NAME:?project required}-acq"]
     volumes:
       - app-db:/data
       - app-logs:/app/logs
@@ -141,11 +165,13 @@ services:
         condition: service_healthy
 
   celery-short:
+    <<: *backend-limits
     image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
     pull_policy: never
     user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
     environment: *backend-environment
-    command: ["celery", "-A", "control_plane", "worker", "-l", "warning", "--pool=solo", "--concurrency=1", "-Q", "short", "-n", "m0-short@%h"]
+    hostname: "${COMPOSE_PROJECT_NAME:?project required}-short"
+    command: ["celery", "-A", "control_plane", "worker", "-l", "warning", "--pool=solo", "--concurrency=1", "-Q", "short", "-n", "m0-short@${COMPOSE_PROJECT_NAME:?project required}-short"]
     volumes:
       - app-db:/data
       - app-logs:/app/logs
@@ -157,6 +183,7 @@ services:
         condition: service_healthy
 
   web:
+    <<: *light-limits
     image: ${M0_WEB_IMAGE_ID:?immutable web ID required}
     pull_policy: never
     environment:

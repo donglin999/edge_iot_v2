@@ -412,6 +412,115 @@ class InfluxBackupTests(unittest.TestCase):
                 any(call[0][1] == "restore" for call in identity_fake.calls)
             )
 
+    def test_bucket_absence_enumerates_org_and_matches_exact_name(self) -> None:
+        missing = FakeInflux(
+            bucket_list=[
+                {"name": "Record_m0_restore_old"},
+                {"name": "Record"},
+            ]
+        )
+        with mock.patch.object(
+            influx_backup.subprocess, "run", side_effect=missing
+        ):
+            influx_backup.assert_bucket_absent(
+                "fake-influx",
+                "http://127.0.0.1:8086",
+                "Midea",
+                "Record_m0_restore",
+                "unit-test-secret",
+                10.0,
+            )
+        bucket_calls = [call for call, _ in missing.calls if call[1] == "bucket"]
+        self.assertEqual(len(bucket_calls), 1)
+        self.assertNotIn("--name", bucket_calls[0])
+        self.assertIn("--limit", bucket_calls[0])
+        self.assertEqual(
+            bucket_calls[0][bucket_calls[0].index("--limit") + 1], "0"
+        )
+        self.assertEqual(bucket_calls[0][-1], "--json")
+
+        existing = FakeInflux(
+            bucket_list=[{"name": "Record_m0_restore"}]
+        )
+        with mock.patch.object(
+            influx_backup.subprocess, "run", side_effect=existing
+        ), self.assertRaisesRegex(influx_backup.BackupError, "existing bucket"):
+            influx_backup.assert_bucket_absent(
+                "fake-influx",
+                "http://127.0.0.1:8086",
+                "Midea",
+                "Record_m0_restore",
+                "unit-test-secret",
+                10.0,
+            )
+
+    def test_bucket_absence_rejects_abnormal_enumeration_response(self) -> None:
+        for payload in (
+            {"unexpected": []},
+            "not-a-list",
+            ["not-a-bucket-object"],
+            [{"id": "missing-name"}],
+            [{"name": 42}],
+        ):
+            with self.subTest(payload=payload):
+                fake = FakeInflux(bucket_list=payload)
+                with mock.patch.object(
+                    influx_backup.subprocess, "run", side_effect=fake
+                ), self.assertRaisesRegex(
+                    influx_backup.BackupError, "unrecognized bucket-list response"
+                ):
+                    influx_backup.assert_bucket_absent(
+                        "fake-influx",
+                        "http://127.0.0.1:8086",
+                        "Midea",
+                        "Record_m0_restore",
+                        "unit-test-secret",
+                        10.0,
+                    )
+
+        def fail_unfiltered_enumeration(command, **kwargs):
+            self.assertNotIn("--name", command)
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="enumeration failed"
+            )
+
+        with mock.patch.object(
+            influx_backup.subprocess,
+            "run",
+            side_effect=fail_unfiltered_enumeration,
+        ), self.assertRaisesRegex(influx_backup.BackupError, "influx bucket failed"):
+            influx_backup.assert_bucket_absent(
+                "fake-influx",
+                "http://127.0.0.1:8086",
+                "Midea",
+                "Record_m0_restore",
+                "unit-test-secret",
+                10.0,
+            )
+
+        def return_invalid_json(command, **kwargs):
+            self.assertNotIn("--name", command)
+            return subprocess.CompletedProcess(
+                command, 0, stdout="not-json", stderr=""
+            )
+
+        with mock.patch.object(
+            influx_backup.subprocess,
+            "run",
+            side_effect=return_invalid_json,
+        ), self.assertRaisesRegex(
+            influx_backup.BackupError,
+            "could not determine whether restore bucket exists",
+        ):
+            influx_backup.assert_bucket_absent(
+                "fake-influx",
+                "http://127.0.0.1:8086",
+                "Midea",
+                "Record_m0_restore",
+                "unit-test-secret",
+                10.0,
+            )
+
     def test_checksum_tampering_and_special_entries_are_detected(self) -> None:
         # Keep this on a local filesystem so mkfifo exercises a real special
         # entry rather than a mocked stat result.

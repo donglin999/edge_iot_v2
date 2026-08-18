@@ -77,7 +77,9 @@ jobs:
             --evidence "$evidence"
 
       - name: Upload non-secret drill evidence
-        if: always() && env.M0_EVIDENCE_PATH != ''
+        # A failed drill may have stopped before the exact-byte credential
+        # scan.  Only a fully successful run is eligible for artifact upload.
+        if: success() && env.M0_EVIDENCE_PATH != ''
         uses: actions/upload-artifact@v4
         with:
           name: m0-recovery-evidence-${{ github.run_id }}-${{ github.run_attempt }}
@@ -85,6 +87,5 @@ jobs:
           retention-days: 14
           path: |
             ${{ env.M0_EVIDENCE_PATH }}/**
-            !${{ env.M0_EVIDENCE_PATH }}/influx.token
             !${{ env.M0_EVIDENCE_PATH }}/rollback-images.tar
             !${{ env.M0_EVIDENCE_PATH }}/.m0-*

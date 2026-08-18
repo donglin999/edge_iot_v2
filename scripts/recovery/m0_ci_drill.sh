@@ -68,46 +68,145 @@ if docker container inspect "$DIND_NAME" >/dev/null 2>&1; then
   echo "SAFETY ERROR: disposable DinD name already exists" >&2
   exit 2
 fi
-
-install -d -m 0700 -- "$EVIDENCE_ROOT"
-python3 "$SAFETY" private-directory "$EVIDENCE_ROOT"
-M0_TOKEN_FILE="$EVIDENCE_ROOT/influx.token"
-python3 - "$M0_TOKEN_FILE" <<'PY'
-import os
-import secrets
-import sys
-
-path = sys.argv[1]
-descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    os.write(descriptor, (secrets.token_urlsafe(48) + "\n").encode())
-    os.fsync(descriptor)
-finally:
-    os.close(descriptor)
-PY
-chmod 0600 -- "$M0_TOKEN_FILE"
-IFS= read -r M0_INFLUX_TOKEN < "$M0_TOKEN_FILE"
-test -n "$M0_INFLUX_TOKEN"
+DIND_NETWORK_NAME="${PROJECT}-dind-net"
+if docker network inspect "$DIND_NETWORK_NAME" >/dev/null 2>&1; then
+  echo "SAFETY ERROR: disposable DinD network already exists" >&2
+  exit 2
+fi
+M0_TOKEN_FILE="$ALLOWED_ROOT/.${PROJECT}.influx.token"
+if test -e "$M0_TOKEN_FILE" || test -L "$M0_TOKEN_FILE"; then
+  echo "SAFETY ERROR: disposable token path already exists" >&2
+  exit 2
+fi
 
 export M0_UID="$(id -u)" M0_GID="$(id -g)"
 export M0_REPO_ROOT="$REPO_ROOT" M0_EVIDENCE_ROOT="$EVIDENCE_ROOT" M0_TOKEN_FILE
-export M0_INFLUX_TOKEN COMPOSE_PROJECT_NAME="$PROJECT"
-
+export COMPOSE_PROJECT_NAME="$PROJECT"
 compose=(docker compose -p "$PROJECT" -f "$COMPOSE_FILE")
-"${compose[@]}" config --quiet
-
 DIND_ID=""
+DIND_NETWORK_ID=""
+STACK_STARTED=0
+TOKEN_DEVICE=""
+TOKEN_INODE=""
+
+cleanup_token() {
+  python3 - "$M0_TOKEN_FILE" "$TOKEN_DEVICE" "$TOKEN_INODE" <<'PY'
+import os
+import stat
+import sys
+
+path, expected_device, expected_inode = sys.argv[1:]
+if not expected_device or not expected_inode:
+    raise SystemExit(0)
+try:
+    metadata = os.lstat(path)
+    if (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_dev == int(expected_device)
+        and metadata.st_ino == int(expected_inode)
+    ):
+        os.unlink(path)
+except OSError:
+    pass
+PY
+}
+
 cleanup() {
   set +e
   if test -n "$DIND_ID"; then
     docker rm -f "$DIND_ID" >/dev/null 2>&1
   fi
-  "${compose[@]}" --profile prep --profile tools down --volumes --remove-orphans >/dev/null 2>&1
+  if test -n "$DIND_NETWORK_ID"; then
+    docker network rm "$DIND_NETWORK_ID" >/dev/null 2>&1
+  fi
+  if test "$STACK_STARTED" = "1"; then
+    "${compose[@]}" --profile prep --profile tools down --volumes --remove-orphans >/dev/null 2>&1
+  fi
+  cleanup_token
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+install -d -m 0700 -- "$EVIDENCE_ROOT"
+python3 "$SAFETY" private-directory "$EVIDENCE_ROOT"
+TOKEN_IDENTITY="$(python3 - "$M0_TOKEN_FILE" <<'PY'
+import os
+import secrets
+import sys
+
+path = sys.argv[1]
+descriptor = None
+try:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    payload = (secrets.token_urlsafe(48) + "\n").encode()
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("could not completely write ephemeral token")
+        offset += written
+    os.fsync(descriptor)
+    metadata = os.fstat(descriptor)
+except Exception:
+    if descriptor is not None:
+        metadata = os.fstat(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            current = os.lstat(path)
+            if (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino):
+                os.unlink(path)
+        except OSError:
+            pass
+    raise
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+print(metadata.st_dev, metadata.st_ino)
+PY
+)"
+read -r TOKEN_DEVICE TOKEN_INODE <<< "$TOKEN_IDENTITY"
+M0_INFLUX_TOKEN="$(python3 - "$M0_TOKEN_FILE" "$TOKEN_DEVICE" "$TOKEN_INODE" <<'PY'
+import os
+import stat
+import sys
+
+path, expected_device, expected_inode = sys.argv[1:]
+descriptor = os.open(
+    path,
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    metadata = os.fstat(descriptor)
+    current = os.lstat(path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (metadata.st_dev, metadata.st_ino)
+        != (int(expected_device), int(expected_inode))
+        or (metadata.st_dev, metadata.st_ino)
+        != (current.st_dev, current.st_ino)
+    ):
+        raise SystemExit("token identity or mode changed")
+    token = os.read(descriptor, 65537)
+finally:
+    os.close(descriptor)
+if len(token) > 65536 or len(token.splitlines()) != 1:
+    raise SystemExit("token content is invalid")
+print(token.decode("utf-8").strip())
+PY
+)"
+test -n "$M0_INFLUX_TOKEN"
+M0_DJANGO_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(64))')"
+M0_INFLUX_INIT_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+test -n "$M0_DJANGO_SECRET_KEY" && test -n "$M0_INFLUX_INIT_PASSWORD"
+
+export M0_INFLUX_TOKEN M0_DJANGO_SECRET_KEY M0_INFLUX_INIT_PASSWORD
+export COMPOSE_PROJECT_NAME="$PROJECT"
+"${compose[@]}" config --quiet
+
+STACK_STARTED=1
 "${compose[@]}" up -d --wait redis influx
 "${compose[@]}" --profile prep run --rm --no-deps volume-init
 "${compose[@]}" --profile prep run --rm --no-deps \
@@ -163,8 +262,13 @@ python3 "$SCRIPT_DIR/image_archive.py" save \
   --image-id "$M0_REDIS_IMAGE_ID" \
   > "$EVIDENCE_ROOT/image-save-report.json"
 
+DIND_NETWORK_ID="$(docker network create --driver bridge --internal \
+  --label "com.edge-iot.m0.project=$PROJECT" "$DIND_NETWORK_NAME")"
+test -n "$DIND_NETWORK_ID"
 DIND_ID="$(docker run -d --pull=never --privileged --name "$DIND_NAME" \
   --label "com.edge-iot.m0.project=$PROJECT" \
+  --network "$DIND_NETWORK_ID" \
+  --memory 768m --cpus 1.50 --pids-limit 512 \
   -p 127.0.0.1::2375 -e DOCKER_TLS_CERTDIR= \
   "$M0_DIND_IMAGE_ID" --host=tcp://0.0.0.0:2375 --tls=false)"
 test -n "$DIND_ID"
@@ -222,9 +326,23 @@ PY
 
 python3 "$SCRIPT_DIR/stack_smoke.py" --base-url "http://127.0.0.1:$WEB_PORT" \
   > "$EVIDENCE_ROOT/stack-smoke-report.json"
-"${compose[@]}" exec -T celery-short celery -A control_plane inspect ping --timeout 10 \
-  > "$EVIDENCE_ROOT/celery-ping.txt"
-grep -q 'pong' "$EVIDENCE_ROOT/celery-ping.txt"
+
+check_worker() {
+  local service="$1" node="$2" queue="$3"
+  local ping_report="$EVIDENCE_ROOT/celery-${service}-ping.json"
+  local queue_report="$EVIDENCE_ROOT/celery-${service}-queues.json"
+  "${compose[@]}" exec -T "$service" celery -A control_plane inspect \
+    --json --timeout 10 --destination "$node" ping > "$ping_report"
+  "${compose[@]}" exec -T "$service" celery -A control_plane inspect \
+    --json --timeout 10 --destination "$node" active_queues > "$queue_report"
+  python3 "$SCRIPT_DIR/celery_smoke.py" \
+    --ping-report "$ping_report" \
+    --queue-report "$queue_report" \
+    --node "$node" \
+    --expected-queue "$queue"
+}
+check_worker celery-acq "m0-acq@${PROJECT}-acq" acquisition
+check_worker celery-short "m0-short@${PROJECT}-short" short
 
 python3 - "$EVIDENCE_ROOT" "$PROJECT" <<'PY'
 import json
@@ -242,6 +360,10 @@ required = (
     "image-save-report.json",
     "image-load-report.json",
     "stack-smoke-report.json",
+    "celery-celery-acq-ping.json",
+    "celery-celery-acq-queues.json",
+    "celery-celery-short-ping.json",
+    "celery-celery-short-queues.json",
 )
 for name in required:
     if not (root / name).is_file() or (root / name).stat().st_size == 0:
@@ -254,9 +376,75 @@ summary = {
     "influx_backup_verify_restore_known_value": "ok",
     "held_fd_image_archive_independent_dind_load": "ok",
     "sha_pinned_rollback_stack": "ok",
-    "http_api_websocket_alarm_data": "ok",
+    "restored_static_fact_http_api_websocket_alarm_data": "ok",
+    "celery_nodes_and_active_queues": "ok",
 }
 (root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+PY
+
+# Artifact publication is allowed only after an exact byte scan proves that
+# none of the three ephemeral credentials was copied into evidence.  The large
+# rollback tar and its retained hard-link are excluded by inode.
+python3 - "$EVIDENCE_ROOT" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+secrets_to_find = [
+    os.environ[name].encode("utf-8")
+    for name in (
+        "M0_INFLUX_TOKEN",
+        "M0_DJANGO_SECRET_KEY",
+        "M0_INFLUX_INIT_PASSWORD",
+    )
+]
+archive = root / "rollback-images.tar"
+archive_identity = None
+if archive.exists():
+    archive_stat = os.lstat(archive)
+    archive_identity = (archive_stat.st_dev, archive_stat.st_ino)
+maximum = max(len(value) for value in secrets_to_find)
+for path in root.rglob("*"):
+    metadata = os.lstat(path)
+    if stat.S_ISDIR(metadata.st_mode):
+        continue
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("evidence contains a non-regular entry; refusing artifact")
+    if archive_identity == (metadata.st_dev, metadata.st_ino):
+        continue
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SystemExit("evidence entry changed during credential scan")
+        initial_size = current.st_size
+        initial_mtime_ns = current.st_mtime_ns
+        carry = b""
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            candidate = carry + block
+            if any(secret in candidate for secret in secrets_to_find):
+                raise SystemExit("ephemeral credential found in evidence; refusing artifact")
+            carry = candidate[-(maximum - 1):] if maximum > 1 else b""
+        final = os.fstat(descriptor)
+        final_path = os.lstat(path)
+        if (
+            (final.st_dev, final.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or (final_path.st_dev, final_path.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+            or final.st_size != initial_size
+            or final.st_mtime_ns != initial_mtime_ns
+        ):
+            raise SystemExit("evidence entry changed during credential scan")
+    finally:
+        os.close(descriptor)
 PY
 
 echo "M0 isolated recovery drill passed; evidence: $EVIDENCE_ROOT"

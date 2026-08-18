@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTP/API/WebSocket/alarm/data smoke for the restored SHA-pinned stack."""
+"""Read-only smoke for restored static facts through HTTP/API/WebSocket."""
 from __future__ import annotations
 
 import argparse
@@ -147,12 +147,12 @@ def run(base_url: str) -> dict[str, Any]:
     ):
         raise SmokeError("WebSocket did not expose the restored active session")
     return {
-        "operation": "restored-stack-smoke",
+        "operation": "restored-static-fact-smoke",
         "http": "ok",
         "api": "ok",
-        "websocket": "ok",
-        "alarm": "ok",
-        "data": "ok",
+        "websocket_initial_state": "ok",
+        "static_alarm_read": "ok",
+        "static_data_read": "ok",
         "session_id": session["id"],
     }
 
