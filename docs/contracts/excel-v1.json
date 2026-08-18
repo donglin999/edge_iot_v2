@@ -1,0 +1,1294 @@
+{
+  "contract_id": "edge-iot-excel-django-v1",
+  "frozen_from_commit": "dfabcc2007f71b69e410d34e8fd719a25154963e",
+  "upload_field": "file",
+  "download_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "v2": {
+    "sheets": [
+      "设备",
+      "测点",
+      "使用说明"
+    ],
+    "header_rows": 2,
+    "protocols": [
+      "modbus_rtu",
+      "modbus_tcp",
+      "mqtt",
+      "opcua",
+      "siemens_s7"
+    ],
+    "excluded_protocols": [
+      "scada",
+      "simulator"
+    ],
+    "schemas": {
+      "modbus_rtu": {
+        "device": [
+          {
+            "name": "device_name",
+            "required": false,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "device_code",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "site_code",
+            "required": false,
+            "kind": "string",
+            "default": "default",
+            "choices": []
+          },
+          {
+            "name": "sample_rate_hz",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "serial_port",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "baudrate",
+            "required": false,
+            "kind": "int",
+            "default": 9600,
+            "choices": []
+          },
+          {
+            "name": "parity",
+            "required": false,
+            "kind": "enum",
+            "default": "N",
+            "choices": [
+              "N",
+              "E",
+              "O"
+            ]
+          },
+          {
+            "name": "bytesize",
+            "required": false,
+            "kind": "enum",
+            "default": 8,
+            "choices": [
+              8
+            ]
+          },
+          {
+            "name": "stopbits",
+            "required": false,
+            "kind": "enum",
+            "default": 1,
+            "choices": [
+              1,
+              2
+            ]
+          },
+          {
+            "name": "slave_id",
+            "required": true,
+            "kind": "int",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "byte_order",
+            "required": false,
+            "kind": "enum",
+            "default": "big",
+            "choices": [
+              "big",
+              "little",
+              "big-swap",
+              "little-swap"
+            ]
+          },
+          {
+            "name": "timeout",
+            "required": false,
+            "kind": "float",
+            "default": 2,
+            "choices": []
+          }
+        ],
+        "point": [
+          {
+            "name": "device_name",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "code",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "description",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "address",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "function_code",
+            "required": false,
+            "kind": "enum",
+            "default": 3,
+            "choices": [
+              1,
+              2,
+              3,
+              4
+            ]
+          },
+          {
+            "name": "data_type",
+            "required": false,
+            "kind": "enum",
+            "default": "uint16",
+            "choices": [
+              "bool",
+              "int16",
+              "uint16",
+              "int32",
+              "uint32",
+              "int64",
+              "uint64",
+              "float32",
+              "float64"
+            ]
+          },
+          {
+            "name": "num",
+            "required": false,
+            "kind": "int",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "unit",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "coefficient",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          }
+        ],
+        "device_labels": [
+          "设备名称",
+          "设备编码(导出携带,新建留空)",
+          "站点编码",
+          "采样频率(Hz)",
+          "串口设备",
+          "波特率",
+          "校验位",
+          "数据位",
+          "停止位",
+          "从站地址",
+          "字节序",
+          "超时(秒)"
+        ],
+        "point_labels": [
+          "设备名称",
+          "测点编码",
+          "中文名称",
+          "寄存器地址",
+          "功能码",
+          "数据类型",
+          "寄存器数量",
+          "单位",
+          "系数"
+        ]
+      },
+      "modbus_tcp": {
+        "device": [
+          {
+            "name": "device_name",
+            "required": false,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "device_code",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "site_code",
+            "required": false,
+            "kind": "string",
+            "default": "default",
+            "choices": []
+          },
+          {
+            "name": "sample_rate_hz",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "source_ip",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "source_port",
+            "required": false,
+            "kind": "int",
+            "default": 502,
+            "choices": []
+          },
+          {
+            "name": "slave_id",
+            "required": false,
+            "kind": "int",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "byte_order",
+            "required": false,
+            "kind": "enum",
+            "default": "big",
+            "choices": [
+              "big",
+              "little",
+              "big-swap",
+              "little-swap"
+            ]
+          },
+          {
+            "name": "timeout",
+            "required": false,
+            "kind": "float",
+            "default": 10,
+            "choices": []
+          }
+        ],
+        "point": [
+          {
+            "name": "device_name",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "code",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "description",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "address",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "function_code",
+            "required": false,
+            "kind": "enum",
+            "default": 3,
+            "choices": [
+              1,
+              2,
+              3,
+              4
+            ]
+          },
+          {
+            "name": "data_type",
+            "required": false,
+            "kind": "enum",
+            "default": "uint16",
+            "choices": [
+              "bool",
+              "int16",
+              "uint16",
+              "int32",
+              "uint32",
+              "int64",
+              "uint64",
+              "float32",
+              "float64"
+            ]
+          },
+          {
+            "name": "num",
+            "required": false,
+            "kind": "int",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "unit",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "coefficient",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          }
+        ],
+        "device_labels": [
+          "设备名称",
+          "设备编码(导出携带,新建留空)",
+          "站点编码",
+          "采样频率(Hz)",
+          "IP 地址",
+          "端口",
+          "单元标识符 (Unit ID)",
+          "字节序",
+          "超时(秒)"
+        ],
+        "point_labels": [
+          "设备名称",
+          "测点编码",
+          "中文名称",
+          "寄存器地址",
+          "功能码",
+          "数据类型",
+          "寄存器数量",
+          "单位",
+          "系数"
+        ]
+      },
+      "mqtt": {
+        "device": [
+          {
+            "name": "device_name",
+            "required": false,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "device_code",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "site_code",
+            "required": false,
+            "kind": "string",
+            "default": "default",
+            "choices": []
+          },
+          {
+            "name": "sample_rate_hz",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "source_ip",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "source_port",
+            "required": false,
+            "kind": "int",
+            "default": 1883,
+            "choices": []
+          },
+          {
+            "name": "mqtt_topics",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "mqtt_qos",
+            "required": false,
+            "kind": "enum",
+            "default": 0,
+            "choices": [
+              0,
+              1,
+              2
+            ]
+          },
+          {
+            "name": "mqtt_username",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "mqtt_password",
+            "required": false,
+            "kind": "secret",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "mqtt_use_tls",
+            "required": false,
+            "kind": "bool",
+            "default": false,
+            "choices": []
+          },
+          {
+            "name": "mqtt_client_id",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "mqtt_read_timeout",
+            "required": false,
+            "kind": "float",
+            "default": 5,
+            "choices": []
+          },
+          {
+            "name": "mqtt_queue_size",
+            "required": false,
+            "kind": "int",
+            "default": 1000,
+            "choices": []
+          }
+        ],
+        "point": [
+          {
+            "name": "device_name",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "code",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "description",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "topic_filter",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "payload_path",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "data_type",
+            "required": false,
+            "kind": "enum",
+            "default": "float",
+            "choices": [
+              "string",
+              "int",
+              "float",
+              "bool"
+            ]
+          },
+          {
+            "name": "unit",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          }
+        ],
+        "device_labels": [
+          "设备名称",
+          "设备编码(导出携带,新建留空)",
+          "站点编码",
+          "采样频率(Hz)",
+          "Broker 地址",
+          "Broker 端口",
+          "订阅话题",
+          "QoS",
+          "用户名",
+          "密码",
+          "启用 TLS",
+          "ClientID",
+          "读取超时(秒)",
+          "接收队列容量"
+        ],
+        "point_labels": [
+          "设备名称",
+          "测点编码",
+          "中文名称",
+          "话题过滤",
+          "JSON 路径",
+          "数据类型",
+          "单位"
+        ]
+      },
+      "opcua": {
+        "device": [
+          {
+            "name": "device_name",
+            "required": false,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "device_code",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "site_code",
+            "required": false,
+            "kind": "string",
+            "default": "default",
+            "choices": []
+          },
+          {
+            "name": "sample_rate_hz",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "endpoint_url",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "security_policy",
+            "required": false,
+            "kind": "enum",
+            "default": "None",
+            "choices": [
+              "None"
+            ]
+          },
+          {
+            "name": "opcua_username",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "opcua_password",
+            "required": false,
+            "kind": "secret",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "timeout",
+            "required": false,
+            "kind": "float",
+            "default": 5,
+            "choices": []
+          }
+        ],
+        "point": [
+          {
+            "name": "device_name",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "code",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "description",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "address",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "data_type",
+            "required": false,
+            "kind": "enum",
+            "default": "auto",
+            "choices": [
+              "auto",
+              "bool",
+              "int16",
+              "uint16",
+              "int32",
+              "uint32",
+              "float32",
+              "double",
+              "string"
+            ]
+          },
+          {
+            "name": "unit",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          }
+        ],
+        "device_labels": [
+          "设备名称",
+          "设备编码(导出携带,新建留空)",
+          "站点编码",
+          "采样频率(Hz)",
+          "Endpoint URL",
+          "安全策略",
+          "用户名",
+          "密码",
+          "超时(秒)"
+        ],
+        "point_labels": [
+          "设备名称",
+          "测点编码",
+          "中文名称",
+          "NodeId",
+          "数据类型",
+          "单位"
+        ]
+      },
+      "siemens_s7": {
+        "device": [
+          {
+            "name": "device_name",
+            "required": false,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "device_code",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "site_code",
+            "required": false,
+            "kind": "string",
+            "default": "default",
+            "choices": []
+          },
+          {
+            "name": "sample_rate_hz",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "source_ip",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "source_port",
+            "required": false,
+            "kind": "int",
+            "default": 102,
+            "choices": []
+          },
+          {
+            "name": "rack",
+            "required": false,
+            "kind": "int",
+            "default": 0,
+            "choices": []
+          },
+          {
+            "name": "slot",
+            "required": false,
+            "kind": "int",
+            "default": 1,
+            "choices": []
+          },
+          {
+            "name": "plc_type",
+            "required": false,
+            "kind": "enum",
+            "default": "S7-1200",
+            "choices": [
+              "S7-200",
+              "S7-300",
+              "S7-400",
+              "S7-1200",
+              "S7-1500"
+            ]
+          },
+          {
+            "name": "timeout",
+            "required": false,
+            "kind": "float",
+            "default": 5,
+            "choices": []
+          }
+        ],
+        "point": [
+          {
+            "name": "device_name",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "code",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "description",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "address",
+            "required": true,
+            "kind": "string",
+            "default": null,
+            "choices": []
+          },
+          {
+            "name": "data_type",
+            "required": false,
+            "kind": "enum",
+            "default": "float32",
+            "choices": [
+              "bool",
+              "byte",
+              "int16",
+              "uint16",
+              "int32",
+              "uint32",
+              "float32",
+              "float64",
+              "lreal",
+              "string"
+            ]
+          },
+          {
+            "name": "str_length",
+            "required": false,
+            "kind": "int",
+            "default": 32,
+            "choices": []
+          },
+          {
+            "name": "unit",
+            "required": false,
+            "kind": "string",
+            "default": "",
+            "choices": []
+          },
+          {
+            "name": "coefficient",
+            "required": false,
+            "kind": "float",
+            "default": 1,
+            "choices": []
+          }
+        ],
+        "device_labels": [
+          "设备名称",
+          "设备编码(导出携带,新建留空)",
+          "站点编码",
+          "采样频率(Hz)",
+          "PLC IP",
+          "端口",
+          "Rack 号",
+          "Slot 号",
+          "PLC 型号",
+          "超时(秒)"
+        ],
+        "point_labels": [
+          "设备名称",
+          "测点编码",
+          "中文名称",
+          "地址",
+          "数据类型",
+          "字符串长度",
+          "单位",
+          "系数"
+        ]
+      }
+    }
+  },
+  "legacy": {
+    "sheets": [
+      "采集点配置",
+      "协议说明",
+      "使用说明"
+    ],
+    "header_rows": 1,
+    "fixed_columns": [
+      "protocol_type",
+      "device_name",
+      "device_a_tag"
+    ],
+    "field_specs": [
+      {
+        "name": "serial_port",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "baudrate",
+        "required": false,
+        "kind": "int",
+        "default": 9600,
+        "choices": []
+      },
+      {
+        "name": "parity",
+        "required": false,
+        "kind": "enum",
+        "default": "N",
+        "choices": [
+          "N",
+          "E",
+          "O"
+        ]
+      },
+      {
+        "name": "bytesize",
+        "required": false,
+        "kind": "enum",
+        "default": 8,
+        "choices": [
+          8
+        ]
+      },
+      {
+        "name": "stopbits",
+        "required": false,
+        "kind": "enum",
+        "default": 1,
+        "choices": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "slave_id",
+        "required": true,
+        "kind": "int",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "byte_order",
+        "required": false,
+        "kind": "enum",
+        "default": "big",
+        "choices": [
+          "big",
+          "little",
+          "big-swap",
+          "little-swap"
+        ]
+      },
+      {
+        "name": "timeout",
+        "required": false,
+        "kind": "float",
+        "default": 2,
+        "choices": []
+      },
+      {
+        "name": "code",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "address",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "function_code",
+        "required": false,
+        "kind": "enum",
+        "default": 3,
+        "choices": [
+          1,
+          2,
+          3,
+          4
+        ]
+      },
+      {
+        "name": "data_type",
+        "required": false,
+        "kind": "enum",
+        "default": "uint16",
+        "choices": [
+          "bool",
+          "int16",
+          "uint16",
+          "int32",
+          "uint32",
+          "int64",
+          "uint64",
+          "float32",
+          "float64"
+        ]
+      },
+      {
+        "name": "num",
+        "required": false,
+        "kind": "int",
+        "default": 1,
+        "choices": []
+      },
+      {
+        "name": "unit",
+        "required": false,
+        "kind": "string",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "description",
+        "required": false,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "coefficient",
+        "required": false,
+        "kind": "float",
+        "default": 1,
+        "choices": []
+      },
+      {
+        "name": "source_ip",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "source_port",
+        "required": false,
+        "kind": "int",
+        "default": 502,
+        "choices": []
+      },
+      {
+        "name": "mqtt_topics",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "mqtt_qos",
+        "required": false,
+        "kind": "enum",
+        "default": 0,
+        "choices": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "name": "mqtt_username",
+        "required": false,
+        "kind": "string",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "mqtt_password",
+        "required": false,
+        "kind": "secret",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "mqtt_use_tls",
+        "required": false,
+        "kind": "bool",
+        "default": false,
+        "choices": []
+      },
+      {
+        "name": "mqtt_client_id",
+        "required": false,
+        "kind": "string",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "mqtt_read_timeout",
+        "required": false,
+        "kind": "float",
+        "default": 5,
+        "choices": []
+      },
+      {
+        "name": "mqtt_queue_size",
+        "required": false,
+        "kind": "int",
+        "default": 1000,
+        "choices": []
+      },
+      {
+        "name": "topic_filter",
+        "required": false,
+        "kind": "string",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "payload_path",
+        "required": false,
+        "kind": "string",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "endpoint_url",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "security_policy",
+        "required": false,
+        "kind": "enum",
+        "default": "None",
+        "choices": [
+          "None"
+        ]
+      },
+      {
+        "name": "opcua_username",
+        "required": false,
+        "kind": "string",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "opcua_password",
+        "required": false,
+        "kind": "secret",
+        "default": "",
+        "choices": []
+      },
+      {
+        "name": "scada_product_key",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "scada_device_name",
+        "required": true,
+        "kind": "string",
+        "default": null,
+        "choices": []
+      },
+      {
+        "name": "scada_topic_template",
+        "required": false,
+        "kind": "string",
+        "default": "/sys/{product_key}/device/{device_name}/thing/property/{code}/post",
+        "choices": []
+      },
+      {
+        "name": "rack",
+        "required": false,
+        "kind": "int",
+        "default": 0,
+        "choices": []
+      },
+      {
+        "name": "slot",
+        "required": false,
+        "kind": "int",
+        "default": 1,
+        "choices": []
+      },
+      {
+        "name": "plc_type",
+        "required": false,
+        "kind": "enum",
+        "default": "S7-1200",
+        "choices": [
+          "S7-200",
+          "S7-300",
+          "S7-400",
+          "S7-1200",
+          "S7-1500"
+        ]
+      },
+      {
+        "name": "str_length",
+        "required": false,
+        "kind": "int",
+        "default": 32,
+        "choices": []
+      }
+    ]
+  },
+  "scada": {
+    "sheets": [
+      "网关服务",
+      "设备与测点",
+      "使用说明"
+    ],
+    "header_rows": 1,
+    "gateway_columns": [
+      "code",
+      "name",
+      "source_ip",
+      "source_port",
+      "mqtt_use_tls",
+      "mqtt_username",
+      "mqtt_password",
+      "mqtt_qos",
+      "mqtt_client_id",
+      "mqtt_read_timeout",
+      "product_key",
+      "topic_template",
+      "task_code",
+      "task_name",
+      "sample_rate_hz"
+    ],
+    "point_columns": [
+      "device_name",
+      "device_label",
+      "code",
+      "description",
+      "data_type",
+      "unit"
+    ]
+  },
+  "semantic_rules": {
+    "v2": "Two display/key header rows; parse English row 2; one device row per device; one point row per point; transactional synchronous upsert; one task per device; errors include kind.",
+    "legacy": "Single English header row, multi-protocol wide sheet, ImportJob validation/apply workflow, retained for stored files.",
+    "scada": "Single English header row with Chinese comments; shared gateway row plus device/point rows; synchronous transactional upsert; errors include protocol but not sheet/kind.",
+    "integer_cells": "Integer-kind fields must remain Excel integers and must not acquire a .0 suffix.",
+    "round_trip": "An unchanged export re-imports idempotently; no rows outside the workbook are implicitly deleted."
+  },
+  "known_legacy_defects": [
+    {
+      "id": "EXCEL-LEGACY-001",
+      "behavior": "MQTT, OPC UA and SCADA exports can contain plaintext credentials.",
+      "migration_rule": "Contract fixtures use synthetic values only; implement secret redaction/keep-existing semantics as an explicit security change."
+    },
+    {
+      "id": "EXCEL-LEGACY-002",
+      "behavior": "v2, SCADA and legacy use incompatible headers, workflows and row-error item shapes.",
+      "migration_rule": "Keep format detection explicit; never route a workbook to a parser by filename alone."
+    },
+    {
+      "id": "EXCEL-LEGACY-003",
+      "behavior": "Legacy is called a 40-column format, but its schema is registry-driven and the exact field count can drift.",
+      "migration_rule": "The executable field-spec snapshot, not the nickname, is normative."
+    }
+  ]
+}

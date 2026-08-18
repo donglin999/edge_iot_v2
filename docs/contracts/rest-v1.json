@@ -1,0 +1,655 @@
+{
+  "contract_id": "edge-iot-rest-django-v1",
+  "frozen_from_commit": "dfabcc2007f71b69e410d34e8fd719a25154963e",
+  "canonical_prefixes": [
+    "/api/config/",
+    "/api/acquisition/"
+  ],
+  "canonical_route_count": 62,
+  "format_suffix_aliases": {
+    "present": true,
+    "rule": "Every DefaultRouter route also accepts a DRF .<format> alias; canonical paths below omit duplicates."
+  },
+  "platform_routes": [
+    {
+      "path": "/schema/",
+      "methods": [
+        "GET"
+      ],
+      "scope": "OpenAPI schema"
+    },
+    {
+      "path": "/api/docs/",
+      "methods": [
+        "GET"
+      ],
+      "scope": "Swagger UI"
+    },
+    {
+      "path": "/api/redoc/",
+      "methods": [
+        "GET"
+      ],
+      "scope": "ReDoc UI"
+    },
+    {
+      "path": "/api/auth/login/",
+      "methods": [
+        "GET",
+        "POST",
+        "PUT"
+      ],
+      "scope": "DRF browsable-session login; not application auth"
+    },
+    {
+      "path": "/api/auth/logout/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "scope": "DRF browsable-session logout; not application auth"
+    }
+  ],
+  "routes": [
+    {
+      "path": "/api/acquisition/",
+      "methods": [
+        "GET"
+      ],
+      "name": "api-root"
+    },
+    {
+      "path": "/api/acquisition/alarm-rules/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "alarm-rule-list"
+    },
+    {
+      "path": "/api/acquisition/alarm-rules/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "alarm-rule-detail"
+    },
+    {
+      "path": "/api/acquisition/alarms/",
+      "methods": [
+        "GET"
+      ],
+      "name": "alarm-list"
+    },
+    {
+      "path": "/api/acquisition/alarms/{id}/",
+      "methods": [
+        "GET"
+      ],
+      "name": "alarm-detail"
+    },
+    {
+      "path": "/api/acquisition/alarms/{id}/ack/",
+      "methods": [
+        "POST"
+      ],
+      "name": "alarm-acknowledge"
+    },
+    {
+      "path": "/api/acquisition/connection-tests/",
+      "methods": [
+        "POST"
+      ],
+      "name": "connection-test-list"
+    },
+    {
+      "path": "/api/acquisition/protocols/",
+      "methods": [
+        "GET"
+      ],
+      "name": "protocol-list"
+    },
+    {
+      "path": "/api/acquisition/protocols/template/",
+      "methods": [
+        "GET"
+      ],
+      "name": "protocol-template"
+    },
+    {
+      "path": "/api/acquisition/protocols/{id}/",
+      "methods": [
+        "GET"
+      ],
+      "name": "protocol-detail"
+    },
+    {
+      "path": "/api/acquisition/sessions/",
+      "methods": [
+        "GET"
+      ],
+      "name": "acquisition-session-list"
+    },
+    {
+      "path": "/api/acquisition/sessions/active/",
+      "methods": [
+        "GET"
+      ],
+      "name": "acquisition-session-active-sessions"
+    },
+    {
+      "path": "/api/acquisition/sessions/point-history/",
+      "methods": [
+        "GET"
+      ],
+      "name": "acquisition-session-point-history"
+    },
+    {
+      "path": "/api/acquisition/sessions/start-task/",
+      "methods": [
+        "POST"
+      ],
+      "name": "acquisition-session-start-task"
+    },
+    {
+      "path": "/api/acquisition/sessions/test-acquire/",
+      "methods": [
+        "POST"
+      ],
+      "name": "acquisition-session-test-acquire"
+    },
+    {
+      "path": "/api/acquisition/sessions/{id}/",
+      "methods": [
+        "GET"
+      ],
+      "name": "acquisition-session-detail"
+    },
+    {
+      "path": "/api/acquisition/sessions/{id}/data-points/",
+      "methods": [
+        "GET"
+      ],
+      "name": "acquisition-session-data-points"
+    },
+    {
+      "path": "/api/acquisition/sessions/{id}/pause/",
+      "methods": [
+        "POST"
+      ],
+      "name": "acquisition-session-pause"
+    },
+    {
+      "path": "/api/acquisition/sessions/{id}/resume/",
+      "methods": [
+        "POST"
+      ],
+      "name": "acquisition-session-resume"
+    },
+    {
+      "path": "/api/acquisition/sessions/{id}/status/",
+      "methods": [
+        "GET"
+      ],
+      "name": "acquisition-session-get-status"
+    },
+    {
+      "path": "/api/acquisition/sessions/{id}/stop/",
+      "methods": [
+        "POST"
+      ],
+      "name": "acquisition-session-stop"
+    },
+    {
+      "path": "/api/acquisition/storage-tests/",
+      "methods": [
+        "POST"
+      ],
+      "name": "storage-test-list"
+    },
+    {
+      "path": "/api/config/",
+      "methods": [
+        "GET"
+      ],
+      "name": "api-root"
+    },
+    {
+      "path": "/api/config/channels/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "channel-list"
+    },
+    {
+      "path": "/api/config/channels/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "channel-detail"
+    },
+    {
+      "path": "/api/config/devices/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "device-list"
+    },
+    {
+      "path": "/api/config/devices/export/",
+      "methods": [
+        "GET"
+      ],
+      "name": "device-export"
+    },
+    {
+      "path": "/api/config/devices/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "device-detail"
+    },
+    {
+      "path": "/api/config/devices/{id}/latest-values/",
+      "methods": [
+        "GET"
+      ],
+      "name": "device-latest-values"
+    },
+    {
+      "path": "/api/config/devices/{id}/points/",
+      "methods": [
+        "GET"
+      ],
+      "name": "device-list-points"
+    },
+    {
+      "path": "/api/config/devices/{id}/stats/",
+      "methods": [
+        "GET"
+      ],
+      "name": "device-stats"
+    },
+    {
+      "path": "/api/config/devices/{id}/test-connection/",
+      "methods": [
+        "POST"
+      ],
+      "name": "device-test-connection"
+    },
+    {
+      "path": "/api/config/export-excel/",
+      "methods": [
+        "GET"
+      ],
+      "name": "config-export-excel"
+    },
+    {
+      "path": "/api/config/import-jobs/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "import-job-list"
+    },
+    {
+      "path": "/api/config/import-jobs/{id}/",
+      "methods": [
+        "GET"
+      ],
+      "name": "import-job-detail"
+    },
+    {
+      "path": "/api/config/import-jobs/{id}/apply/",
+      "methods": [
+        "POST"
+      ],
+      "name": "import-job-apply"
+    },
+    {
+      "path": "/api/config/import-jobs/{id}/diff/",
+      "methods": [
+        "GET"
+      ],
+      "name": "import-job-diff"
+    },
+    {
+      "path": "/api/config/points/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "point-list"
+    },
+    {
+      "path": "/api/config/points/latest-values/",
+      "methods": [
+        "GET"
+      ],
+      "name": "point-latest-values"
+    },
+    {
+      "path": "/api/config/points/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "point-detail"
+    },
+    {
+      "path": "/api/config/protocol-excel/export/",
+      "methods": [
+        "GET"
+      ],
+      "name": "protocol-excel-export"
+    },
+    {
+      "path": "/api/config/protocol-excel/import/",
+      "methods": [
+        "POST"
+      ],
+      "name": "protocol-excel-import-excel"
+    },
+    {
+      "path": "/api/config/protocol-excel/template/",
+      "methods": [
+        "GET"
+      ],
+      "name": "protocol-excel-template"
+    },
+    {
+      "path": "/api/config/scada-gateways/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "scada-gateway-list"
+    },
+    {
+      "path": "/api/config/scada-gateways/import/",
+      "methods": [
+        "POST"
+      ],
+      "name": "scada-gateway-import-excel"
+    },
+    {
+      "path": "/api/config/scada-gateways/template/",
+      "methods": [
+        "GET"
+      ],
+      "name": "scada-gateway-template"
+    },
+    {
+      "path": "/api/config/scada-gateways/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "scada-gateway-detail"
+    },
+    {
+      "path": "/api/config/scada-gateways/{id}/export/",
+      "methods": [
+        "GET"
+      ],
+      "name": "scada-gateway-export"
+    },
+    {
+      "path": "/api/config/scada-gateways/{id}/provision/",
+      "methods": [
+        "POST"
+      ],
+      "name": "scada-gateway-provision"
+    },
+    {
+      "path": "/api/config/sites/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "site-list"
+    },
+    {
+      "path": "/api/config/sites/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "site-detail"
+    },
+    {
+      "path": "/api/config/tasks/",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "name": "task-list"
+    },
+    {
+      "path": "/api/config/tasks/overview/",
+      "methods": [
+        "GET"
+      ],
+      "name": "task-overview"
+    },
+    {
+      "path": "/api/config/tasks/{id}/",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "PUT"
+      ],
+      "name": "task-detail"
+    },
+    {
+      "path": "/api/config/tasks/{id}/points/",
+      "methods": [
+        "GET"
+      ],
+      "name": "task-list-points"
+    },
+    {
+      "path": "/api/config/tasks/{id}/start/",
+      "methods": [
+        "POST"
+      ],
+      "name": "task-start"
+    },
+    {
+      "path": "/api/config/tasks/{id}/stop/",
+      "methods": [
+        "POST"
+      ],
+      "name": "task-stop"
+    },
+    {
+      "path": "/api/config/versions/",
+      "methods": [
+        "GET"
+      ],
+      "name": "config-version-list"
+    },
+    {
+      "path": "/api/config/versions/bulk-delete/",
+      "methods": [
+        "POST"
+      ],
+      "name": "config-version-bulk-delete"
+    },
+    {
+      "path": "/api/config/versions/{id}/",
+      "methods": [
+        "DELETE",
+        "GET"
+      ],
+      "name": "config-version-detail"
+    },
+    {
+      "path": "/api/config/versions/{id}/export-excel/",
+      "methods": [
+        "GET"
+      ],
+      "name": "config-version-export-excel"
+    },
+    {
+      "path": "/api/config/versions/{id}/rollback/",
+      "methods": [
+        "POST"
+      ],
+      "name": "config-version-rollback"
+    }
+  ],
+  "generic_statuses": {
+    "list": 200,
+    "retrieve": 200,
+    "create": 201,
+    "update": 200,
+    "partial_update": 200,
+    "destroy": 204,
+    "validation_error": 400,
+    "not_found": 404
+  },
+  "pagination": {
+    "style": "limit-offset",
+    "default_limit": 50,
+    "maximum_limit": 1000,
+    "query_parameters": [
+      "limit",
+      "offset"
+    ],
+    "response_keys": [
+      "count",
+      "next",
+      "previous",
+      "results"
+    ],
+    "applies_to": "DRF list actions only; custom actions may return bare arrays or bespoke objects"
+  },
+  "decimal_wire_rule": "Django DecimalField values are fixed-precision JSON strings, not JSON numbers.",
+  "decimal_string_examples": {
+    "channel.sampling_rate_hz": "1.25",
+    "point.sample_rate_hz": "2.50",
+    "point.template_detail.coefficient": "1.2345",
+    "task.sample_rate_hz": "3.75"
+  },
+  "json_value_rules": {
+    "data_point_value": "JSONField preserves the stored JSON scalar type.",
+    "influx_latest_value": "int/float/bool/null pass through; numeric-looking non-JSON strings become float; other strings remain strings.",
+    "influx_history_value": "int/float pass through; numeric-looking strings become float; other strings remain strings."
+  },
+  "error_families": {
+    "drf_validation": {
+      "status": 400,
+      "top_level_keys": [
+        "code",
+        "name"
+      ],
+      "shape": "field -> list[string]"
+    },
+    "drf_not_found": {
+      "status": 404,
+      "top_level_keys": [
+        "detail"
+      ],
+      "shape": "detail string/ErrorDetail"
+    },
+    "detail": {
+      "status": [
+        400,
+        404
+      ],
+      "top_level_keys": [
+        "detail"
+      ],
+      "shape": "endpoint-specific Chinese detail string"
+    },
+    "excel_v2": {
+      "status": 400,
+      "top_level_keys": [
+        "created",
+        "devices",
+        "errors",
+        "protocol",
+        "updated"
+      ],
+      "item_keys": [
+        "column",
+        "kind",
+        "message",
+        "row",
+        "sheet"
+      ]
+    },
+    "excel_scada": {
+      "status": 400,
+      "top_level_keys": [
+        "created",
+        "devices",
+        "errors",
+        "gateway"
+      ],
+      "item_keys": [
+        "column",
+        "message",
+        "protocol",
+        "row"
+      ]
+    },
+    "point_history_upstream_failure": {
+      "status": 200,
+      "top_level_keys": [
+        "count",
+        "data",
+        "end_time",
+        "error",
+        "point_code",
+        "start_time"
+      ],
+      "legacy": true
+    }
+  },
+  "known_legacy_defects": [
+    {
+      "id": "REST-LEGACY-001",
+      "behavior": "Errors have several incompatible envelopes instead of one error_code/message/details shape.",
+      "migration_rule": "Preserve during shadow comparison; normalize only behind an explicit versioned cutover."
+    },
+    {
+      "id": "REST-LEGACY-002",
+      "behavior": "point-history reports InfluxDB failures as HTTP 200 with an error field.",
+      "migration_rule": "Do not silently change while clients rely on it; target a coordinated 5xx/error-envelope change."
+    },
+    {
+      "id": "REST-LEGACY-003",
+      "behavior": "point-history parses limit with unguarded int(), so malformed values can become HTTP 500.",
+      "migration_rule": "Fix before FastAPI parity or encode the corrected 400 as a deliberate contract version."
+    },
+    {
+      "id": "REST-LEGACY-004",
+      "behavior": "Global DRF permission is AllowAny; /api/auth is only browsable-session UI and there is no application login flow.",
+      "migration_rule": "Authentication/RBAC belongs to M8 and requires coordinated frontend behavior."
+    },
+    {
+      "id": "REST-LEGACY-005",
+      "behavior": "Several custom list actions return bare arrays/objects and are not wrapped by global pagination.",
+      "migration_rule": "Preserve endpoint-by-endpoint; do not infer pagination from the URL alone."
+    }
+  ]
+}

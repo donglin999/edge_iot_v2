@@ -1,0 +1,119 @@
+{
+  "contract_id": "edge-iot-websocket-django-v1",
+  "frozen_from_commit": "dfabcc2007f71b69e410d34e8fd719a25154963e",
+  "paths": [
+    {
+      "path": "/ws/acquisition/sessions/{session_id}/",
+      "django_regex": "ws/acquisition/sessions/(?P<session_id>\\d+)/$",
+      "on_connect": {"type": "session_status", "payload_key": "data"},
+      "client_to_server": "Frames are accepted and ignored."
+    },
+    {
+      "path": "/ws/acquisition/global/",
+      "django_regex": "ws/acquisition/global/$",
+      "on_connect": {"type": "active_sessions", "payload_key": "data", "maximum_sessions": 50},
+      "client_to_server": "Frames are accepted and ignored."
+    }
+  ],
+  "transport": {
+    "authentication": "none",
+    "channel_backend": "channels_redis.core.RedisChannelLayer",
+    "channel_capacity": 1500,
+    "channel_message_expiry_seconds": 10,
+    "event_id": false,
+    "sequence": false,
+    "resume_cursor": false,
+    "replay": false,
+    "delivery_semantics": "best-effort live delivery; reconnect requires REST/Influx resynchronization"
+  },
+  "forwarded_events": [
+    {
+      "consumer": "AcquisitionConsumer",
+      "handler": "session_status_update",
+      "example_frame": {"type": "session_status", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "AcquisitionConsumer",
+      "handler": "data_point_update",
+      "example_frame": {"type": "data_point", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "AcquisitionConsumer",
+      "handler": "session_error",
+      "example_frame": {"type": "error", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "AcquisitionConsumer",
+      "handler": "connection_event",
+      "example_frame": {"type": "connection_event", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "GlobalAcquisitionConsumer",
+      "handler": "session_status_update",
+      "example_frame": {"type": "session_status", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "GlobalAcquisitionConsumer",
+      "handler": "session_started",
+      "example_frame": {"type": "session_started", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "GlobalAcquisitionConsumer",
+      "handler": "session_stopped",
+      "example_frame": {"type": "session_stopped", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "GlobalAcquisitionConsumer",
+      "handler": "connection_event",
+      "example_frame": {"type": "connection_event", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "GlobalAcquisitionConsumer",
+      "handler": "data_point_update",
+      "example_frame": {"type": "data_point_update", "data": {"sentinel": "contract"}}
+    },
+    {
+      "consumer": "GlobalAcquisitionConsumer",
+      "handler": "alarm_event",
+      "example_frame": {"type": "alarm", "event": "created", "alarm": {"id": 99, "message": "synthetic"}}
+    }
+  ],
+  "data_batch": {
+    "payload_key": "data",
+    "keys": ["session_id", "timestamp", "readings", "batch_count", "chunk_index", "chunk_count"],
+    "reading_keys": ["point_code", "value", "quality", "timestamp"],
+    "batch_count_rule": "Present on the first chunk and represents consumed readings before latest-per-point deduplication."
+  },
+  "browser_policy": {
+    "hook_default_auto_reconnect": true,
+    "fixed_delay_ms": 3000,
+    "backoff": false,
+    "jitter": false,
+    "maximum_attempts": null,
+    "global_socket_auto_reconnect": true,
+    "session_panel_auto_reconnect": false,
+    "rest_resync_poll_ms": 3000
+  },
+  "known_legacy_defects": [
+    {
+      "id": "WS-LEGACY-001",
+      "behavior": "The same data update is type=data_point on a session socket and type=data_point_update globally.",
+      "migration_rule": "Preserve both variants until a versioned client cutover."
+    },
+    {
+      "id": "WS-LEGACY-002",
+      "behavior": "Frames have no event id, sequence, resume cursor or replay, and Redis messages expire after 10 seconds.",
+      "migration_rule": "Never claim exactly-once delivery; always resynchronize from REST/Influx after reconnect."
+    },
+    {
+      "id": "WS-LEGACY-003",
+      "behavior": "Session-panel sockets explicitly disable reconnect while the global socket retries forever at a fixed 3-second delay.",
+      "migration_rule": "Treat this as current client behavior, not a recommended reconnection design."
+    },
+    {
+      "id": "WS-LEGACY-004",
+      "behavior": "WebSocket routes have no authentication or authorization.",
+      "migration_rule": "Coordinate the M8 auth change with browser token transport and close-code behavior."
+    }
+  ]
+}
