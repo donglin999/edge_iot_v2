@@ -1,6 +1,6 @@
 # 离线部署 —— 中山小家电单体版（amd64）
 
-只有 Docker、无网络的工控机上，一键部署整套边缘 IoT 数采系统（Django + Celery +
+只有 Docker + Python 3、无网络的工控机上，一键部署整套边缘 IoT 数采系统（Django + Celery +
 前端 + scada 协议）。
 
 **架构约定（重要）**：所有服务用 **host 网络**。
@@ -24,11 +24,13 @@
 | `.env.example` | 不可直接运行的空值模板（不含密钥/现场值） |
 | `load-and-up.sh` | **一键加载 + 启动** |
 | `validate-env.sh` | 启动前校验密钥、安全开关和文件权限（不输出敏感值） |
+| `prepare-env.py` | 以 owner/mode/inode 校验固定私有 env 快照，防止替换竞态 |
+| `verify-image-archive.py` | 加载前强制校验 SHA-256、精确镜像标签和 linux/amd64 |
 | `manifest.txt` | 镜像清单 + 架构 + 大小 |
 | `README.md` | 本文档 |
 
 > **前置**：
-> 1. 目标机须已有 `redis:7.0.10` 镜像（`docker images` 可见）；若宿主机已自跑 Redis，删 compose 里 redis 服务。
+> 1. 目标机须是 linux/amd64，已安装 Docker、Compose 和 Python 3；Redis 镜像已包在 `images.tar`。
 > 2. 宿主机须已运行 InfluxDB，并准备有限权限的 API token。
 > `load-and-up.sh` 会先做这两项检查。
 
@@ -78,18 +80,31 @@ vi .env                    # 填 ALLOWED_HOSTS 和 InfluxDB org/bucket/token
 # 首次：完整模式（要用界面配置）
 ./load-and-up.sh --env-file .env
 
-# 配置完成后，切到省资源的采集模式
-docker compose --env-file .env -f docker-compose.yml stop django web
+# 配置完成后，停掉界面容器（采集 worker 不受影响）
+docker stop django-iot frontend-iot
 # 或下次直接：
 ./load-and-up.sh --env-file .env --headless
 
-# 需要再开界面
-docker compose --env-file .env --profile ui -f docker-compose.yml up -d
+# 需要再开界面（继续走安全预检）
+./load-and-up.sh --env-file .env --ui
 ```
 
-`load-and-up.sh` 会先执行 fail-closed 校验：`.env` 必须是权限 `0400` 或
-`0600` 的普通文件，`DEBUG=False`，Django key 与 Influx token 不能为空/占位值，
-`ALLOWED_HOSTS` 不能是 `*`。任何一项失败都会在 `docker load`、删容器或停旧服务前退出。
+`load-and-up.sh` 会先执行 fail-closed 校验：`.env` 必须由当前执行用户拥有，
+且是权限 `0400` 或 `0600` 的单硬链普通文件；`DEBUG=False`，Django key 与
+Influx token 不能为空/占位值，`ALLOWED_HOSTS` 不能是 `*`。校验后会建立私有
+快照，清理调用者 shell 中的同名变量，并在 Compose 渲染与启动前复核 inode/内容。
+env 只接受清单内的单一 `KEY=VALUE` 语法，拒绝 `export`、重复键、引号和变量插值。
+`LEGACY_CONTAINERS` 默认留空（不会停任何旧容器）；核对现场后才填写要停用的精确名称。
+
+`images.tar.sha256` 不得缺失；脚本会在 `docker load` 前解析 tar manifest，严格要求
+`edge-iot/backend:offline-amd64`、`edge-iot/web:offline-amd64`、`redis:7.0.10`
+三个且只有这三个标签，并且均为 linux/amd64。任何校验失败都会在加载镜像、
+删容器或停旧服务前退出。
+
+> **M0 凭据轮换硬门禁**：旧版本曾把现场形态凭据提交到 Git 历史。仅从 HEAD 删除
+> 不会使其失效；现场上线前必须在 MQTT/InfluxDB 侧吊销并轮换相关凭据，同时更新
+> Django `SECRET_KEY`，将新值只通过受控渠道写入 `0600` env。未留存轮换证据时，
+> M0 不得验收。
 
 > **资源调优**：`CELERY_ACQ_CONCURRENCY` 安全默认为 32。大规模现场必须压测后
 > 再显式调高；几台设备可调到 `8`~`16` 继续节省内存。
@@ -102,7 +117,7 @@ docker compose --env-file .env --profile ui -f docker-compose.yml up -d
 
 ```bash
 curl -fsS http://localhost/ >/dev/null && echo OK
-docker compose --env-file .env -f docker-compose.yml ps   # 各服务 Up / healthy
+docker ps --filter name='-iot'                 # 各服务 Up / healthy
 ```
 
 浏览器访问 `http://<工控机IP>/` 即为前端。
@@ -140,8 +155,8 @@ docker compose --env-file .env -f docker-compose.yml ps   # 各服务 Up / healt
 
 ## 5. 常见问题
 
-- **`[缺] redis:7.0.10`**：目标机没有该镜像。若宿主机已自跑 Redis → 删 compose 里 redis 服务；
-  否则先单独 `docker load` redis 镜像。
+- **镜像包校验失败**：重新从受信构建机拷贝完整的 `images.tar` 和
+  `images.tar.sha256`，不得跳过校验或手工修改 manifest。
 - **数据写不进 InfluxDB**：确认 `.env` 中的 host/port/org/bucket/token 与现场 InfluxDB
   一致（host 网络下容器内 127.0.0.1 = 宿主机）。不要在日志或工单中粘贴 token。
 - **:80 被占用**：改宿主机上占用者，或改用 host 网络时需释放 80；host 网络下不支持端口重映射。

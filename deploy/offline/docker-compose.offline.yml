@@ -4,8 +4,8 @@
 #
 # 【网络形态】所有服务用 host 网络（network_mode: host），因此容器内 127.0.0.1
 # 等于宿主机 loopback：
-#   - InfluxDB **由生产环境自行运行**在宿主机 127.0.0.1:8086（本包不启动它，
-#     只连它，org=Midea / bucket=Record）。
+#   - InfluxDB **由生产环境自行运行**；地址、端口、org 与 bucket 都必须由受保护
+#     env 文件显式提供，本包不内置任何现场值。
 #   - Redis 由本包启动（redis:7.0.10，目标机已有镜像）监听 127.0.0.1:6379。
 #     若宿主机已自跑 Redis 占用 6379，删掉下面 redis 服务即可，后端仍连 127.0.0.1:6379。
 #   - Django 仅绑 127.0.0.1:8000（不对外）；nginx(web) 绑 0.0.0.0:80 反代到它，
@@ -79,8 +79,8 @@ services:
       - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
       - REDIS_PORT=${REDIS_PORT:-6379}
       # InfluxDB 由生产环境自行运行在宿主机；host 网络下 127.0.0.1 即宿主机
-      - INFLUXDB_HOST=${INFLUXDB_HOST:-127.0.0.1}
-      - INFLUXDB_PORT=${INFLUXDB_PORT:-8086}
+      - "INFLUXDB_HOST=${INFLUXDB_HOST:?INFLUXDB_HOST must be set in the protected env file}"
+      - "INFLUXDB_PORT=${INFLUXDB_PORT:?INFLUXDB_PORT must be set in the protected env file}"
       - "INFLUXDB_TOKEN=${INFLUXDB_TOKEN:?INFLUXDB_TOKEN must be set in the protected env file}"
       - "INFLUXDB_ORG=${INFLUXDB_ORG:?INFLUXDB_ORG must be set in the protected env file}"
       - "INFLUXDB_BUCKET=${INFLUXDB_BUCKET:?INFLUXDB_BUCKET must be set in the protected env file}"
@@ -106,8 +106,8 @@ services:
       - ALLOW_PRIVATE_NETWORK_TESTS=${ALLOW_PRIVATE_NETWORK_TESTS:-False}
       - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - INFLUXDB_HOST=${INFLUXDB_HOST:-127.0.0.1}
-      - INFLUXDB_PORT=${INFLUXDB_PORT:-8086}
+      - "INFLUXDB_HOST=${INFLUXDB_HOST:?INFLUXDB_HOST must be set in the protected env file}"
+      - "INFLUXDB_PORT=${INFLUXDB_PORT:?INFLUXDB_PORT must be set in the protected env file}"
       - "INFLUXDB_TOKEN=${INFLUXDB_TOKEN:?INFLUXDB_TOKEN must be set in the protected env file}"
       - "INFLUXDB_ORG=${INFLUXDB_ORG:?INFLUXDB_ORG must be set in the protected env file}"
       - "INFLUXDB_BUCKET=${INFLUXDB_BUCKET:?INFLUXDB_BUCKET must be set in the protected env file}"
@@ -135,8 +135,8 @@ services:
       - ALLOW_PRIVATE_NETWORK_TESTS=${ALLOW_PRIVATE_NETWORK_TESTS:-False}
       - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - INFLUXDB_HOST=${INFLUXDB_HOST:-127.0.0.1}
-      - INFLUXDB_PORT=${INFLUXDB_PORT:-8086}
+      - "INFLUXDB_HOST=${INFLUXDB_HOST:?INFLUXDB_HOST must be set in the protected env file}"
+      - "INFLUXDB_PORT=${INFLUXDB_PORT:?INFLUXDB_PORT must be set in the protected env file}"
       - "INFLUXDB_TOKEN=${INFLUXDB_TOKEN:?INFLUXDB_TOKEN must be set in the protected env file}"
       - "INFLUXDB_ORG=${INFLUXDB_ORG:?INFLUXDB_ORG must be set in the protected env file}"
       - "INFLUXDB_BUCKET=${INFLUXDB_BUCKET:?INFLUXDB_BUCKET must be set in the protected env file}"

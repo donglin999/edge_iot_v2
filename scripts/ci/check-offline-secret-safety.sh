@@ -26,11 +26,13 @@ awk -F= '
 grep -Fq 'DEBUG=False' "$EXAMPLE" || fail "example must default DEBUG to False"
 grep -Fq 'ALLOW_PRIVATE_NETWORK_TESTS=False' "$EXAMPLE" \
   || fail "example must keep private-network connection tests disabled"
+grep -qx 'LEGACY_CONTAINERS=' "$EXAMPLE" \
+  || fail "example must not stop a legacy container by default"
 
-if grep -nE '\$\{(SECRET_KEY|INFLUXDB_TOKEN|ALLOWED_HOSTS|INFLUXDB_ORG|INFLUXDB_BUCKET):-' "$COMPOSE"; then
+if grep -nE '\$\{(SECRET_KEY|INFLUXDB_TOKEN|ALLOWED_HOSTS|INFLUXDB_HOST|INFLUXDB_PORT|INFLUXDB_ORG|INFLUXDB_BUCKET):-' "$COMPOSE"; then
   fail "required production values must not have Compose fallbacks"
 fi
-for required in SECRET_KEY INFLUXDB_TOKEN ALLOWED_HOSTS INFLUXDB_ORG INFLUXDB_BUCKET; do
+for required in SECRET_KEY INFLUXDB_TOKEN ALLOWED_HOSTS INFLUXDB_HOST INFLUXDB_PORT INFLUXDB_ORG INFLUXDB_BUCKET; do
   grep -Fq '${'"$required"':?' "$COMPOSE" \
     || fail "$required is not fail-closed in Compose"
 done
@@ -74,10 +76,23 @@ if bad:
 PY
 
 validate_line=$(grep -nE '^[[:space:]]*\./validate-env\.sh ' "$LOADER" | head -1 | cut -d: -f1)
+archive_line=$(grep -nE 'verify-image-archive\.py images\.tar images\.tar\.sha256' "$LOADER" | head -1 | cut -d: -f1)
 load_line=$(grep -n '^docker load ' "$LOADER" | head -1 | cut -d: -f1)
 [ -n "$validate_line" ] && [ -n "$load_line" ] && [ "$validate_line" -lt "$load_line" ] \
   || fail "loader must validate secrets before docker load or runtime mutation"
-grep -Fq 'validate-env.sh' scripts/offline/build-offline-bundle.sh \
-  || fail "offline bundle must include validate-env.sh"
+[ -n "$archive_line" ] && [ "$archive_line" -lt "$load_line" ] \
+  || fail "loader must verify the archive before docker load"
+grep -Fq 'unset DJANGO_DB_NAME SECRET_KEY DEBUG ALLOWED_HOSTS' "$LOADER" \
+  || fail "loader must clear caller shell configuration precedence"
+grep -Fq 'local clean_env=(env -i "PATH=$PATH")' "$LOADER" \
+  || fail "Compose must run from an allow-listed environment"
+grep -Fq 'prepare-env.py prepare' "$LOADER" \
+  || fail "loader must pin the validated env file to a private snapshot"
+grep -Fq 'VALIDATED_INFLUXDB_HOST' "$LOADER" \
+  || fail "health check must use the validated Influx host"
+for helper in validate-env.sh prepare-env.py verify-image-archive.py; do
+  grep -Fq "$helper" scripts/offline/build-offline-bundle.sh \
+    || fail "offline bundle must include $helper"
+done
 
 echo "offline secret safety gate: OK"

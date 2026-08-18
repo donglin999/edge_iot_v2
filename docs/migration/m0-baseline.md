@@ -66,7 +66,10 @@ SQLite 通过 `app-db:/data` 在后端服务之间共享。
 - Redis 无持久卷。
 - Influx spill SQLite 默认位于 `/app/influx_spill.sqlite3`，没有落入 `/data` volume；
   容器替换可能丢失待回放批次。
-- Compose 带默认 Influx token、Django secret 与 `DEBUG=True`；生产必须改为必填密钥。
+- 基线时 Compose 曾带默认 Influx token、Django secret 与 `DEBUG=True`；现已改为
+  受保护 env 必填、安全默认和启动前 fail-closed 校验。
+- 历史凭据即使从 HEAD 删除仍视为已暴露；MQTT/InfluxDB 侧吊销、轮换、
+  Django `SECRET_KEY` 更新及证据留存是 M0 外部验收硬门禁，未完成前不得上线。
 
 ## 3. 数据职责和 schema
 
