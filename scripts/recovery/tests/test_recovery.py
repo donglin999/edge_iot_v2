@@ -98,12 +98,38 @@ class SafetyTests(unittest.TestCase):
                 + "SECRET_KEY"
                 + ": "
                 + "hardcoded-credential\n"
+                "networks:\n  x:\n    driver: bridge\n    internal: true\n"
+                "    enable_ipv6: false\n"
+                "    driver_opts:\n"
+                "      com.docker.network.bridge.gateway_mode_ipv4: isolated\n"
+            )
+            with self.assertRaisesRegex(safety.SafetyError, "credential literal"):
+                safety.validate_compose_source(str(credential))
+
+            published = Path(raw_root) / "published.yml"
+            published.write_text(
+                "services:\n  x:\n    image: sha256:"
+                + "a" * 64
+                + "\n    pull_policy: never\n"
                 "    ports:\n      - target: 80\n        published: \"0\"\n"
                 "        host_ip: \"127.0.0.1\"\n"
                 "networks:\n  x:\n    driver: bridge\n    internal: true\n"
             )
-            with self.assertRaisesRegex(safety.SafetyError, "credential literal"):
-                safety.validate_compose_source(str(credential))
+            with self.assertRaisesRegex(safety.SafetyError, "must not publish"):
+                safety.validate_compose_source(str(published))
+
+            not_isolated = Path(raw_root) / "not-isolated.yml"
+            not_isolated.write_text(
+                (RECOVERY_ROOT / "docker-compose.m0-ci.yml")
+                .read_text(encoding="utf-8")
+                .replace(
+                    "com.docker.network.bridge.gateway_mode_ipv4: isolated",
+                    "com.docker.network.bridge.gateway_mode_ipv4: nat",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(safety.SafetyError, "host bridge gateway"):
+                safety.validate_compose_source(str(not_isolated))
 
     def test_static_scan_rejects_broad_cleanup_without_rg_on_path(self):
         with tempfile.TemporaryDirectory() as raw_root:
@@ -347,8 +373,12 @@ class SafetyTests(unittest.TestCase):
                 "Driver": "bridge",
                 "Scope": "local",
                 "Internal": True,
+                "EnableIPv6": False,
                 "Attachable": False,
                 "Ingress": False,
+                "Options": {
+                    safety.ISOLATED_GATEWAY_OPTION: "isolated",
+                },
                 "Labels": {"com.edge-iot.m0.project": project},
                 "Containers": {
                     container_id: {"Name": f"{project}-dind"}
@@ -361,6 +391,13 @@ class SafetyTests(unittest.TestCase):
         )
         mutations = (
             ("not internal", lambda item: item.update(Internal=False)),
+            ("IPv6 enabled", lambda item: item.update(EnableIPv6=True)),
+            (
+                "gateway mode",
+                lambda item: item["Options"].update(
+                    {safety.ISOLATED_GATEWAY_OPTION: "nat"}
+                ),
+            ),
             ("wrong driver", lambda item: item.update(Driver="overlay")),
             ("wrong scope", lambda item: item.update(Scope="swarm")),
             ("attachable", lambda item: item.update(Attachable=True)),
@@ -387,6 +424,81 @@ class SafetyTests(unittest.TestCase):
                     network_id,
                     network_name,
                     container_id,
+                    project,
+                )
+
+    def test_application_runtime_network_is_host_isolated_and_exact(self):
+        project = "m0ci-run-123456"
+        network_id = "e" * 64
+        redis_id = "a" * 64
+        influx_id = "b" * 64
+        document = [
+            {
+                "Id": network_id,
+                "Name": f"{project}_drill",
+                "Driver": "bridge",
+                "Scope": "local",
+                "Internal": True,
+                "EnableIPv6": False,
+                "Attachable": False,
+                "Ingress": False,
+                "Options": {
+                    safety.ISOLATED_GATEWAY_OPTION: "isolated",
+                },
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.network": "drill",
+                },
+                "Containers": {
+                    redis_id: {"Name": f"{project}-redis-1"},
+                    influx_id: {"Name": f"{project}-influx-1"},
+                },
+            }
+        ]
+        raw = json.dumps(document)
+        safety.validate_app_network(raw, network_id, redis_id, influx_id, project)
+        mutations = (
+            (
+                "gateway mode",
+                lambda item: item["Options"].update(
+                    {safety.ISOLATED_GATEWAY_OPTION: "nat"}
+                ),
+            ),
+            ("not internal", lambda item: item.update(Internal=False)),
+            ("IPv6 enabled", lambda item: item.update(EnableIPv6=True)),
+            ("wrong driver", lambda item: item.update(Driver="overlay")),
+            (
+                "wrong label",
+                lambda item: item["Labels"].update(
+                    {"com.docker.compose.network": "wrong"}
+                ),
+            ),
+            (
+                "extra option",
+                lambda item: item["Options"].update(
+                    {"com.docker.network.bridge.enable_ip_masquerade": "true"}
+                ),
+            ),
+            (
+                "extra container",
+                lambda item: item["Containers"].update(
+                    {"c" * 64: {"Name": "intruder"}}
+                ),
+            ),
+            (
+                "wrong member name",
+                lambda item: item["Containers"][redis_id].update(Name="wrong"),
+            ),
+        )
+        for label, mutate in mutations:
+            candidate = json.loads(raw)
+            mutate(candidate[0])
+            with self.subTest(label=label), self.assertRaises(safety.SafetyError):
+                safety.validate_app_network(
+                    json.dumps(candidate),
+                    network_id,
+                    redis_id,
+                    influx_id,
                     project,
                 )
 
@@ -892,9 +1004,24 @@ class SmokeHelpersTests(unittest.TestCase):
         with self.assertRaises(smoke.SmokeError):
             smoke.result_list({"data": []})
 
-    def test_websocket_rejects_non_loopback_target(self):
+    def test_websocket_rejects_external_target(self):
         with self.assertRaises(smoke.SmokeError):
             smoke.websocket_first_message("http://example.com:80")
+
+    def test_smoke_accepts_only_internal_web_origin(self):
+        self.assertEqual(smoke.validate_base_url("http://web").hostname, "web")
+        for value in (
+            "http://web:8080",
+            "http://web.example",
+            "http://127.0.0.1:38080",
+            "http://localhost",
+            "https://web",
+            "http://user@web",
+            "http://web/path",
+            "http://web?query=1",
+        ):
+            with self.subTest(value=value), self.assertRaises(smoke.SmokeError):
+                smoke.validate_base_url(value)
 
     def test_celery_reports_bind_exact_node_and_queue(self):
         node = "m0-acq@m0ci-run-123456-acq"

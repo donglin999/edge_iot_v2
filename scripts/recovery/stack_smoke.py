@@ -13,11 +13,27 @@ import sys
 import urllib.error
 import urllib.request
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 
 class SmokeError(RuntimeError):
     pass
+
+
+def validate_base_url(base_url: str) -> SplitResult:
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise SmokeError("smoke target must be an isolated drill HTTP origin")
+    if parsed.hostname != "web" or parsed.port not in (None, 80):
+        raise SmokeError("smoke target must be the internal web service on port 80")
+    return parsed
 
 
 def get(base_url: str, path: str) -> tuple[int, bytes, str]:
@@ -65,9 +81,7 @@ def _read_exact(sock: socket.socket, size: int, prefix: bytes) -> tuple[bytes, b
 
 
 def websocket_first_message(base_url: str) -> Any:
-    parsed = urlsplit(base_url)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
-        raise SmokeError("smoke target must be a loopback HTTP URL")
+    parsed = validate_base_url(base_url)
     port = parsed.port or 80
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (
@@ -116,6 +130,7 @@ def websocket_first_message(base_url: str) -> Any:
 
 
 def run(base_url: str) -> dict[str, Any]:
+    validate_base_url(base_url)
     status, home, content_type = get(base_url, "/")
     if status != 200 or b'id="root"' not in home or "text/html" not in content_type:
         raise SmokeError("restored frontend did not return the built SPA")

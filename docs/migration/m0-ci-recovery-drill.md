@@ -13,12 +13,20 @@
   这是“源码发生任何变化就必须重新审查并更新摘要”的完整性回归门禁，不宣称能推导任意 Shell 语义。
 - Compose 文件不允许 `container_name`、`network_mode: host` 或 external resource；应用网络是
   `internal: true` 的 bridge。DinD 另建仅属于本 project 的 internal bridge，并在结束时按
-  Docker 返回的 network ID 精确删除。DinD 不发布任何宿主端口，只监听容器内 Unix socket；
+  Docker 返回的 network ID 精确删除。两个 bridge 都使用 isolated IPv4 gateway 并禁用 IPv6；
+  DinD 不发布任何宿主端口，只监听容器内 Unix socket；
   held-fd 镜像流通过宿主 `docker exec -i <immutable-container-id> docker image load` 送入该 socket。
   container ID 必须是 `docker run` 返回的完整 64 位 immutable ID，不接受可变容器名，也不落盘
   客户端证书或暴露远程 Docker API。启动后还会核对实际 image/command/label/空 port binding/唯一
   network；退出时使用精确 container ID 和 `rm -v` 删除 `/var/lib/docker` 匿名卷并验证它已不存在。
-- Web 与 Influx 的随机宿主端口只绑定 `127.0.0.1`。Redis、Django、Celery 不发布端口。
+- 回滚栈所有服务均不发布宿主端口。HTTP/API/WebSocket smoke 由只读、去 capability 的
+  `stack-smoke` 工具容器在 project 私有 internal bridge 内访问精确服务名 `http://web`；
+  该 bridge 同时要求 Moby 28+ 的
+  `com.docker.network.bridge.gateway_mode_ipv4=isolated`，移除 host bridge gateway。
+  IPv6 被显式禁用，避免 daemon 默认网络选项重新引入 IPv6 host gateway。启动后会对
+  network ID、driver、scope、internal/IPv6/isolated option、Compose labels 和初始成员
+  做精确 inspect；因此宿主与外部网络都没有可连接入口。缺少该能力的旧 Docker Engine
+  会 fail closed，不能运行此恢复演练。
 - SQLite、Influx data/config 都使用 project 私有新卷。退出 trap 只删除这个已验证 project
   的资源，从不调用 prune，也不按模糊名称删除资源。
 - 所有镜像必须先显式 prepare；演练收到的引用只能是六个 `sha256:<64 hex>` immutable ID。
@@ -48,8 +56,9 @@
    并逐个 inspect 原 ID。
 5. 用恢复后的 SQLite、恢复后的 Influx bucket 以及 SHA-pinned backend/web/Redis 启动回滚栈。
    对每个运行容器重新核对顶层 `.Image`。
-6. 经 Nginx 真实执行 SPA HTTP、Site/Session/DataPoint/Alarm API、RFC 6455 WebSocket upgrade
-   与恢复后初始首帧读取。这只证明**恢复后的静态事实源可读**，不声称验证实时采集、动态告警
+6. 在同一 project 私有 internal bridge 内，经 Nginx 真实执行 SPA HTTP、
+   Site/Session/DataPoint/Alarm API、RFC 6455 WebSocket upgrade 与恢复后初始首帧读取；
+   全程不发布宿主端口。这只证明**恢复后的静态事实源可读**，不声称验证实时采集、动态告警
    或消息推送链路。
 7. 分别定向完整唯一节点名检查 acquisition 与 short 两个 Celery worker 的 ping，并检查
    `active_queues` 确实为 `acquisition` / `short`，不以单个模糊 `pong` 代替双 worker 验收。

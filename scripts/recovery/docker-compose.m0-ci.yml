@@ -55,11 +55,6 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: m0-source
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${M0_INFLUX_TOKEN:?ephemeral drill token required}
     networks: [drill]
-    ports:
-      - target: 8086
-        published: "0"
-        host_ip: "127.0.0.1"
-        protocol: tcp
     volumes:
       - influx-data:/var/lib/influxdb2
       - influx-config:/etc/influxdb2
@@ -122,6 +117,21 @@ services:
       - app-db:/data
       - ${M0_EVIDENCE_ROOT:?evidence root required}:/evidence
       - ${M0_TOKEN_FILE:?token file required}:/run/secrets/influx.token:ro
+    networks: [drill]
+
+  stack-smoke:
+    <<: *light-limits
+    image: ${M0_TOOL_IMAGE_ID:?immutable recovery tool ID required}
+    pull_policy: never
+    profiles: [tools]
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+    volumes:
+      - ${M0_REPO_ROOT:?repository root required}/scripts/recovery:/recovery:ro
     networks: [drill]
 
   django:
@@ -190,11 +200,6 @@ services:
       BACKEND_UPSTREAM: django:8000
       WEB_PORT: "80"
     networks: [drill]
-    ports:
-      - target: 80
-        published: "0"
-        host_ip: "127.0.0.1"
-        protocol: tcp
     depends_on:
       django:
         condition: service_healthy
@@ -203,6 +208,9 @@ networks:
   drill:
     driver: bridge
     internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
 
 volumes:
   app-db:

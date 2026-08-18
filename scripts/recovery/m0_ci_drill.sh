@@ -276,6 +276,16 @@ export COMPOSE_PROJECT_NAME="$PROJECT"
 
 STACK_STARTED=1
 "${compose[@]}" up -d --wait redis influx
+APP_NETWORK_NAME="${PROJECT}_drill"
+APP_NETWORK_ID="$(docker network inspect "$APP_NETWORK_NAME" --format '{{.Id}}')"
+REDIS_CONTAINER_ID="$("${compose[@]}" ps -q redis)"
+INFLUX_CONTAINER_ID="$("${compose[@]}" ps -q influx)"
+test -n "$APP_NETWORK_ID" && test -n "$REDIS_CONTAINER_ID" && test -n "$INFLUX_CONTAINER_ID"
+docker network inspect "$APP_NETWORK_ID" | python3 "$SAFETY" app-network \
+  --network-id "$APP_NETWORK_ID" \
+  --redis-container-id "$REDIS_CONTAINER_ID" \
+  --influx-container-id "$INFLUX_CONTAINER_ID" \
+  --project "$PROJECT"
 "${compose[@]}" --profile prep run --rm --no-deps volume-init
 "${compose[@]}" --profile prep run --rm --no-deps \
   -e DJANGO_DB_NAME=/data/source.sqlite3 migrate
@@ -328,7 +338,8 @@ run_evidence image-save-report.json python3 "$SCRIPT_DIR/image_archive.py" save 
   --image-id "$M0_WEB_IMAGE_ID" \
   --image-id "$M0_REDIS_IMAGE_ID"
 
-DIND_NETWORK_ID="$(docker network create --driver bridge --internal \
+DIND_NETWORK_ID="$(docker network create --driver bridge --internal --ipv6=false \
+  --opt com.docker.network.bridge.gateway_mode_ipv4=isolated \
   --label "com.edge-iot.m0.project=$PROJECT" "$DIND_NETWORK_NAME")"
 test -n "$DIND_NETWORK_ID"
 DIND_ID="$(docker run -d --pull=never --privileged --name "$DIND_NAME" \
@@ -371,32 +382,9 @@ for service in redis influx django celery-acq celery-short web; do
   test "$actual" = "$expected" || { echo "ERROR: $service is not SHA-pinned" >&2; exit 2; }
 done
 
-WEB_PORT="$("${compose[@]}" port web 80 | awk -F: 'NR == 1 {print $NF}')"
-test -n "$WEB_PORT"
-WEB_CONTAINER="$("${compose[@]}" ps -q web)"
-INFLUX_CONTAINER="$("${compose[@]}" ps -q influx)"
-python3 - "$WEB_CONTAINER" "$INFLUX_CONTAINER" <<'PY'
-import json
-import subprocess
-import sys
-
-for container in sys.argv[1:]:
-    ports = json.loads(subprocess.check_output([
-        "docker", "inspect", container,
-        "--format", "{{json .NetworkSettings.Ports}}",
-    ]))
-    seen = 0
-    for bindings in ports.values():
-        for binding in bindings or []:
-            seen += 1
-            if binding["HostIp"] != "127.0.0.1":
-                raise SystemExit("published drill port is not loopback-bound")
-    if seen != 1:
-        raise SystemExit("each published drill service must have one loopback binding")
-PY
-
 run_evidence stack-smoke-report.json \
-  python3 "$SCRIPT_DIR/stack_smoke.py" --base-url "http://127.0.0.1:$WEB_PORT"
+  "${compose[@]}" --profile tools run --rm --no-deps -T stack-smoke \
+  python /recovery/stack_smoke.py --base-url http://web
 
 check_worker() {
   local service="$1" node="$2" queue="$3"

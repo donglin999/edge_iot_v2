@@ -15,7 +15,8 @@ from typing import Iterable, Optional, Sequence
 
 PROJECT_RE = re.compile(r"^m0ci-[a-z0-9](?:[a-z0-9-]{6,46}[a-z0-9])$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-RECOVERY_SCRIPT_SHA256 = "b16868aa0f4a6b2e62328643723e2f78d285421910bb85247d1f3e8332b5f799"
+ISOLATED_GATEWAY_OPTION = "com.docker.network.bridge.gateway_mode_ipv4"
+RECOVERY_SCRIPT_SHA256 = "e1d16e506d9ced175f8b64b1dcb178a10ba4956bafada5a710748fac1ff4490b"
 INFLUX_CLI_URL = (
     "https://dl.influxdata.com/influxdb/releases/"
     "influxdb2-client-2.7.5-linux-amd64.tar.gz"
@@ -141,12 +142,16 @@ def validate_compose_source(path_value: str) -> Path:
     no_pull_count = text.count("\n    pull_policy: never")
     if image_count == 0 or no_pull_count != image_count:
         raise SafetyError("every drill image must be protected by pull_policy: never")
-    published_count = text.count("\n        published:")
-    loopback_count = text.count('\n        host_ip: "127.0.0.1"')
-    if published_count == 0 or loopback_count != published_count:
-        raise SafetyError("published ports must be explicitly bound to 127.0.0.1")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("ports:", "published:", "host_ip:")):
+            raise SafetyError("the internal drill stack must not publish host ports")
     if "driver: bridge" not in text or "internal: true" not in text:
         raise SafetyError("drill network must be an internal bridge")
+    if "enable_ipv6: false" not in text:
+        raise SafetyError("drill network must explicitly disable IPv6")
+    if f"{ISOLATED_GATEWAY_OPTION}: isolated" not in text:
+        raise SafetyError("drill network must remove the host bridge gateway")
     credential_keys = {
         "SECRET_KEY",
         "INFLUXDB_TOKEN",
@@ -467,22 +472,82 @@ def validate_dind_network(
     item = document[0]
     labels = item.get("Labels") or {}
     containers = item.get("Containers") or {}
+    options = item.get("Options") or {}
     if item.get("Id") != network_id or item.get("Name") != network_name:
         raise SafetyError("DinD network immutable identity mismatch")
     if (
         item.get("Driver") != "bridge"
         or item.get("Scope") != "local"
         or item.get("Internal") is not True
+        or item.get("EnableIPv6") is not False
         or item.get("Attachable") is not False
         or item.get("Ingress") is not False
     ):
         raise SafetyError("DinD network is not one local internal bridge")
     if labels.get("com.edge-iot.m0.project") != project:
         raise SafetyError("DinD network project label mismatch")
+    if options != {ISOLATED_GATEWAY_OPTION: "isolated"}:
+        raise SafetyError("DinD network does not use isolated gateway mode")
     if set(containers) != {container_id}:
         raise SafetyError("DinD network must contain exactly the isolated daemon")
     if (containers[container_id] or {}).get("Name") != f"{project}-dind":
         raise SafetyError("DinD network container name mismatch")
+
+
+def validate_app_network(
+    raw: str,
+    network_id: str,
+    redis_container_id: str,
+    influx_container_id: str,
+    project: str,
+) -> None:
+    """Prove the application bridge has no host gateway or extra members."""
+    validate_project(project)
+    container_ids = (redis_container_id, influx_container_id)
+    if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+        raise SafetyError("application network ID must be one immutable ID")
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in container_ids):
+        raise SafetyError("application network members must be immutable container IDs")
+    if len(set(container_ids)) != 2:
+        raise SafetyError("application network members must be distinct")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SafetyError("application network inspect JSON is invalid") from exc
+    if not isinstance(document, list) or len(document) != 1 or not isinstance(document[0], dict):
+        raise SafetyError("application network inspect must contain exactly one network")
+    item = document[0]
+    labels = item.get("Labels") or {}
+    containers = item.get("Containers") or {}
+    options = item.get("Options") or {}
+    expected_name = f"{project}_drill"
+    if item.get("Id") != network_id or item.get("Name") != expected_name:
+        raise SafetyError("application network immutable identity mismatch")
+    if (
+        item.get("Driver") != "bridge"
+        or item.get("Scope") != "local"
+        or item.get("Internal") is not True
+        or item.get("EnableIPv6") is not False
+        or item.get("Attachable") is not False
+        or item.get("Ingress") is not False
+    ):
+        raise SafetyError("application network is not one local internal bridge")
+    if options != {ISOLATED_GATEWAY_OPTION: "isolated"}:
+        raise SafetyError("application network does not use isolated gateway mode")
+    if (
+        labels.get("com.docker.compose.project") != project
+        or labels.get("com.docker.compose.network") != "drill"
+    ):
+        raise SafetyError("application network Compose labels mismatch")
+    expected_members = {
+        redis_container_id: f"{project}-redis-1",
+        influx_container_id: f"{project}-influx-1",
+    }
+    if set(containers) != set(expected_members):
+        raise SafetyError("application network must contain only Redis and Influx")
+    for container_id, expected_name in expected_members.items():
+        if (containers[container_id] or {}).get("Name") != expected_name:
+            raise SafetyError("application network member name mismatch")
 
 
 def _dockerfile_instructions(text: str) -> tuple[str, ...]:
@@ -558,6 +623,11 @@ def build_parser() -> argparse.ArgumentParser:
     dind_network.add_argument("--network-name", required=True)
     dind_network.add_argument("--container-id", required=True)
     dind_network.add_argument("--project", required=True)
+    app_network = subparsers.add_parser("app-network")
+    app_network.add_argument("--network-id", required=True)
+    app_network.add_argument("--redis-container-id", required=True)
+    app_network.add_argument("--influx-container-id", required=True)
+    app_network.add_argument("--project", required=True)
     tool = subparsers.add_parser("tool-dockerfile")
     tool.add_argument("path")
     return parser
@@ -595,6 +665,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.network_id,
                 args.network_name,
                 args.container_id,
+                args.project,
+            )
+        elif args.command == "app-network":
+            validate_app_network(
+                sys.stdin.read(),
+                args.network_id,
+                args.redis_container_id,
+                args.influx_container_id,
                 args.project,
             )
         elif args.command == "tool-dockerfile":
