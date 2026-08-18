@@ -6,7 +6,7 @@
 FastAPI，同时保留现场已经验证过的 SQLite、Redis、Celery、InfluxDB 和工业协议
 采集链路。迁移采用绞杀者模式，每个里程碑都必须能够独立验收和回滚。
 
-以下约束贯穿 M0～M7：
+以下约束贯穿 M0～M9：
 
 - 对外 `/api/`、`/ws/` 路径、分页格式、错误格式和 InfluxDB schema 默认保持兼容。
 - SQLite 与 InfluxDB 不在本次框架迁移中换库，避免同时叠加数据迁移风险。
@@ -44,8 +44,8 @@ git worktree add ../edge_iot_v2-remediation \
 - 每个里程碑使用短分支：`codex/remediation-mX-<scope>`。
 - 每个提交只包含一个可解释的逻辑变化；迁移代码、兼容测试和必要文档应在同一
   里程碑 PR 中闭环。
-- 提交信息使用 `chore(m0): ...`、`feat(m3): ...`、`test(m6): ...`、
-  `release(m7): ...` 等格式。
+- 提交信息使用 `chore(m0): ...`、`feat(m3): ...`、`test(m8): ...`、
+  `release(m9): ...` 等格式。
 - 只显式暂存目标文件，禁止 `git add .`；提交前必须执行：
 
 ```bash
@@ -129,7 +129,7 @@ git push midea <accepted-sha>:refs/heads/codex/remediation-mX-scope
 7. 在 PR 合入后对 accepted SHA 再执行或核对同等 CI；回滚未验证、CI 未通过或两个
    远端 SHA 不可核对时，不得进入下一里程碑。
 
-## 4. M0～M7
+## 4. M0～M9
 
 ### M0：隔离、决策和可回滚基线
 
@@ -150,8 +150,9 @@ git push midea <accepted-sha>:refs/heads/codex/remediation-mX-scope
 门禁：现有 CI 全绿，当前 Docker 栈和 Mock 全流程可复现，备份恢复至少在测试环境
 演练一次。M0 只建立基线，不切流量、不修改生产数据。
 
-说明：里程碑计划文档、worktree 和测试环境的初始化提交只算 M0 准备工作。只有上列
-交付物与门禁证据全部归档后，才能把 M0 标记为 accepted 或开始 M1 实现。
+说明：里程碑计划文档、worktree 和测试环境的初始化提交只算 M0 准备工作。为了缩短
+总工期，下一里程碑可以在独立、不切流量的 worktree 中并行实现；但只有上列交付物与
+门禁证据全部归档后，才能把 M0 标记为 accepted、合入下一里程碑或改变运行行为。
 
 ### M1：API、WebSocket 与数据契约安全网
 
@@ -182,77 +183,111 @@ fixture 与文档，不改变运行行为。
 门禁：Vue 与 React 可同时访问，但所有写请求仍只有 Django API 一个写入者；Vue
 构建产物不得替换当前生产入口。新旧前端读取同一 API 的关键展示结果一致。
 
-### M3：Vue 3 功能对等与前端切换
+### M3：Vue 3 普通业务页面
 
-目标：完成仪表盘、采集控制、设备、详情、数据、导入、版本和告警等页面对等。
-
-交付物：
-
-- 8 条现有页面路由及全部表单、图表、Excel、告警和版本操作；
-- Vue 单测、浏览器冒烟和真后端 round-trip；
-- Nginx/Compose 前端切换开关，保留旧 React 镜像和入口。
-
-门禁：浏览器全流程在一次性数据库通过，控制台无阻断错误，构建体积和页面性能不
-劣于约定基线。仅切静态前端，不改变采集 worker；失败时只需把入口切回 React。
-
-### M4：FastAPI 只读 sidecar
-
-目标：FastAPI 在独立端口实现只读 API，并与 Django 响应对拍。
+目标：先迁移低风险、以 REST CRUD 为主的页面，继续调用既有 Django API。
 
 交付物：
 
-- FastAPI 配置、健康检查、Pydantic schema 和只读 repository；
-- 对现有 SQLite 表使用显式表名和字段映射；
-- 设备、测点、任务、会话、历史和告警等只读接口；
-- 影子请求/响应归一化比较报告。
+- 仪表盘、设备列表/详情、配置导入、版本历史和告警页面；
+- 通用协议字段表单、连接测试、设备编辑和 Excel 导入组件；
+- loading、空态、分页、错误态和取消请求等价测试；
+- 每个垂直页面切片的 Vue 单测与真 Django API 冒烟。
 
-门禁：FastAPI 进程不得执行 schema migration 和业务写入；对拍覆盖分页、排序、
-时间和空值。Django 仍是全部写接口和 migration 的唯一 owner。sidecar 停止不能影响
-现网 API 或采集。
+门禁：上述 6 个业务路由与 React 行为等价；设备 CRUD、连接测试、通用协议 Excel、
+告警确认/规则 CRUD、版本查看/回滚在一次性测试数据中通过。SCADA 专属配置、采集控制
+和数据可视化仍留在 M4，M3 不切默认入口。
 
-### M5：FastAPI 写接口与控制面切流
+### M4：Vue 3 高风险实时功能
 
-目标：按业务域逐条迁移配置、导入、版本和采集控制接口。
+目标：迁移 SCADA、采集控制和数据可视化三条高风险关键路径。
 
 交付物：
 
-- 每条 mutation 路由的 owner 表，明确 `Django` 或 `FastAPI`；
-- CRUD、Excel 导入/导出、配置版本和回滚事务；
+- SCADA 网关及 N 设备 × M 测点动态表单、Excel round-trip；
+- 采集任务启停、WebSocket 断线重连、1Hz 消息聚合和会话日志；
+- 历史图、离散/文本值展示与大测点虚拟滚动；
+- 高频消息、断线、取消、卸载清理和 5k 测点压力测试。
+
+门禁：M1 的 REST/WS/Excel 契约保持不变；SCADA 导入导出、任务启停、断线重连、
+历史图和虚拟滚动全绿，浏览器无 timer/socket 泄漏或阻断错误。仍不切默认入口。
+
+### M5：Vue 3 全量切换与回滚
+
+目标：在 8 条路由全量对等后，只切换静态前端入口。
+
+交付物：
+
+- Vue 单测、浏览器全流程和真后端 round-trip；
+- Nginx、Compose、离线 Web 镜像与文档改为 Vue 产物；
+- React 旧镜像、产物和入口回退说明；
+- 切换前后构建体积、页面 p95 和控制台错误对比。
+
+门禁：一次性数据库全流程通过，82 个既有 React 测试场景的业务语义全部保留；只切
+静态前端，不改变 Django API、schema 或采集 worker。部署切换必须是单独原子提交，
+一笔 revert 即可恢复 React。
+
+### M6：FastAPI 壳、认证与只读兼容层
+
+目标：FastAPI 在独立端口建立生产级骨架，以只读影子流量与 Django 响应对拍。
+
+交付物：
+
+- FastAPI 配置、健康检查、生命周期、结构化日志、异常信封和 OpenAPI；
+- 与现有认证/RBAC 等价的依赖与拒绝路径；
+- Pydantic schema、只读 repository 和显式 SQLite 表/字段映射；
+- 设备、测点、任务、会话、历史、告警等只读接口与影子对拍报告。
+
+门禁：FastAPI 不执行 migration 或业务写入；契约对拍覆盖权限、分页、排序、Decimal、
+时间和空值。Django 仍是全部写入和 schema owner；sidecar 停止不能影响当前 API 或采集。
+
+### M7：FastAPI 业务写接口与控制面切流
+
+目标：按业务域迁移配置、导入、版本、告警和采集控制写接口。
+
+交付物：
+
+- 每条 mutation 路由的唯一 owner 表；
+- CRUD、Excel 导入/导出、配置版本/回滚和告警事务；
 - FastAPI 调用既有 Celery task 的适配层；
-- 按 URL 前缀或显式路由切换的反向代理配置。
+- 按精确 URL 切换的反向代理配置与逐域回退开关。
 
-门禁：禁止数据库双写和“失败后再让另一个后端补写”；一个路由切到 FastAPI 后，
-Django 同路由必须从生产入口移除。Django migrations 仍是共存期唯一 schema owner。
-采集仍由原 `celery-acq` 独占执行，因此本阶段不应产生采集停顿。
+门禁：禁止双写和“失败后让另一个后端补写”；一个路由切到 FastAPI 后，Django 同路由
+必须从生产入口移除。共存期仍由 Django migration 独占 schema；采集仍由原
+`celery-acq` 独占，本阶段不切 worker。
 
-### M6：WebSocket、采集运行时解耦与离线 RC
+### M8：WebSocket、Influx 与采集运行时解耦
 
-目标：迁移实时推送，并让 Celery/采集代码不再依赖 Django ORM 与 signals；生成发布
-候选离线包。
+目标：迁移实时推送，并让采集运行时不再依赖 Django ORM、signals 或 Channels。
 
 交付物：
 
-- FastAPI WebSocket + Redis 广播，消息与 M1 契约一致；
-- repository/service 显式承接采样率变更重启、删除级联、startup recovery、watchdog、
-  告警和幂等守卫；
-- Alembic baseline；只有 Django migration 冻结后才能接管 schema；
-- 可在干净 amd64 环境安装的 RC 离线包。
+- FastAPI WebSocket + Redis 广播，事件名、帧和重连语义与 M1 契约一致；
+- Influx 查询/写入、spill/replay 和历史接口适配；
+- repository/service 显式承接采样率重启、删除级联、startup recovery、watchdog、告警
+  和幂等守卫；
+- Alembic baseline；只有 Django migration 冻结后才能接管 schema。
 
-门禁：
+门禁：Mock 协议全链路、Redis/Influx/设备断连、worker kill 和恢复通过；WebSocket
+无异常重复且可重连，采集 schema 不变。采集 worker 演练必须先停旧实例、flush、确认
+设备/Broker 连接释放，再启新实例；任何环境不得让新旧采集器连接同一设备或账号。
 
-- Mock 协议全链路、Redis/Influx/设备断连、worker kill 和恢复测试通过；
-- WebSocket 无重复、可重连，采集数据 schema 不变；
-- 实验室连续运行至少 72 小时，新增丢失和重复不得超过基线；
-- 迁移采集 worker 的演练必须先停旧 worker、flush、确认连接释放，再启新 worker；
-  任何环境都不得让新旧采集器同时连接同一现场设备或账号。
+### M9：移除 Django 运行时、发布 RC 与现场灰度
 
-### M7：发布、现场灰度与关闭旧栈
+目标：生产运行不再依赖 Django/DRF/Channels，从 accepted SHA 构建不可变发布物，
+完成单站灰度、回滚演练和最终交接。
 
-目标：从已接受 SHA 构建不可变发布物，完成单站灰度、回滚演练和最终交接。
+交付物：
+
+- 运行 Compose/镜像/启动脚本移除 Django 服务和 Django migration 入口；
+- FastAPI/Alembic 成为唯一控制面与 schema owner；
+- 清理仅供 Django 运行时使用的代码和依赖，保留必要的数据迁移/审计工具；
+- 干净 amd64 环境可安装的离线 RC、SBOM、镜像 digest 和恢复证据；
+- 24/72 小时稳定性、资源、丢失/重复和现场回滚报告。
 
 发布前门禁：
 
-- M0～M6 的 accepted SHA、CI 和验收记录完整；
+- M0～M8 的 accepted SHA、CI 和验收记录完整；
 - 使用 Git SHA/版本号标记镜像并记录 digest，不只使用可变的 `latest` 或
   `offline-amd64` tag；
 - `images.tar.sha256` 正确，manifest 中所有目标镜像均为 `amd64`；
@@ -279,7 +314,7 @@ Broker 142 互踢、migration 失败、持续 API 5xx、关键 WS 断流或新�
 容器 inspect 和数据样本供复盘。
 
 发布提交与 tag 必须先在 `origin` 完成 CI/评审，再将同一 SHA 推送到 `midea`。两个
-远端的 release branch 和 annotated tag SHA 一致，才算 M7 Git 交付完成。
+远端的 release branch 和 annotated tag SHA 一致，才算 M9 Git 交付完成。
 
 ## 5. 完成定义
 
