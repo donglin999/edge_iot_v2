@@ -848,8 +848,10 @@ def assert_bucket_absent(
         token,
         command_timeout,
     )
+    if not output.strip():
+        raise BackupError("empty bucket-list response; refusing restore")
     try:
-        payload = json.loads(output or "[]")
+        payload = json.loads(output)
     except json.JSONDecodeError as exc:
         raise BackupError("could not determine whether restore bucket exists") from exc
     if isinstance(payload, dict):

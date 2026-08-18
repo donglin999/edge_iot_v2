@@ -110,7 +110,49 @@ def validate_compose_source(path_value: str) -> Path:
         raise SafetyError("published ports must be explicitly bound to 127.0.0.1")
     if "driver: bridge" not in text or "internal: true" not in text:
         raise SafetyError("drill network must be an internal bridge")
+    credential_keys = {
+        "SECRET_KEY",
+        "INFLUXDB_TOKEN",
+        "DOCKER_INFLUXDB_INIT_PASSWORD",
+        "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        if key in credential_keys and not value.strip().startswith("${"):
+            raise SafetyError(f"Compose source contains a credential literal: {key}")
     return path
+
+
+def validate_recovery_scripts(root_value: str) -> Path:
+    root = Path(root_value).resolve(strict=True)
+    if not root.is_dir():
+        raise SafetyError("recovery script root must be a directory")
+    broad_cleanup = re.compile(
+        r"\bdocker\s+(?:system|image|volume|network)\s+prune\b"
+        r"|\bdocker\s+compose\s+down\b"
+    )
+    unsafe_evidence_redirect = re.compile(
+        r">{1,2}\s*[\"']?\$\{?EVIDENCE_ROOT\}?"
+    )
+    for path in sorted(root.rglob("*.sh")):
+        relative = path.relative_to(root)
+        if "tests" in relative.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if broad_cleanup.search(text):
+            raise SafetyError(f"recovery script contains broad cleanup: {relative}")
+        if unsafe_evidence_redirect.search(text):
+            raise SafetyError(
+                f"recovery script bypasses exclusive evidence capture: {relative}"
+            )
+        if "2375" in text or "--tls=false" in text:
+            raise SafetyError(
+                f"recovery script contains plaintext DinD transport: {relative}"
+            )
+    return root
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -133,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     compose = subparsers.add_parser("compose")
     compose.add_argument("path")
+    scripts = subparsers.add_parser("recovery-scripts")
+    scripts.add_argument("--root", required=True)
     return parser
 
 
@@ -149,6 +193,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             validate_created_private_directory(args.path)
         elif args.command == "compose":
             validate_compose_source(args.path)
+        elif args.command == "recovery-scripts":
+            validate_recovery_scripts(args.root)
         else:  # pragma: no cover - argparse makes this unreachable.
             raise SafetyError("unsupported safety check")
     except (OSError, SafetyError) as exc:

@@ -11,23 +11,16 @@ bash -n "$RECOVERY_DIR/m0_ci_drill.sh" "$SCRIPT_DIR/test_static.sh"
 python3 -m py_compile \
   "$RECOVERY_DIR/safety.py" \
   "$RECOVERY_DIR/celery_smoke.py" \
+  "$RECOVERY_DIR/dind_tls.py" \
+  "$RECOVERY_DIR/evidence_io.py" \
   "$RECOVERY_DIR/image_archive.py" \
   "$RECOVERY_DIR/stack_smoke.py" \
   "$RECOVERY_DIR/seed_fixture.py"
 python3 -m unittest discover -s "$SCRIPT_DIR" -p 'test_*.py' -v
 python3 -m unittest discover -s "$RECOVERY_DIR/../backup/tests" -p 'test_*.py' -v
 
-if rg -n 'container_name:|network_mode:|external:[[:space:]]*(true|\{)' \
-  "$RECOVERY_DIR/docker-compose.m0-ci.yml"; then
-  echo "recovery Compose must not name containers, use host networking, or attach external resources" >&2
-  exit 1
-fi
-
-if rg -n 'docker[[:space:]]+(system|image|volume|network)[[:space:]]+prune|docker[[:space:]]+compose[[:space:]]+down' \
-  "$RECOVERY_DIR" -g '!tests/test_static.sh'; then
-  echo "recovery scripts contain a broad cleanup primitive" >&2
-  exit 1
-fi
+python3 "$RECOVERY_DIR/safety.py" compose "$RECOVERY_DIR/docker-compose.m0-ci.yml"
+python3 "$RECOVERY_DIR/safety.py" recovery-scripts --root "$RECOVERY_DIR"
 
 grep -q 'pull_policy: never' "$RECOVERY_DIR/docker-compose.m0-ci.yml"
 grep -q 'host_ip: "127.0.0.1"' "$RECOVERY_DIR/docker-compose.m0-ci.yml"
@@ -39,18 +32,23 @@ grep -q 'M0_INFLUX_INIT_PASSWORD:?' "$RECOVERY_DIR/docker-compose.m0-ci.yml"
 grep -q 'COMPOSE_PROJECT_NAME="$PROJECT"' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q 'label=com.docker.compose.project=$PROJECT' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q 'M0_TOKEN_FILE="$ALLOWED_ROOT/' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'create-and-exec' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'run_evidence' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'O_EXCL' "$RECOVERY_DIR/evidence_io.py"
+grep -q 'O_NOFOLLOW' "$RECOVERY_DIR/evidence_io.py"
 grep -q 'docker network create --driver bridge --internal' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q -- '--memory 768m --cpus 1.50 --pids-limit 512' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'DOCKER_TLS_CERTDIR=/certs' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q '2376' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'openssl verify -CAfile /certs/client/ca.pem' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q -- '--tlsverify' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q -- '--docker-tls-key' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q '_stream_load_to_docker' "$RECOVERY_DIR/image_archive.py"
+grep -q 'bytes delivered to Docker do not match archive checksum' "$RECOVERY_DIR/image_archive.py"
 grep -q 'active_queues' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q -- '--json --timeout 10 --destination "$node"' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q 'set(payload) != {node}' "$RECOVERY_DIR/celery_smoke.py"
 grep -q 'queues\[0\].get("name") != expected_queue' "$RECOVERY_DIR/celery_smoke.py"
 grep -q 'ephemeral credential found in evidence' "$RECOVERY_DIR/m0_ci_drill.sh"
-
-if rg -n 'SECRET_KEY:[[:space:]]+[A-Za-z0-9]|DOCKER_INFLUXDB_INIT_PASSWORD:[[:space:]]+[A-Za-z0-9]' \
-  "$RECOVERY_DIR/docker-compose.m0-ci.yml"; then
-  echo "recovery Compose contains a credential-shaped literal" >&2
-  exit 1
-fi
 
 echo "M0 recovery static and unit gates passed"

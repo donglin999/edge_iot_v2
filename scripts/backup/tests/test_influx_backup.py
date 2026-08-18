@@ -521,6 +521,28 @@ class InfluxBackupTests(unittest.TestCase):
                 10.0,
             )
 
+    def test_bucket_absence_rejects_exit_zero_empty_stdout(self) -> None:
+        def return_empty_success(command, **kwargs):
+            self.assertNotIn("--name", command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch.object(
+            influx_backup.subprocess,
+            "run",
+            side_effect=return_empty_success,
+        ), self.assertRaisesRegex(
+            influx_backup.BackupError,
+            "empty bucket-list response; refusing restore",
+        ):
+            influx_backup.assert_bucket_absent(
+                "fake-influx",
+                "http://127.0.0.1:8086",
+                "Midea",
+                "Record_m0_restore",
+                "unit-test-secret",
+                10.0,
+            )
+
     def test_checksum_tampering_and_special_entries_are_detected(self) -> None:
         # Keep this on a local filesystem so mkfifo exercises a real special
         # entry rather than a mocked stat result.

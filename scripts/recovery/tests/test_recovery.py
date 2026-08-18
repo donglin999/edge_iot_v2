@@ -4,7 +4,10 @@ import hashlib
 import importlib.util
 import argparse
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +25,9 @@ def load_module(name: str, filename: str):
 
 
 safety = load_module("m0_safety", "safety.py")
+sys.modules["safety"] = safety
+evidence_io = load_module("m0_evidence_io", "evidence_io.py")
+dind_tls = load_module("m0_dind_tls", "dind_tls.py")
 archive = load_module("m0_image_archive", "image_archive.py")
 smoke = load_module("m0_stack_smoke", "stack_smoke.py")
 celery_smoke = load_module("m0_celery_smoke", "celery_smoke.py")
@@ -82,6 +88,220 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaises(safety.SafetyError):
                 safety.validate_compose_source(str(bad))
 
+            credential = Path(raw_root) / "credential.yml"
+            credential.write_text(
+                "services:\n  x:\n    image: sha256:"
+                + "a" * 64
+                + "\n    pull_policy: never\n    environment:\n"
+                "      "
+                + "SECRET_KEY"
+                + ": "
+                + "hardcoded-credential\n"
+                "    ports:\n      - target: 80\n        published: \"0\"\n"
+                "        host_ip: \"127.0.0.1\"\n"
+                "networks:\n  x:\n    driver: bridge\n    internal: true\n"
+            )
+            with self.assertRaisesRegex(safety.SafetyError, "credential literal"):
+                safety.validate_compose_source(str(credential))
+
+    def test_static_scan_rejects_broad_cleanup_without_rg_on_path(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            scripts = root / "recovery"
+            scripts.mkdir()
+            (scripts / "unsafe.sh").write_text(
+                "#!/bin/sh\ndocker system prune --force\n", encoding="utf-8"
+            )
+            empty_path = root / "no-rg-bin"
+            empty_path.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = str(empty_path)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(RECOVERY_ROOT / "safety.py"),
+                    "recovery-scripts",
+                    "--root",
+                    str(scripts),
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("broad cleanup", completed.stderr)
+
+    def test_static_scan_rejects_unsafe_evidence_and_plaintext_dind(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            script = root / "unsafe.sh"
+            cases = (
+                ('printf unsafe > "$EVIDENCE_ROOT/report.json"\n', "exclusive"),
+                (
+                    "docker run -p 127.0.0.1::"
+                    + "23"
+                    + "75 image --tls="
+                    + "false\n",
+                    "plaintext",
+                ),
+            )
+            for source, message in cases:
+                with self.subTest(message=message):
+                    script.write_text("#!/bin/sh\n" + source, encoding="utf-8")
+                    with self.assertRaisesRegex(safety.SafetyError, message):
+                        safety.validate_recovery_scripts(str(root))
+
+
+class EvidenceIOTests(unittest.TestCase):
+    def test_atomic_creation_rejects_preexisting_directory(self):
+        project = "m0ci-run-123456"
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            os.chmod(root, 0o700)
+            evidence = root / f"evidence-{project}"
+            evidence.mkdir(mode=0o700)
+            marker = evidence / "keep"
+            marker.write_bytes(b"preexisting")
+            with self.assertRaises(evidence_io.EvidenceError):
+                evidence_io.create_evidence_directory(
+                    str(evidence), str(root), project
+                )
+            self.assertEqual(marker.read_bytes(), b"preexisting")
+
+    def test_exclusive_capture_refuses_symlink_without_truncating_victim(self):
+        project = "m0ci-run-123456"
+        with tempfile.TemporaryDirectory() as raw_root:
+            allowed = Path(raw_root)
+            os.chmod(allowed, 0o700)
+            root, descriptor, identity = evidence_io.create_evidence_directory(
+                str(allowed / f"evidence-{project}"), str(allowed), project
+            )
+            victim = allowed / "victim"
+            victim.write_bytes(b"must-not-change")
+            (root / "report.json").symlink_to(victim)
+            try:
+                with mock.patch.object(
+                    evidence_io.subprocess, "run"
+                ) as run, self.assertRaises(evidence_io.EvidenceError):
+                    evidence_io.capture_output(
+                        root,
+                        descriptor,
+                        identity,
+                        "report.json",
+                        [sys.executable, "-c", "print('attacker')"],
+                    )
+                run.assert_not_called()
+            finally:
+                os.close(descriptor)
+            self.assertEqual(victim.read_bytes(), b"must-not-change")
+
+    def test_held_directory_descriptor_rejects_path_replacement(self):
+        project = "m0ci-run-123456"
+        with tempfile.TemporaryDirectory() as raw_root:
+            allowed = Path(raw_root)
+            os.chmod(allowed, 0o700)
+            root, descriptor, identity = evidence_io.create_evidence_directory(
+                str(allowed / f"evidence-{project}"), str(allowed), project
+            )
+            moved = allowed / "held-evidence"
+            root.rename(moved)
+            root.mkdir(mode=0o700)
+            try:
+                with self.assertRaises(evidence_io.EvidenceError):
+                    evidence_io.capture_output(
+                        root,
+                        descriptor,
+                        identity,
+                        "report.json",
+                        [sys.executable, "-c", "print('unexpected')"],
+                    )
+            finally:
+                os.close(descriptor)
+            self.assertFalse((root / "report.json").exists())
+            self.assertFalse((moved / "report.json").exists())
+
+    def test_create_exec_preserves_guard_fd_for_exclusive_child_capture(self):
+        project = "m0ci-run-123456"
+        with tempfile.TemporaryDirectory() as raw_root:
+            allowed = Path(raw_root)
+            os.chmod(allowed, 0o700)
+            root = allowed / f"evidence-{project}"
+            script = allowed / "guard-child.sh"
+            script.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                'test "$M0_EVIDENCE_GUARD_PID" = "$$"\n'
+                f'"{sys.executable}" "{RECOVERY_ROOT / "evidence_io.py"}" capture '
+                f'--root "{root}" --fd "$M0_EVIDENCE_DIR_FD" '
+                '--device "$M0_EVIDENCE_DEVICE" --inode "$M0_EVIDENCE_INODE" '
+                '--name inherited.txt -- /usr/bin/printf inherited\n',
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(RECOVERY_ROOT / "evidence_io.py"),
+                    "create-and-exec",
+                    "--path",
+                    str(root),
+                    "--allowed-root",
+                    str(allowed),
+                    "--project",
+                    project,
+                    "--script",
+                    str(script),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((root / "inherited.txt").read_bytes(), b"inherited")
+            self.assertEqual((root / "inherited.txt").stat().st_mode & 0o777, 0o600)
+
+
+class DinDTLSTests(unittest.TestCase):
+    def test_client_material_is_private_regular_pem(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            allowed = Path(raw_root)
+            os.chmod(allowed, 0o700)
+            path = allowed / ".m0ci-run-123456.dind-client"
+            identity = dind_tls.create_directory(str(path), str(allowed))
+            for name in dind_tls.REQUIRED_FILES:
+                (path / name).write_text(
+                    "-----BEGIN TEST-----\nvalue\n-----END TEST-----\n",
+                    encoding="utf-8",
+                )
+            dind_tls.secure_client_files(path, identity)
+            for name in dind_tls.REQUIRED_FILES:
+                self.assertEqual((path / name).stat().st_mode & 0o777, 0o600)
+            dind_tls.cleanup_directory(path, identity)
+            self.assertFalse(path.exists())
+
+    def test_client_key_symlink_is_rejected_without_touching_victim(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            allowed = Path(raw_root)
+            os.chmod(allowed, 0o700)
+            path = allowed / ".m0ci-run-123456.dind-client"
+            identity = dind_tls.create_directory(str(path), str(allowed))
+            for name in ("ca.pem", "cert.pem"):
+                (path / name).write_text(
+                    "-----BEGIN TEST-----\nvalue\n-----END TEST-----\n",
+                    encoding="utf-8",
+                )
+            victim = allowed / "victim-key"
+            victim.write_text("private-victim", encoding="utf-8")
+            os.chmod(victim, 0o640)
+            (path / "key.pem").symlink_to(victim)
+            with self.assertRaises(dind_tls.TLSMaterialError):
+                dind_tls.secure_client_files(path, identity)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "private-victim")
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
+
 
 class ArchiveTests(unittest.TestCase):
     def _fake_docker(self, root: Path) -> Path:
@@ -125,6 +345,23 @@ class ArchiveTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
+    def test_docker_tls_client_options_are_complete_and_explicit(self):
+        arguments = argparse.Namespace(
+            docker_bin="docker",
+            docker_host="tcp://127.0.0.1:42376",
+            docker_tls_ca="/private/ca.pem",
+            docker_tls_cert="/private/cert.pem",
+            docker_tls_key="/private/key.pem",
+        )
+        command = archive._docker_base_command(arguments)
+        self.assertEqual(command[0:3], ["docker", "--host", arguments.docker_host])
+        self.assertIn("--tlsverify", command)
+        self.assertEqual(command[command.index("--tlskey") + 1], "/private/key.pem")
+
+        arguments.docker_tls_key = None
+        with self.assertRaisesRegex(archive.ArchiveError, "required together"):
+            archive._docker_base_command(arguments)
+
     def test_fake_docker_archive_save_and_independent_load(self):
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -148,7 +385,7 @@ class ArchiveTests(unittest.TestCase):
                     path=str(archive_path),
                     checksum=str(checksum_path),
                     docker_bin=str(docker),
-                    docker_host="tcp://127.0.0.1:2375",
+                    docker_host="tcp://127.0.0.1:42376",
                     timeout=10.0,
                 )
             )
@@ -162,7 +399,7 @@ class ArchiveTests(unittest.TestCase):
                         path=str(archive_path),
                         checksum=str(checksum_path),
                         docker_bin=str(docker),
-                        docker_host="tcp://127.0.0.1:2375",
+                        docker_host="tcp://127.0.0.1:42376",
                         timeout=10.0,
                     )
                 )
@@ -210,6 +447,79 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(replaced_path.read_bytes(), attacker_bytes)
             self.assertEqual(moved_stage.read_bytes(), held_bytes)
             self.assertEqual(archive_path.read_bytes(), held_bytes)
+
+    def test_mutate_restore_cannot_evade_docker_stream_digest(self):
+        expected = b"GOODSAFE"
+        attacker = b"EVIL"
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "archive.tar"
+            path.write_bytes(expected)
+            original_stat = path.stat()
+            descriptor, identity = archive._open_regular(path)
+            completed = threading.Event()
+            consumed = bytearray()
+
+            class MutatingInput:
+                closed = False
+
+                def write(self, data):
+                    block = bytes(data)
+                    consumed.extend(block)
+                    if len(consumed) == 4:
+                        writer = os.open(path, os.O_WRONLY)
+                        try:
+                            os.pwrite(writer, attacker, 4)
+                            os.fsync(writer)
+                        finally:
+                            os.close(writer)
+                    elif len(consumed) == 8:
+                        writer = os.open(path, os.O_WRONLY)
+                        try:
+                            os.pwrite(writer, expected[4:], 4)
+                            os.fsync(writer)
+                        finally:
+                            os.close(writer)
+                        os.utime(
+                            path,
+                            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                        )
+                    return len(block)
+
+                def close(self):
+                    self.closed = True
+                    completed.set()
+
+            class FakeProcess:
+                def __init__(self):
+                    self.stdin = MutatingInput()
+
+                def wait(self, timeout=None):
+                    if not completed.wait(timeout):
+                        raise subprocess.TimeoutExpired(["fake-docker"], timeout)
+                    return 0
+
+                def kill(self):
+                    completed.set()
+
+            try:
+                with mock.patch.object(
+                    archive.subprocess, "Popen", return_value=FakeProcess()
+                ), self.assertRaisesRegex(
+                    archive.ArchiveError,
+                    "bytes delivered to Docker do not match archive checksum",
+                ):
+                    archive._stream_load_to_docker(
+                        ["fake-docker", "image", "load"],
+                        descriptor,
+                        identity,
+                        hashlib.sha256(expected).hexdigest(),
+                        10.0,
+                        chunk_size=4,
+                    )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(bytes(consumed), b"GOODEVIL")
+            self.assertEqual(path.read_bytes(), expected)
 
 
 class SmokeHelpersTests(unittest.TestCase):

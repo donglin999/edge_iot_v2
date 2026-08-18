@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.m0-ci.yml"
 SAFETY="$SCRIPT_DIR/safety.py"
+EVIDENCE_IO="$SCRIPT_DIR/evidence_io.py"
+DIND_TLS="$SCRIPT_DIR/dind_tls.py"
 
 usage() {
   echo "usage: $0 --project m0ci-<unique> --evidence <new-path> --allowed-root <private-root>" >&2
@@ -42,7 +44,23 @@ python3 "$SAFETY" images \
   "$M0_BACKEND_IMAGE_ID" "$M0_WEB_IMAGE_ID" "$M0_REDIS_IMAGE_ID" \
   "$M0_INFLUX_IMAGE_ID" "$M0_TOOL_IMAGE_ID" "$M0_DIND_IMAGE_ID"
 python3 "$SAFETY" compose "$COMPOSE_FILE"
-python3 "$SAFETY" new-evidence --path "$EVIDENCE_ROOT" --allowed-root "$ALLOWED_ROOT" --project "$PROJECT"
+if test "${M0_EVIDENCE_READY:-}" != "1"; then
+  exec python3 "$EVIDENCE_IO" create-and-exec \
+    --path "$EVIDENCE_ROOT" \
+    --allowed-root "$ALLOWED_ROOT" \
+    --project "$PROJECT" \
+    --script "$0"
+fi
+test "${M0_EVIDENCE_GUARD_PID:-}" = "$$" || {
+  echo "SAFETY ERROR: evidence guard was not created by this drill process" >&2
+  exit 2
+}
+EVIDENCE_FD="${M0_EVIDENCE_DIR_FD:?held evidence directory fd required}"
+EVIDENCE_DEVICE="${M0_EVIDENCE_DEVICE:?evidence device required}"
+EVIDENCE_INODE="${M0_EVIDENCE_INODE:?evidence inode required}"
+python3 "$EVIDENCE_IO" verify \
+  --root "$EVIDENCE_ROOT" --fd "$EVIDENCE_FD" \
+  --device "$EVIDENCE_DEVICE" --inode "$EVIDENCE_INODE"
 
 for image_id in \
   "$M0_BACKEND_IMAGE_ID" "$M0_WEB_IMAGE_ID" "$M0_REDIS_IMAGE_ID" \
@@ -73,6 +91,11 @@ if docker network inspect "$DIND_NETWORK_NAME" >/dev/null 2>&1; then
   echo "SAFETY ERROR: disposable DinD network already exists" >&2
   exit 2
 fi
+DIND_CERT_ROOT="$ALLOWED_ROOT/.${PROJECT}.dind-client"
+if test -e "$DIND_CERT_ROOT" || test -L "$DIND_CERT_ROOT"; then
+  echo "SAFETY ERROR: disposable DinD client TLS path already exists" >&2
+  exit 2
+fi
 M0_TOKEN_FILE="$ALLOWED_ROOT/.${PROJECT}.influx.token"
 if test -e "$M0_TOKEN_FILE" || test -L "$M0_TOKEN_FILE"; then
   echo "SAFETY ERROR: disposable token path already exists" >&2
@@ -85,9 +108,20 @@ export COMPOSE_PROJECT_NAME="$PROJECT"
 compose=(docker compose -p "$PROJECT" -f "$COMPOSE_FILE")
 DIND_ID=""
 DIND_NETWORK_ID=""
+DIND_CERT_DEVICE=""
+DIND_CERT_INODE=""
 STACK_STARTED=0
 TOKEN_DEVICE=""
 TOKEN_INODE=""
+
+run_evidence() {
+  local name="$1"
+  shift
+  python3 "$EVIDENCE_IO" capture \
+    --root "$EVIDENCE_ROOT" --fd "$EVIDENCE_FD" \
+    --device "$EVIDENCE_DEVICE" --inode "$EVIDENCE_INODE" \
+    --name "$name" -- "$@"
+}
 
 cleanup_token() {
   python3 - "$M0_TOKEN_FILE" "$TOKEN_DEVICE" "$TOKEN_INODE" <<'PY'
@@ -111,6 +145,14 @@ except OSError:
 PY
 }
 
+cleanup_dind_certs() {
+  if test -n "$DIND_CERT_DEVICE" && test -n "$DIND_CERT_INODE"; then
+    python3 "$DIND_TLS" cleanup \
+      --path "$DIND_CERT_ROOT" \
+      --device "$DIND_CERT_DEVICE" --inode "$DIND_CERT_INODE"
+  fi
+}
+
 cleanup() {
   set +e
   if test -n "$DIND_ID"; then
@@ -122,14 +164,13 @@ cleanup() {
   if test "$STACK_STARTED" = "1"; then
     "${compose[@]}" --profile prep --profile tools down --volumes --remove-orphans >/dev/null 2>&1
   fi
+  cleanup_dind_certs
   cleanup_token
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-install -d -m 0700 -- "$EVIDENCE_ROOT"
-python3 "$SAFETY" private-directory "$EVIDENCE_ROOT"
 TOKEN_IDENTITY="$(python3 - "$M0_TOKEN_FILE" <<'PY'
 import os
 import secrets
@@ -214,54 +255,56 @@ STACK_STARTED=1
 "${compose[@]}" --profile prep run --rm --no-deps \
   -e DJANGO_DB_NAME=/data/source.sqlite3 seed
 
-"${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
+run_evidence sqlite-backup-report.json \
+  "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   python /repo/scripts/backup/sqlite_backup.py backup \
   --source /data/source.sqlite3 \
-  --destination /evidence/sqlite-source.backup \
-  > "$EVIDENCE_ROOT/sqlite-backup-report.json"
-"${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
+  --destination /evidence/sqlite-source.backup
+run_evidence sqlite-restore-report.json \
+  "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   python /repo/scripts/backup/sqlite_backup.py restore \
   --source /evidence/sqlite-source.backup \
-  --destination /data/restored.sqlite3 \
-  > "$EVIDENCE_ROOT/sqlite-restore-report.json"
+  --destination /data/restored.sqlite3
 
 "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   influx write --host http://influx:8086 --org m0-ci --bucket m0-source \
   --precision ns 'm0_sample,source=ci temperature=42.5 1704067200000000000'
-"${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
+run_evidence influx-backup-report.json \
+  "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   python /repo/scripts/backup/influx_backup.py backup \
   --host http://influx:8086 --org m0-ci --bucket m0-source \
-  --token-file /run/secrets/influx.token --path /evidence/influx-archive \
-  > "$EVIDENCE_ROOT/influx-backup-report.json"
-"${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
+  --token-file /run/secrets/influx.token --path /evidence/influx-archive
+run_evidence influx-verify-report.json \
+  "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   python /repo/scripts/backup/influx_backup.py verify-archive \
   --host http://influx:8086 --org m0-ci --bucket m0-source \
-  --path /evidence/influx-archive \
-  > "$EVIDENCE_ROOT/influx-verify-report.json"
-"${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
+  --path /evidence/influx-archive
+run_evidence influx-restore-report.json \
+  "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   python /repo/scripts/backup/influx_backup.py restore \
   --host http://influx:8086 --org m0-ci --bucket m0-source \
   --restore-bucket m0-restored --token-file /run/secrets/influx.token \
-  --path /evidence/influx-archive \
-  > "$EVIDENCE_ROOT/influx-restore-report.json"
+  --path /evidence/influx-archive
 
 flux_query='from(bucket: "m0-restored") |> range(start: time(v: 0)) |> filter(fn: (r) => r._measurement == "m0_sample" and r._field == "temperature") |> keep(columns: ["_value"])'
-"${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
-  influx query --host http://influx:8086 --org m0-ci --raw "$flux_query" \
-  > "$EVIDENCE_ROOT/influx-known-value.csv"
+run_evidence influx-known-value.csv \
+  "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
+  influx query --host http://influx:8086 --org m0-ci --raw "$flux_query"
 grep -Eq '(^|,)42\.5(,|$)' "$EVIDENCE_ROOT/influx-known-value.csv" || {
   echo "ERROR: restored Influx bucket does not contain the known value" >&2
   exit 2
 }
 
-python3 "$SCRIPT_DIR/image_archive.py" save \
+run_evidence image-save-report.json python3 "$SCRIPT_DIR/image_archive.py" save \
   --path "$EVIDENCE_ROOT/rollback-images.tar" \
   --checksum "$EVIDENCE_ROOT/rollback-images.sha256.json" \
   --image-id "$M0_BACKEND_IMAGE_ID" \
   --image-id "$M0_WEB_IMAGE_ID" \
-  --image-id "$M0_REDIS_IMAGE_ID" \
-  > "$EVIDENCE_ROOT/image-save-report.json"
+  --image-id "$M0_REDIS_IMAGE_ID"
 
+DIND_CERT_IDENTITY="$(python3 "$DIND_TLS" create \
+  --path "$DIND_CERT_ROOT" --allowed-root "$ALLOWED_ROOT")"
+read -r DIND_CERT_DEVICE DIND_CERT_INODE <<< "$DIND_CERT_IDENTITY"
 DIND_NETWORK_ID="$(docker network create --driver bridge --internal \
   --label "com.edge-iot.m0.project=$PROJECT" "$DIND_NETWORK_NAME")"
 test -n "$DIND_NETWORK_ID"
@@ -269,22 +312,61 @@ DIND_ID="$(docker run -d --pull=never --privileged --name "$DIND_NAME" \
   --label "com.edge-iot.m0.project=$PROJECT" \
   --network "$DIND_NETWORK_ID" \
   --memory 768m --cpus 1.50 --pids-limit 512 \
-  -p 127.0.0.1::2375 -e DOCKER_TLS_CERTDIR= \
-  "$M0_DIND_IMAGE_ID" --host=tcp://0.0.0.0:2375 --tls=false)"
+  -p 127.0.0.1::2376 -e DOCKER_TLS_CERTDIR=/certs \
+  "$M0_DIND_IMAGE_ID")"
 test -n "$DIND_ID"
-DIND_PORT="$(docker port "$DIND_ID" 2375/tcp | awk -F: 'NR == 1 {print $NF}')"
-test -n "$DIND_PORT"
-DIND_HOST="tcp://127.0.0.1:$DIND_PORT"
+TLS_READY=0
 for _attempt in $(seq 1 60); do
-  if docker --host "$DIND_HOST" info >/dev/null 2>&1; then break; fi
+  if docker exec "$DIND_ID" sh -ec '
+    test -s /certs/client/ca.pem
+    test -s /certs/client/cert.pem
+    test -s /certs/client/key.pem
+    openssl verify -CAfile /certs/client/ca.pem /certs/client/cert.pem >/dev/null
+    openssl pkey -in /certs/client/key.pem -noout >/dev/null
+  ' >/dev/null 2>&1; then
+    TLS_READY=1
+    break
+  fi
   sleep 1
 done
-docker --host "$DIND_HOST" info >/dev/null
-python3 "$SCRIPT_DIR/image_archive.py" load \
+test "$TLS_READY" = "1"
+# Copy only the documented client set; CA/server private material remains in
+# the disposable container and is destroyed with it.
+for certificate in ca.pem cert.pem key.pem; do
+  docker cp \
+    "$DIND_ID:/certs/client/$certificate" \
+    "$DIND_CERT_ROOT/$certificate"
+done
+python3 "$DIND_TLS" secure \
+  --path "$DIND_CERT_ROOT" \
+  --device "$DIND_CERT_DEVICE" --inode "$DIND_CERT_INODE"
+
+DIND_BINDING="$(docker port "$DIND_ID" 2376/tcp | awk 'NR == 1 {print; exit}')"
+case "$DIND_BINDING" in
+  127.0.0.1:*) ;;
+  *) echo "ERROR: DinD TLS port is not loopback-bound" >&2; exit 2 ;;
+esac
+DIND_PORT="${DIND_BINDING##*:}"
+test -n "$DIND_PORT"
+DIND_HOST="tcp://127.0.0.1:$DIND_PORT"
+dind_docker=(
+  docker --host "$DIND_HOST" --tlsverify
+  --tlscacert "$DIND_CERT_ROOT/ca.pem"
+  --tlscert "$DIND_CERT_ROOT/cert.pem"
+  --tlskey "$DIND_CERT_ROOT/key.pem"
+)
+for _attempt in $(seq 1 60); do
+  if "${dind_docker[@]}" info >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+"${dind_docker[@]}" info >/dev/null
+run_evidence image-load-report.json python3 "$SCRIPT_DIR/image_archive.py" load \
   --path "$EVIDENCE_ROOT/rollback-images.tar" \
   --checksum "$EVIDENCE_ROOT/rollback-images.sha256.json" \
   --docker-host "$DIND_HOST" \
-  > "$EVIDENCE_ROOT/image-load-report.json"
+  --docker-tls-ca "$DIND_CERT_ROOT/ca.pem" \
+  --docker-tls-cert "$DIND_CERT_ROOT/cert.pem" \
+  --docker-tls-key "$DIND_CERT_ROOT/key.pem"
 
 "${compose[@]}" up -d --wait django celery-acq celery-short web
 for service in redis influx django celery-acq celery-short web; do
@@ -324,17 +406,19 @@ for container in sys.argv[1:]:
         raise SystemExit("each published drill service must have one loopback binding")
 PY
 
-python3 "$SCRIPT_DIR/stack_smoke.py" --base-url "http://127.0.0.1:$WEB_PORT" \
-  > "$EVIDENCE_ROOT/stack-smoke-report.json"
+run_evidence stack-smoke-report.json \
+  python3 "$SCRIPT_DIR/stack_smoke.py" --base-url "http://127.0.0.1:$WEB_PORT"
 
 check_worker() {
   local service="$1" node="$2" queue="$3"
   local ping_report="$EVIDENCE_ROOT/celery-${service}-ping.json"
   local queue_report="$EVIDENCE_ROOT/celery-${service}-queues.json"
-  "${compose[@]}" exec -T "$service" celery -A control_plane inspect \
-    --json --timeout 10 --destination "$node" ping > "$ping_report"
-  "${compose[@]}" exec -T "$service" celery -A control_plane inspect \
-    --json --timeout 10 --destination "$node" active_queues > "$queue_report"
+  run_evidence "celery-${service}-ping.json" \
+    "${compose[@]}" exec -T "$service" celery -A control_plane inspect \
+    --json --timeout 10 --destination "$node" ping
+  run_evidence "celery-${service}-queues.json" \
+    "${compose[@]}" exec -T "$service" celery -A control_plane inspect \
+    --json --timeout 10 --destination "$node" active_queues
   python3 "$SCRIPT_DIR/celery_smoke.py" \
     --ping-report "$ping_report" \
     --queue-report "$queue_report" \
@@ -344,7 +428,7 @@ check_worker() {
 check_worker celery-acq "m0-acq@${PROJECT}-acq" acquisition
 check_worker celery-short "m0-short@${PROJECT}-short" short
 
-python3 - "$EVIDENCE_ROOT" "$PROJECT" <<'PY'
+run_evidence summary.json python3 - "$EVIDENCE_ROOT" "$PROJECT" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -379,12 +463,15 @@ summary = {
     "restored_static_fact_http_api_websocket_alarm_data": "ok",
     "celery_nodes_and_active_queues": "ok",
 }
-(root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+print(json.dumps(summary, indent=2, sort_keys=True))
 PY
 
 # Artifact publication is allowed only after an exact byte scan proves that
 # none of the three ephemeral credentials was copied into evidence.  The large
 # rollback tar and its retained hard-link are excluded by inode.
+python3 "$EVIDENCE_IO" verify \
+  --root "$EVIDENCE_ROOT" --fd "$EVIDENCE_FD" \
+  --device "$EVIDENCE_DEVICE" --inode "$EVIDENCE_INODE"
 python3 - "$EVIDENCE_ROOT" <<'PY'
 import os
 import stat
@@ -446,5 +533,8 @@ for path in root.rglob("*"):
     finally:
         os.close(descriptor)
 PY
+python3 "$EVIDENCE_IO" verify \
+  --root "$EVIDENCE_ROOT" --fd "$EVIDENCE_FD" \
+  --device "$EVIDENCE_DEVICE" --inode "$EVIDENCE_INODE"
 
 echo "M0 isolated recovery drill passed; evidence: $EVIDENCE_ROOT"

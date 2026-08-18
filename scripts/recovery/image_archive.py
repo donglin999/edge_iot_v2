@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -152,6 +153,130 @@ def _run(
         raise ArchiveError(f"Docker command could not complete: {type(exc).__name__}") from None
     if completed.returncode != 0:
         raise ArchiveError("Docker command failed; output suppressed")
+
+
+def _stream_load_to_docker(
+    command: list[str],
+    descriptor: int,
+    expected_identity: tuple[int, int],
+    expected_digest: str,
+    timeout: float,
+    *,
+    chunk_size: int = 256 * 1024,
+) -> str:
+    """Hash exactly the bytes concurrently delivered to ``docker image load``."""
+    if chunk_size <= 0:
+        raise ArchiveError("Docker stream chunk size must be positive")
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or _identity(before) != expected_identity:
+        raise ArchiveError("held archive descriptor changed before Docker load")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise ArchiveError(
+            f"Docker command could not complete: {type(exc).__name__}"
+        ) from None
+    if process.stdin is None:  # pragma: no cover - guaranteed by PIPE.
+        process.kill()
+        process.wait()
+        raise ArchiveError("Docker load stdin pipe was not created")
+
+    errors: list[BaseException] = []
+    streamed_digest: list[str] = []
+
+    def pump() -> None:
+        digest = hashlib.sha256()
+        offset = 0
+        try:
+            while offset < before.st_size:
+                block = os.pread(
+                    descriptor,
+                    min(chunk_size, before.st_size - offset),
+                    offset,
+                )
+                if not block:
+                    raise ArchiveError("held archive ended during Docker load")
+                digest.update(block)
+                view = memoryview(block)
+                while view:
+                    written = process.stdin.write(view)
+                    if written is None or written <= 0:
+                        raise ArchiveError("Docker load stopped consuming archive bytes")
+                    view = view[written:]
+                offset += len(block)
+            process.stdin.close()
+            after = os.fstat(descriptor)
+            if (
+                _identity(after) != expected_identity
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise ArchiveError("archive changed while streaming to Docker")
+            streamed_digest.append(digest.hexdigest())
+        except BaseException as exc:  # Propagate writer-thread failures below.
+            errors.append(exc)
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    writer = threading.Thread(target=pump, name="m0-docker-load-stream", daemon=True)
+    writer.start()
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        writer.join(timeout=5)
+        raise ArchiveError("Docker command could not complete: TimeoutExpired") from None
+    writer.join(timeout=5)
+    if writer.is_alive():
+        process.kill()
+        process.wait()
+        raise ArchiveError("Docker archive writer did not terminate")
+    if errors:
+        error = errors[0]
+        if isinstance(error, ArchiveError):
+            raise error
+        raise ArchiveError(
+            f"Docker load stream failed: {type(error).__name__}"
+        ) from None
+    if return_code != 0:
+        raise ArchiveError("Docker command failed; output suppressed")
+    if streamed_digest != [expected_digest]:
+        raise ArchiveError("bytes delivered to Docker do not match archive checksum")
+    return streamed_digest[0]
+
+
+def _docker_base_command(args: argparse.Namespace) -> list[str]:
+    command = [args.docker_bin]
+    if args.docker_host:
+        command += ["--host", args.docker_host]
+    tls_values = (
+        getattr(args, "docker_tls_ca", None),
+        getattr(args, "docker_tls_cert", None),
+        getattr(args, "docker_tls_key", None),
+    )
+    if any(tls_values):
+        if not all(tls_values):
+            raise ArchiveError("all Docker TLS client files are required together")
+        if not args.docker_host:
+            raise ArchiveError("Docker TLS client files require an explicit host")
+        command += [
+            "--tlsverify",
+            "--tlscacert",
+            tls_values[0],
+            "--tlscert",
+            tls_values[1],
+            "--tlskey",
+            tls_values[2],
+        ]
+    return command
 
 
 def _ctypes_function(name: str):
@@ -399,17 +524,16 @@ def load_archive(args: argparse.Namespace) -> dict[str, object]:
         digest = _sha256_fd(archive_fd, archive_identity)
         if digest != document.get("archive_sha256"):
             raise ArchiveError("archive checksum mismatch")
-        os.lseek(archive_fd, 0, os.SEEK_SET)
-        command = [args.docker_bin]
-        if args.docker_host:
-            command += ["--host", args.docker_host]
-        command += ["image", "load"]
-        _run(command, stdin=archive_fd, timeout=args.timeout)
+        command = _docker_base_command(args) + ["image", "load"]
+        _stream_load_to_docker(
+            command,
+            archive_fd,
+            archive_identity,
+            digest,
+            args.timeout,
+        )
         for image_id in image_ids:
-            inspect = [args.docker_bin]
-            if args.docker_host:
-                inspect += ["--host", args.docker_host]
-            inspect += ["image", "inspect", image_id]
+            inspect = _docker_base_command(args) + ["image", "inspect", image_id]
             _run(inspect, timeout=args.timeout)
         if _sha256_fd(archive_fd, archive_identity) != digest:
             raise ArchiveError("archive changed during Docker load")
@@ -440,6 +564,9 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--image-id", action="append", required=True)
         else:
             child.add_argument("--docker-host")
+            child.add_argument("--docker-tls-ca")
+            child.add_argument("--docker-tls-cert")
+            child.add_argument("--docker-tls-key")
     return parser
 
 

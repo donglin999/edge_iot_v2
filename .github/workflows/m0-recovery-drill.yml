@@ -78,7 +78,8 @@ jobs:
 
       - name: Upload non-secret drill evidence
         # A failed drill may have stopped before the exact-byte credential
-        # scan.  Only a fully successful run is eligible for artifact upload.
+        # scan. Runtime tokens and DinD TLS client keys live outside this tree;
+        # only a fully successful, scanned run is eligible for artifact upload.
         if: success() && env.M0_EVIDENCE_PATH != ''
         uses: actions/upload-artifact@v4
         with:
