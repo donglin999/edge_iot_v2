@@ -22,6 +22,7 @@ python3 -m unittest discover -s "$RECOVERY_DIR/../backup/tests" -p 'test_*.py' -
 
 python3 "$RECOVERY_DIR/safety.py" compose "$RECOVERY_DIR/docker-compose.m0-ci.yml"
 python3 "$RECOVERY_DIR/safety.py" recovery-scripts --root "$RECOVERY_DIR"
+python3 "$RECOVERY_DIR/safety.py" tool-dockerfile "$RECOVERY_DIR/Dockerfile.tool"
 
 grep -q 'pull_policy: never' "$RECOVERY_DIR/docker-compose.m0-ci.yml"
 grep -q 'host_ip: "127.0.0.1"' "$RECOVERY_DIR/docker-compose.m0-ci.yml"
@@ -53,15 +54,6 @@ grep -q -- '--json --timeout 10 --destination "$node"' "$RECOVERY_DIR/m0_ci_dril
 grep -q 'set(payload) != {node}' "$RECOVERY_DIR/celery_smoke.py"
 grep -q 'queues\[0\].get("name") != expected_queue' "$RECOVERY_DIR/celery_smoke.py"
 grep -q 'runner-local evidence was not uploaded' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q '^ARG INFLUX_CLI_VERSION=2\.7\.5$' "$RECOVERY_DIR/Dockerfile.tool"
-grep -q '^ARG INFLUX_CLI_SHA256=496dffcd70bed2bb3dc3d614e3d9c97e312e092dfe0577d332027566bbb7d8cd$' "$RECOVERY_DIR/Dockerfile.tool"
-grep -q 'dl\.influxdata\.com/influxdb/releases/influxdb2-client-' "$RECOVERY_DIR/Dockerfile.tool"
-grep -q 'sha256sum --check --strict' "$RECOVERY_DIR/Dockerfile.tool"
-grep -q 'test "$TARGETARCH" = "amd64"' "$RECOVERY_DIR/Dockerfile.tool"
-if grep -qE '^FROM influxdb:|/usr/bin/influx' "$RECOVERY_DIR/Dockerfile.tool"; then
-  echo "recovery tool must install the pinned CLI archive, not assume a server-image path" >&2
-  exit 1
-fi
 if grep -q 'docker cp' "$RECOVERY_DIR/m0_ci_drill.sh"; then
   echo "mutable-path docker cp must not be used for DinD TLS material" >&2
   exit 1

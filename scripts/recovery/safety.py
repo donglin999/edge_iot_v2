@@ -13,6 +13,13 @@ from typing import Iterable, Optional, Sequence
 
 PROJECT_RE = re.compile(r"^m0ci-[a-z0-9](?:[a-z0-9-]{6,46}[a-z0-9])$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+INFLUX_CLI_URL = (
+    "https://dl.influxdata.com/influxdb/releases/"
+    "influxdb2-client-2.7.5-linux-amd64.tar.gz"
+)
+INFLUX_CLI_SHA256 = (
+    "496dffcd70bed2bb3dc3d614e3d9c97e312e092dfe0577d332027566bbb7d8cd"
+)
 FORBIDDEN_PROJECTS = {
     "edge_iot_v2",
     "edge-iot-v2",
@@ -159,6 +166,73 @@ def validate_recovery_scripts(root_value: str) -> Path:
     return root
 
 
+def _dockerfile_instructions(text: str) -> tuple[str, ...]:
+    """Return comment-free logical Dockerfile instructions."""
+    instructions = []
+    current = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or (not current and stripped.startswith("#")):
+            continue
+        continued = stripped.endswith("\\")
+        fragment = stripped[:-1].rstrip() if continued else stripped
+        if fragment and not fragment.startswith("#"):
+            current.append(fragment)
+        if not continued:
+            if current:
+                instructions.append(" ".join(current))
+            current = []
+    if current:
+        raise SafetyError("recovery tool Dockerfile ends with a continued instruction")
+    return tuple(instructions)
+
+
+def validate_recovery_tool_dockerfile(path_value: str) -> Path:
+    """Require the final tool image to consume one immutable, verified CLI."""
+    path = Path(path_value).resolve(strict=True)
+    instructions = _dockerfile_instructions(path.read_text(encoding="utf-8"))
+    from_instructions = tuple(
+        instruction for instruction in instructions if instruction.upper().startswith("FROM ")
+    )
+    expected_from = (
+        "FROM python:3.10-slim AS influx-cli",
+        "FROM python:3.10-slim",
+    )
+    if from_instructions != expected_from:
+        raise SafetyError("recovery tool must use exactly the approved two Python stages")
+    if any("influxdb:" in instruction.lower() for instruction in instructions):
+        raise SafetyError("recovery tool must not source the CLI from a server image")
+    if instructions.count("ARG TARGETARCH") != 1:
+        raise SafetyError("recovery tool must declare TARGETARCH exactly once")
+    if any(instruction.startswith("ARG INFLUX_CLI_") for instruction in instructions):
+        raise SafetyError("pinned CLI version and digest must not be build-arg overridable")
+
+    cli_runs = tuple(
+        instruction
+        for instruction in instructions
+        if instruction.startswith("RUN ") and INFLUX_CLI_URL in instruction
+    )
+    if len(cli_runs) != 1:
+        raise SafetyError("recovery tool must download the approved CLI in one RUN instruction")
+    cli_run = cli_runs[0]
+    required_run_fragments = (
+        'test "$TARGETARCH" = "amd64"',
+        INFLUX_CLI_URL,
+        INFLUX_CLI_SHA256,
+        "sha256sum --check --strict -",
+        'tar -xzf "$archive" -C /tmp ./influx',
+        "install -m 0755 /tmp/influx /usr/local/bin/influx",
+        "/usr/local/bin/influx version",
+    )
+    if any(cli_run.count(fragment) != 1 for fragment in required_run_fragments):
+        raise SafetyError("recovery tool CLI download, verification, or install chain changed")
+
+    expected_copy = "COPY --from=influx-cli /usr/local/bin/influx /usr/local/bin/influx"
+    if instructions.count(expected_copy) != 1 or "/usr/bin/influx" in "\n".join(instructions):
+        raise SafetyError("final recovery image must copy only the verified CLI artifact")
+    return path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -181,6 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
     compose.add_argument("path")
     scripts = subparsers.add_parser("recovery-scripts")
     scripts.add_argument("--root", required=True)
+    tool = subparsers.add_parser("tool-dockerfile")
+    tool.add_argument("path")
     return parser
 
 
@@ -199,6 +275,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             validate_compose_source(args.path)
         elif args.command == "recovery-scripts":
             validate_recovery_scripts(args.root)
+        elif args.command == "tool-dockerfile":
+            validate_recovery_tool_dockerfile(args.path)
         else:  # pragma: no cover - argparse makes this unreachable.
             raise SafetyError("unsupported safety check")
     except (OSError, SafetyError) as exc:

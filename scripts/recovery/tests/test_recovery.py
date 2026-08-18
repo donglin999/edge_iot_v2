@@ -154,6 +154,42 @@ class SafetyTests(unittest.TestCase):
                     with self.assertRaisesRegex(safety.SafetyError, message):
                         safety.validate_recovery_scripts(str(root))
 
+    def test_recovery_tool_uses_one_pinned_verified_cli(self):
+        source_path = RECOVERY_ROOT / "Dockerfile.tool"
+        self.assertEqual(
+            safety.validate_recovery_tool_dockerfile(str(source_path)),
+            source_path.resolve(),
+        )
+        source = source_path.read_text(encoding="utf-8")
+        mutations = {
+            "server image with platform": source.replace(
+                "FROM python:3.10-slim AS influx-cli",
+                "FROM --platform=linux/amd64 influxdb:2.7 AS influx-cli",
+                1,
+            ),
+            "overridable version": source.replace(
+                "ARG TARGETARCH", "ARG TARGETARCH\nARG INFLUX_CLI_VERSION=2.7.5", 1
+            ),
+            "wrong final stage": source.replace(
+                "COPY --from=influx-cli", "COPY --from=unverified-cli", 1
+            ),
+            "wrong checksum": source.replace(safety.INFLUX_CLI_SHA256, "0" * 64, 1),
+            "unused verified stage": source.replace(
+                "FROM python:3.10-slim\nCOPY --from=influx-cli",
+                "FROM python:3.10-slim AS unverified-cli\n"
+                "RUN touch /usr/local/bin/influx\n"
+                "FROM python:3.10-slim\nCOPY --from=unverified-cli",
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            candidate = Path(raw_root) / "Dockerfile.tool"
+            for label, mutated in mutations.items():
+                with self.subTest(label=label):
+                    candidate.write_text(mutated, encoding="utf-8")
+                    with self.assertRaises(safety.SafetyError):
+                        safety.validate_recovery_tool_dockerfile(str(candidate))
+
 
 class EvidenceIOTests(unittest.TestCase):
     def test_atomic_creation_rejects_preexisting_directory(self):
