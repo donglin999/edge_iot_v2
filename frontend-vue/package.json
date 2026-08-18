@@ -1,0 +1,38 @@
+{
+  "name": "edge-iot-frontend-vue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc -b --force",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@ant-design/icons-vue": "7.0.1",
+    "ant-design-vue": "4.2.6",
+    "axios": "1.19.0",
+    "dayjs": "1.11.21",
+    "vue": "3.5.41",
+    "vue-router": "4.6.4"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/vue": "8.1.0",
+    "@types/node": "22.20.1",
+    "@vitejs/plugin-vue": "6.0.8",
+    "@vue/compiler-sfc": "3.5.41",
+    "@vue/test-utils": "2.4.6",
+    "jsdom": "28.1.0",
+    "typescript": "5.9.3",
+    "vite": "8.2.1",
+    "vitest": "4.1.11",
+    "vue-tsc": "3.3.10"
+  }
+}

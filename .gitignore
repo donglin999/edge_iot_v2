@@ -122,6 +122,7 @@ node_modules/
 frontend/node_modules/
 .npm
 .yarn-integrity
+*.tsbuildinfo
 
 # Logs
 npm-debug.log*
