@@ -20,6 +20,33 @@ INFLUX_CLI_URL = (
 INFLUX_CLI_SHA256 = (
     "496dffcd70bed2bb3dc3d614e3d9c97e312e092dfe0577d332027566bbb7d8cd"
 )
+EXPECTED_RECOVERY_TOOL_INSTRUCTIONS = (
+    "FROM python:3.10-slim AS influx-cli",
+    "ARG TARGETARCH",
+    (
+        'RUN test "$TARGETARCH" = "amd64" '
+        "&& apt-get update "
+        "&& apt-get install -y --no-install-recommends ca-certificates curl "
+        "&& rm -rf /var/lib/apt/lists/* "
+        '&& archive="/tmp/influxdb2-client-2.7.5-linux-amd64.tar.gz" '
+        "&& curl --fail --show-error --silent --location "
+        f'"{INFLUX_CLI_URL}" '
+        '--output "$archive" '
+        "&& printf '%s  %s\\n' "
+        f'"{INFLUX_CLI_SHA256}" '
+        '"$archive" | sha256sum --check --strict - '
+        '&& tar -xzf "$archive" -C /tmp ./influx '
+        "&& install -m 0755 /tmp/influx /usr/local/bin/influx "
+        "&& /usr/local/bin/influx version "
+        '&& rm -f "$archive" /tmp/influx'
+    ),
+    "FROM python:3.10-slim",
+    "COPY --from=influx-cli /usr/local/bin/influx /usr/local/bin/influx",
+    "WORKDIR /repo",
+    "COPY scripts/backup/ /repo/scripts/backup/",
+    "ENTRYPOINT []",
+    'CMD ["python", "--version"]',
+)
 FORBIDDEN_PROJECTS = {
     "edge_iot_v2",
     "edge-iot-v2",
@@ -172,7 +199,15 @@ def _dockerfile_instructions(text: str) -> tuple[str, ...]:
     current = []
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
-        if not stripped or (not current and stripped.startswith("#")):
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            if re.match(r"#\s*escape\s*=", stripped, flags=re.IGNORECASE):
+                raise SafetyError(
+                    "recovery tool Dockerfile must use the default backslash escape"
+                )
+            # Docker removes pure comment lines before joining a continued
+            # instruction, including comments placed inside a RUN chain.
             continue
         continued = stripped.endswith("\\")
         fragment = stripped[:-1].rstrip() if continued else stripped
@@ -191,45 +226,10 @@ def validate_recovery_tool_dockerfile(path_value: str) -> Path:
     """Require the final tool image to consume one immutable, verified CLI."""
     path = Path(path_value).resolve(strict=True)
     instructions = _dockerfile_instructions(path.read_text(encoding="utf-8"))
-    from_instructions = tuple(
-        instruction for instruction in instructions if instruction.upper().startswith("FROM ")
-    )
-    expected_from = (
-        "FROM python:3.10-slim AS influx-cli",
-        "FROM python:3.10-slim",
-    )
-    if from_instructions != expected_from:
-        raise SafetyError("recovery tool must use exactly the approved two Python stages")
-    if any("influxdb:" in instruction.lower() for instruction in instructions):
-        raise SafetyError("recovery tool must not source the CLI from a server image")
-    if instructions.count("ARG TARGETARCH") != 1:
-        raise SafetyError("recovery tool must declare TARGETARCH exactly once")
-    if any(instruction.startswith("ARG INFLUX_CLI_") for instruction in instructions):
-        raise SafetyError("pinned CLI version and digest must not be build-arg overridable")
-
-    cli_runs = tuple(
-        instruction
-        for instruction in instructions
-        if instruction.startswith("RUN ") and INFLUX_CLI_URL in instruction
-    )
-    if len(cli_runs) != 1:
-        raise SafetyError("recovery tool must download the approved CLI in one RUN instruction")
-    cli_run = cli_runs[0]
-    required_run_fragments = (
-        'test "$TARGETARCH" = "amd64"',
-        INFLUX_CLI_URL,
-        INFLUX_CLI_SHA256,
-        "sha256sum --check --strict -",
-        'tar -xzf "$archive" -C /tmp ./influx',
-        "install -m 0755 /tmp/influx /usr/local/bin/influx",
-        "/usr/local/bin/influx version",
-    )
-    if any(cli_run.count(fragment) != 1 for fragment in required_run_fragments):
-        raise SafetyError("recovery tool CLI download, verification, or install chain changed")
-
-    expected_copy = "COPY --from=influx-cli /usr/local/bin/influx /usr/local/bin/influx"
-    if instructions.count(expected_copy) != 1 or "/usr/bin/influx" in "\n".join(instructions):
-        raise SafetyError("final recovery image must copy only the verified CLI artifact")
+    if instructions != EXPECTED_RECOVERY_TOOL_INSTRUCTIONS:
+        raise SafetyError(
+            "recovery tool Dockerfile must exactly match the approved verified CLI flow"
+        )
     return path
 
 

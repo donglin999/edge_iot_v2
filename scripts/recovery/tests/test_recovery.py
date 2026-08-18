@@ -181,6 +181,15 @@ class SafetyTests(unittest.TestCase):
                 "FROM python:3.10-slim\nCOPY --from=unverified-cli",
                 1,
             ),
+            "overwrite after verification": source + "\nRUN printf attacker > /usr/local/bin/influx\n",
+            "second unverified download": source
+            + "\nRUN curl https://example.invalid/influx -o /usr/local/bin/influx\n",
+            "ignored checksum failure": source.replace(
+                "sha256sum --check --strict -",
+                "sha256sum --check --strict - || true",
+                1,
+            ),
+            "alternate escape directive": "# escape=`\n" + source,
         }
         with tempfile.TemporaryDirectory() as raw_root:
             candidate = Path(raw_root) / "Dockerfile.tool"
@@ -189,6 +198,18 @@ class SafetyTests(unittest.TestCase):
                     candidate.write_text(mutated, encoding="utf-8")
                     with self.assertRaises(safety.SafetyError):
                         safety.validate_recovery_tool_dockerfile(str(candidate))
+
+            comment_in_continuation = source.replace(
+                "    && apt-get install",
+                "# a pure comment inside the continued RUN is ignored by Docker\n"
+                "    && apt-get install",
+                1,
+            )
+            candidate.write_text(comment_in_continuation, encoding="utf-8")
+            self.assertEqual(
+                safety.validate_recovery_tool_dockerfile(str(candidate)),
+                candidate.resolve(),
+            )
 
 
 class EvidenceIOTests(unittest.TestCase):
