@@ -130,3 +130,37 @@ jobs:
       # 构建（tsc 类型检查 + vite build），能 build 过才算前端没坏
       - name: 构建
         run: npm run build
+
+  # ── 平行前端：Vue 3 + Vite（M2 验收前不切默认流量） ──────────────────
+  frontend-vue:
+    name: Vue 3 类型、测试、安全与构建门禁
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend-vue
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 20.19
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.0'
+          cache: npm
+          cache-dependency-path: frontend-vue/package-lock.json
+
+      - name: 安装锁定依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 依赖安全审计
+        run: npm audit --audit-level=high
+
+      - name: 生产构建
+        run: npm run build
