@@ -33,12 +33,16 @@ export COMPOSE_FILE="$(pwd -P)/deploy/offline/docker-compose.offline.yml"
 export COMPOSE_ENV_FILE='/etc/edge-iot/production.env'
 export EDGE_WRITER_CONTAINER='celery-acq'
 export INFLUX_HOST='http://127.0.0.1:8086'
-export INFLUX_ORG='Midea'
-export INFLUX_BUCKET='Record'
+# 必填：从受保护的现场配置中逐项核对后填写；不要把实际值写回本手册或 Git。
+export INFLUX_ORG=''
+export INFLUX_BUCKET=''
 export INFLUX_TOKEN_FILE='/run/secrets/edge-iot-influx.token'
 
 test -n "$RECOVERY_ID"
 test -n "$EVIDENCE_ROOT"
+test -n "$INFLUX_HOST"
+test -n "$INFLUX_ORG"
+test -n "$INFLUX_BUCKET"
 test -f "$COMPOSE_FILE"
 case "$COMPOSE_ENV_FILE" in /*) ;; *) echo 'COMPOSE_ENV_FILE 必须是绝对路径' >&2; exit 2 ;; esac
 test ! -L "$COMPOSE_ENV_FILE"
@@ -608,7 +612,10 @@ staging，目录改为 `0500`、文件改为 `0400` 并完成 `fsync`。远端 b
 `retained_restore_staging_path` 供人工核对，不自动删除。
 
 ```bash
-export INFLUX_RESTORE_BUCKET="Record_m0_restore_${RECOVERY_ID}"
+# 必填：显式指定一个确认不存在的新 bucket；不要在文档中固化现场命名。
+export INFLUX_RESTORE_BUCKET=''
+test -n "$INFLUX_RESTORE_BUCKET"
+test "$INFLUX_RESTORE_BUCKET" != "$INFLUX_BUCKET"
 python3 scripts/backup/influx_backup.py restore \
   --host "$INFLUX_HOST" \
   --org "$INFLUX_ORG" \
