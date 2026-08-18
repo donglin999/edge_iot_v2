@@ -89,15 +89,17 @@ function deferred<T>(): {
 }
 
 beforeEach(() => {
-  vi.mocked(fetchAlarms).mockResolvedValue(alarmRecords);
-  vi.mocked(fetchAlarmRules).mockResolvedValue(alarmRules);
-  vi.mocked(acknowledgeAlarm).mockResolvedValue({
+  vi.mocked(fetchAlarms).mockReset().mockResolvedValue(alarmRecords);
+  vi.mocked(fetchAlarmRules).mockReset().mockResolvedValue(alarmRules);
+  vi.mocked(acknowledgeAlarm).mockReset().mockResolvedValue({
     ...alarmRecords[0]!,
     status: 'acked',
   });
-  vi.mocked(createAlarmRule).mockResolvedValue({ ...alarmRules[0]!, id: 12, name: '压力高' });
-  vi.mocked(updateAlarmRule).mockResolvedValue(alarmRules[0]!);
-  vi.mocked(deleteAlarmRule).mockResolvedValue();
+  vi.mocked(createAlarmRule)
+    .mockReset()
+    .mockResolvedValue({ ...alarmRules[0]!, id: 12, name: '压力高' });
+  vi.mocked(updateAlarmRule).mockReset().mockResolvedValue(alarmRules[0]!);
+  vi.mocked(deleteAlarmRule).mockReset().mockResolvedValue();
 });
 
 afterEach(() => {
@@ -283,6 +285,124 @@ describe('AlarmsPage', () => {
         expect.any(AbortSignal),
       );
     });
+  });
+
+  it('prefills an edited rule and updates the exact id and writable payload', async () => {
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await fireEvent.click(screen.getByRole('button', { name: '编辑规则 温度高' }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('编辑规则')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('规则名称')).toHaveValue('温度高');
+    expect(within(dialog).getByLabelText('测点编码')).toHaveValue('temperature');
+    expect(within(dialog).getByLabelText('设备编码（留空匹配所有）')).toHaveValue('plc-1');
+    expect(within(dialog).getByLabelText('阈值')).toHaveValue('80');
+    expect(within(dialog).getByText('> 大于')).toBeInTheDocument();
+    expect(within(dialog).getByText('🔴 critical 严重')).toBeInTheDocument();
+    expect(within(dialog).getByRole('switch', { name: '启用规则' })).toBeChecked();
+    expect(within(dialog).getByLabelText('描述')).toHaveValue('温度超过安全值');
+
+    await fireEvent.update(within(dialog).getByLabelText('规则名称'), '温度超高');
+    await fireEvent.update(within(dialog).getByLabelText('描述'), '更新后的安全值');
+    await fireEvent.click(within(dialog).getByRole('button', { name: /保\s*存/ }));
+
+    await waitFor(() => {
+      expect(updateAlarmRule).toHaveBeenCalledWith(
+        11,
+        {
+          name: '温度超高',
+          point_code: 'temperature',
+          device_code: 'plc-1',
+          operator: 'gt',
+          threshold: 80,
+          threshold_high: null,
+          severity: 'critical',
+          is_active: true,
+          description: '更新后的安全值',
+        },
+        expect.any(AbortSignal),
+      );
+    });
+    const updateSignal = vi.mocked(updateAlarmRule).mock.calls[0]![2];
+    expect(updateSignal).toBeInstanceOf(AbortSignal);
+    expect(updateSignal?.aborted).toBe(false);
+  });
+
+  it('deletes a rule only after the confirmation dialog is accepted', async () => {
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    const deleteButton = screen.getByRole('button', { name: '删除规则 温度高' });
+    await fireEvent.click(deleteButton);
+
+    const cancelDialog = await screen.findByRole('dialog');
+    expect(within(cancelDialog).getByText('删除规则 "温度高" ?')).toBeInTheDocument();
+    await fireEvent.click(
+      within(cancelDialog).getByRole('button', { name: /Cancel|取\s*消/ }),
+    );
+    const cancelledModal = cancelDialog.querySelector('.ant-modal');
+    expect(cancelledModal).not.toBeNull();
+    await waitFor(() => {
+      expect(cancelledModal).not.toBeVisible();
+    });
+    expect(deleteAlarmRule).not.toHaveBeenCalled();
+
+    await fireEvent.click(deleteButton);
+    await fireEvent.click(await screen.findByRole('button', { name: /OK|确\s*定/ }));
+
+    await waitFor(() => {
+      expect(deleteAlarmRule).toHaveBeenCalledWith(11, expect.any(AbortSignal));
+    });
+    expect(deleteAlarmRule).toHaveBeenCalledTimes(1);
+    const deleteSignal = vi.mocked(deleteAlarmRule).mock.calls[0]![1];
+    expect(deleteSignal).toBeInstanceOf(AbortSignal);
+    expect(deleteSignal?.aborted).toBe(false);
+  });
+
+  it('aborts active read and write signals when the page unmounts', async () => {
+    vi.mocked(acknowledgeAlarm).mockImplementationOnce((_id, signal) =>
+      new Promise<AlarmRecord>((_resolve, reject) => {
+        signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('Aborted', 'AbortError')),
+          { once: true },
+        );
+      }),
+    );
+    const { unmount } = render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+    await waitFor(() => {
+      expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+    });
+
+    const pendingAlarms = deferred<AlarmRecord[]>();
+    const pendingRules = deferred<AlarmRule[]>();
+    vi.mocked(fetchAlarms).mockReturnValueOnce(pendingAlarms.promise);
+    vi.mocked(fetchAlarmRules).mockReturnValueOnce(pendingRules.promise);
+    await fireEvent.click(screen.getByRole('button', { name: '刷新告警' }));
+    await waitFor(() => expect(fetchAlarms).toHaveBeenCalledTimes(2));
+
+    await fireEvent.click(screen.getByRole('button', { name: '确认告警 1' }));
+    await waitFor(() => expect(acknowledgeAlarm).toHaveBeenCalledTimes(1));
+
+    const alarmReadSignal = vi.mocked(fetchAlarms).mock.calls[1]![1];
+    const ruleReadSignal = vi.mocked(fetchAlarmRules).mock.calls[1]![0];
+    const writeSignal = vi.mocked(acknowledgeAlarm).mock.calls[0]![1];
+    expect(alarmReadSignal?.aborted).toBe(false);
+    expect(ruleReadSignal?.aborted).toBe(false);
+    expect(writeSignal?.aborted).toBe(false);
+
+    unmount();
+
+    expect(alarmReadSignal?.aborted).toBe(true);
+    expect(ruleReadSignal?.aborted).toBe(true);
+    expect(writeSignal?.aborted).toBe(true);
+    pendingAlarms.resolve(alarmRecords);
+    pendingRules.resolve(alarmRules);
   });
 
   it('validates and submits a between rule as an ordered interval', async () => {

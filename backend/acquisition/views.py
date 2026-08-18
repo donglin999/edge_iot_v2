@@ -1129,10 +1129,43 @@ from rest_framework import serializers as drf_serializers
 
 
 class AlarmRuleSerializer(drf_serializers.ModelSerializer):
+    RANGE_OPERATORS = frozenset({"between", "outside"})
+
     class Meta:
         model = acq_models.AlarmRule
         fields = "__all__"
         read_only_fields = ("id", "created_at", "updated_at")
+
+    def _effective_value(self, attrs, field_name):
+        """Return the post-write value for create, update and partial update."""
+        if field_name in attrs:
+            return attrs[field_name]
+        if self.instance is not None:
+            return getattr(self.instance, field_name)
+        return self.Meta.model._meta.get_field(field_name).get_default()
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        operator = self._effective_value(attrs, "operator")
+        is_active = self._effective_value(attrs, "is_active")
+        if not is_active or operator not in self.RANGE_OPERATORS:
+            return attrs
+
+        threshold = self._effective_value(attrs, "threshold")
+        threshold_high = self._effective_value(attrs, "threshold_high")
+        if threshold is None:
+            raise drf_serializers.ValidationError({
+                "threshold": "启用的区间规则必须填写阈值下限。",
+            })
+        if threshold_high is None:
+            raise drf_serializers.ValidationError({
+                "threshold_high": "启用的区间规则必须填写阈值上限。",
+            })
+        if threshold_high < threshold:
+            raise drf_serializers.ValidationError({
+                "threshold_high": "阈值上限必须大于或等于阈值下限。",
+            })
+        return attrs
 
 
 class AlarmSerializer(drf_serializers.ModelSerializer):
