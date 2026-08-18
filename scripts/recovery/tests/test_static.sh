@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 RECOVERY_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+REPO_ROOT="$(cd -- "$RECOVERY_DIR/../.." && pwd -P)"
 PYCACHE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/m0-recovery-pycache.XXXXXX")"
 trap 'rm -rf -- "$PYCACHE_ROOT"' EXIT
 export PYTHONPYCACHEPREFIX="$PYCACHE_ROOT"
@@ -41,6 +42,8 @@ grep -q -- '--memory 768m --cpus 1.50 --pids-limit 512' "$RECOVERY_DIR/m0_ci_dri
 grep -q 'DOCKER_TLS_CERTDIR=/certs' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q '2376' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q 'openssl verify -CAfile /certs/client/ca.pem' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q '"$DIND_TLS" capture' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'docker exec "$DIND_ID" cat "/certs/client/$certificate"' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q -- '--tlsverify' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q -- '--docker-tls-key' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q '_stream_load_to_docker' "$RECOVERY_DIR/image_archive.py"
@@ -49,6 +52,18 @@ grep -q 'active_queues' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q -- '--json --timeout 10 --destination "$node"' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q 'set(payload) != {node}' "$RECOVERY_DIR/celery_smoke.py"
 grep -q 'queues\[0\].get("name") != expected_queue' "$RECOVERY_DIR/celery_smoke.py"
-grep -q 'ephemeral credential found in evidence' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'runner-local evidence was not uploaded' "$RECOVERY_DIR/m0_ci_drill.sh"
+if grep -q 'docker cp' "$RECOVERY_DIR/m0_ci_drill.sh"; then
+  echo "mutable-path docker cp must not be used for DinD TLS material" >&2
+  exit 1
+fi
+if grep -q 'actions/upload-artifact' "$REPO_ROOT/.github/workflows/m0-recovery-drill.yml"; then
+  echo "runner-local recovery evidence must not have an artifact uploader" >&2
+  exit 1
+fi
+if grep -q 'M0_EVIDENCE_PATH' "$REPO_ROOT/.github/workflows/m0-recovery-drill.yml"; then
+  echo "workflow must not publish an evidence export path" >&2
+  exit 1
+fi
 
 echo "M0 recovery static and unit gates passed"

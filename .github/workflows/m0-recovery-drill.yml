@@ -70,23 +70,7 @@ jobs:
           set -euo pipefail
           project="m0ci-gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           evidence="${RUNNER_TEMP}/evidence-${project}"
-          echo "M0_EVIDENCE_PATH=${evidence}" >> "$GITHUB_ENV"
           bash scripts/recovery/m0_ci_drill.sh \
             --project "$project" \
             --allowed-root "$RUNNER_TEMP" \
             --evidence "$evidence"
-
-      - name: Upload non-secret drill evidence
-        # A failed drill may have stopped before the exact-byte credential
-        # scan. Runtime tokens and DinD TLS client keys live outside this tree;
-        # only a fully successful, scanned run is eligible for artifact upload.
-        if: success() && env.M0_EVIDENCE_PATH != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: m0-recovery-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: warn
-          retention-days: 14
-          path: |
-            ${{ env.M0_EVIDENCE_PATH }}/**
-            !${{ env.M0_EVIDENCE_PATH }}/rollback-images.tar
-            !${{ env.M0_EVIDENCE_PATH }}/.m0-*

@@ -152,6 +152,10 @@ def validate_recovery_scripts(root_value: str) -> Path:
             raise SafetyError(
                 f"recovery script contains plaintext DinD transport: {relative}"
             )
+        if re.search(r"\bdocker[ \t]+cp\b", text):
+            raise SafetyError(
+                f"recovery script contains mutable-path DinD copy: {relative}"
+            )
     return root
 
 

@@ -330,12 +330,15 @@ for _attempt in $(seq 1 60); do
   sleep 1
 done
 test "$TLS_READY" = "1"
-# Copy only the documented client set; CA/server private material remains in
-# the disposable container and is destroyed with it.
+# Capture only the documented client set directly into held, exclusive files;
+# CA/server private material remains in the disposable container and is
+# destroyed with it.
 for certificate in ca.pem cert.pem key.pem; do
-  docker cp \
-    "$DIND_ID:/certs/client/$certificate" \
-    "$DIND_CERT_ROOT/$certificate"
+  python3 "$DIND_TLS" capture \
+    --path "$DIND_CERT_ROOT" \
+    --device "$DIND_CERT_DEVICE" --inode "$DIND_CERT_INODE" \
+    --name "$certificate" -- \
+    docker exec "$DIND_ID" cat "/certs/client/$certificate"
 done
 python3 "$DIND_TLS" secure \
   --path "$DIND_CERT_ROOT" \
@@ -466,75 +469,10 @@ summary = {
 print(json.dumps(summary, indent=2, sort_keys=True))
 PY
 
-# Artifact publication is allowed only after an exact byte scan proves that
-# none of the three ephemeral credentials was copied into evidence.  The large
-# rollback tar and its retained hard-link are excluded by inode.
-python3 "$EVIDENCE_IO" verify \
-  --root "$EVIDENCE_ROOT" --fd "$EVIDENCE_FD" \
-  --device "$EVIDENCE_DEVICE" --inode "$EVIDENCE_INODE"
-python3 - "$EVIDENCE_ROOT" <<'PY'
-import os
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-secrets_to_find = [
-    os.environ[name].encode("utf-8")
-    for name in (
-        "M0_INFLUX_TOKEN",
-        "M0_DJANGO_SECRET_KEY",
-        "M0_INFLUX_INIT_PASSWORD",
-    )
-]
-archive = root / "rollback-images.tar"
-archive_identity = None
-if archive.exists():
-    archive_stat = os.lstat(archive)
-    archive_identity = (archive_stat.st_dev, archive_stat.st_ino)
-maximum = max(len(value) for value in secrets_to_find)
-for path in root.rglob("*"):
-    metadata = os.lstat(path)
-    if stat.S_ISDIR(metadata.st_mode):
-        continue
-    if not stat.S_ISREG(metadata.st_mode):
-        raise SystemExit("evidence contains a non-regular entry; refusing artifact")
-    if archive_identity == (metadata.st_dev, metadata.st_ino):
-        continue
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        current = os.fstat(descriptor)
-        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
-            raise SystemExit("evidence entry changed during credential scan")
-        initial_size = current.st_size
-        initial_mtime_ns = current.st_mtime_ns
-        carry = b""
-        while True:
-            block = os.read(descriptor, 1024 * 1024)
-            if not block:
-                break
-            candidate = carry + block
-            if any(secret in candidate for secret in secrets_to_find):
-                raise SystemExit("ephemeral credential found in evidence; refusing artifact")
-            carry = candidate[-(maximum - 1):] if maximum > 1 else b""
-        final = os.fstat(descriptor)
-        final_path = os.lstat(path)
-        if (
-            (final.st_dev, final.st_ino) != (metadata.st_dev, metadata.st_ino)
-            or (final_path.st_dev, final_path.st_ino)
-            != (metadata.st_dev, metadata.st_ino)
-            or final.st_size != initial_size
-            or final.st_mtime_ns != initial_mtime_ns
-        ):
-            raise SystemExit("evidence entry changed during credential scan")
-    finally:
-        os.close(descriptor)
-PY
+# Evidence remains runner-local and is never handed to an artifact uploader.
+# Recheck its held directory identity before reporting the CI gate result.
 python3 "$EVIDENCE_IO" verify \
   --root "$EVIDENCE_ROOT" --fd "$EVIDENCE_FD" \
   --device "$EVIDENCE_DEVICE" --inode "$EVIDENCE_INODE"
 
-echo "M0 isolated recovery drill passed; evidence: $EVIDENCE_ROOT"
+echo "M0 isolated recovery drill passed; runner-local evidence was not uploaded"

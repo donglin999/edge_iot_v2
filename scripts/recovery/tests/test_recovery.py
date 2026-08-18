@@ -146,6 +146,7 @@ class SafetyTests(unittest.TestCase):
                     + "false\n",
                     "plaintext",
                 ),
+                ("docker cp container:/cert.pem client.pem\n", "mutable-path"),
             )
             for source, message in cases:
                 with self.subTest(message=message):
@@ -265,6 +266,15 @@ class EvidenceIOTests(unittest.TestCase):
 
 
 class DinDTLSTests(unittest.TestCase):
+    PEM = b"-----BEGIN TEST-----\nvalue\n-----END TEST-----\n"
+
+    def _capture_command(self):
+        return [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(" + repr(self.PEM) + ")",
+        ]
+
     def test_client_material_is_private_regular_pem(self):
         with tempfile.TemporaryDirectory() as raw_root:
             allowed = Path(raw_root)
@@ -272,35 +282,66 @@ class DinDTLSTests(unittest.TestCase):
             path = allowed / ".m0ci-run-123456.dind-client"
             identity = dind_tls.create_directory(str(path), str(allowed))
             for name in dind_tls.REQUIRED_FILES:
-                (path / name).write_text(
-                    "-----BEGIN TEST-----\nvalue\n-----END TEST-----\n",
-                    encoding="utf-8",
+                dind_tls.capture_client_file(
+                    path,
+                    identity,
+                    name,
+                    self._capture_command(),
                 )
             dind_tls.secure_client_files(path, identity)
             for name in dind_tls.REQUIRED_FILES:
                 self.assertEqual((path / name).stat().st_mode & 0o777, 0o600)
+                self.assertEqual((path / name).stat().st_nlink, 1)
+                self.assertEqual((path / name).read_bytes(), self.PEM)
             dind_tls.cleanup_directory(path, identity)
             self.assertFalse(path.exists())
 
-    def test_client_key_symlink_is_rejected_without_touching_victim(self):
+    def test_capture_rejects_precreated_symlink_before_command(self):
         with tempfile.TemporaryDirectory() as raw_root:
             allowed = Path(raw_root)
             os.chmod(allowed, 0o700)
             path = allowed / ".m0ci-run-123456.dind-client"
             identity = dind_tls.create_directory(str(path), str(allowed))
-            for name in ("ca.pem", "cert.pem"):
-                (path / name).write_text(
-                    "-----BEGIN TEST-----\nvalue\n-----END TEST-----\n",
-                    encoding="utf-8",
-                )
             victim = allowed / "victim-key"
             victim.write_text("private-victim", encoding="utf-8")
             os.chmod(victim, 0o640)
             (path / "key.pem").symlink_to(victim)
-            with self.assertRaises(dind_tls.TLSMaterialError):
-                dind_tls.secure_client_files(path, identity)
+            with mock.patch.object(dind_tls.subprocess, "run") as run:
+                with self.assertRaises(dind_tls.TLSMaterialError):
+                    dind_tls.capture_client_file(
+                        path, identity, "key.pem", self._capture_command()
+                    )
+                run.assert_not_called()
             self.assertEqual(victim.read_text(encoding="utf-8"), "private-victim")
             self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
+
+    def test_capture_rejects_precreated_hardlink_before_command(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            allowed = Path(raw_root)
+            os.chmod(allowed, 0o700)
+            path = allowed / ".m0ci-run-123456.dind-client"
+            identity = dind_tls.create_directory(str(path), str(allowed))
+            victim = allowed / "victim-cert"
+            victim.write_bytes(b"must-not-change")
+            os.chmod(victim, 0o640)
+            os.link(victim, path / "cert.pem")
+            with mock.patch.object(dind_tls.subprocess, "run") as run:
+                with self.assertRaises(dind_tls.TLSMaterialError):
+                    dind_tls.capture_client_file(
+                        path, identity, "cert.pem", self._capture_command()
+                    )
+                run.assert_not_called()
+            self.assertEqual(victim.read_bytes(), b"must-not-change")
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    def test_runner_local_evidence_has_no_artifact_uploader(self):
+        workflow = (
+            RECOVERY_ROOT.parents[1] / ".github/workflows/m0-recovery-drill.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("actions/upload-artifact", workflow)
+        self.assertNotIn("M0_EVIDENCE_PATH", workflow)
 
 
 class ArchiveTests(unittest.TestCase):

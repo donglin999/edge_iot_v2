@@ -12,8 +12,10 @@
 - Compose 文件不允许 `container_name`、`network_mode: host` 或 external resource；应用网络是
   `internal: true` 的 bridge。DinD 另建仅属于本 project 的 internal bridge，并在结束时按
   Docker 返回的 network ID 精确删除。DinD 只发布 loopback TLS 2376；入口自动生成的客户端
-  CA/cert/key 被复制到 evidence 外的 project 私有 `0700` 目录，逐个验证为 PEM 并改为 `0600`，
-  客户端强制 `--tlsverify`，结束时按目录 device/inode 精确清理。
+  CA/cert/key 通过 `docker exec cat` 的 stdout 直接写入 evidence 外 project 私有 `0700` 目录中
+  预先以 `O_EXCL|O_NOFOLLOW` 创建并持有的 `0600` FD；采集前后复核目录及文件
+  device/inode/mode/size/nlink 和 PEM 边界。客户端强制 `--tlsverify`，结束时按目录
+  device/inode 精确清理。
 - Web 与 Influx 的随机宿主端口只绑定 `127.0.0.1`。Redis、Django、Celery 不发布端口。
 - SQLite、Influx data/config 都使用 project 私有新卷。退出 trap 只删除这个已验证 project
   的资源，从不调用 prune，也不按模糊名称删除资源。
@@ -49,11 +51,12 @@
 7. 分别定向完整唯一节点名检查 acquisition 与 short 两个 Celery worker 的 ping，并检查
    `active_queues` 确实为 `acquisition` / `short`，不以单个模糊 `pong` 代替双 worker 验收。
 
-成功证据在 `summary.json` 汇总；CI artifact 还保留 SQLite/Influx wrapper 报告、archive
-checksum 文档、DinD load 报告和静态事实源 smoke 报告。大体积镜像 tar 不上传；token 从未
-进入 evidence。上传前会对所有候选普通文件进行三项一次性凭据的精确字节扫描，只有完整演练
-成功且扫描无命中才调用 artifact action。Influx restore wrapper 按安全设计保留只读 restore
-staging，随 project/evidence 生命周期结束，不会触碰源 bucket。
+成功证据在 runner-local `summary.json` 汇总；SQLite/Influx wrapper 报告、archive checksum、
+DinD load 报告、静态事实源 smoke 报告以及大体积镜像 tar 都只存在于本次 runner 的私有
+evidence 目录。workflow 不调用 artifact uploader，因而 token、TLS material、数据库、tar、
+hardlink/别名或报告元数据都没有 GitHub Actions artifact 上传边界；CI 日志只输出门禁成功/失败
+状态。Influx restore wrapper 按安全设计保留只读 restore staging，随 project/evidence 生命周期
+结束，不会触碰源 bucket。
 
 ## 本地运行
 
