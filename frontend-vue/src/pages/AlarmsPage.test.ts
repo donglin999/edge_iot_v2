@@ -300,6 +300,39 @@ describe('AlarmsPage', () => {
     });
   });
 
+  it('locks the rule editor and deduplicates saves until the request settles', async () => {
+    const pendingCreate = deferred<AlarmRule>();
+    vi.mocked(createAlarmRule).mockReturnValueOnce(pendingCreate.promise);
+
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
+
+    const dialog = await screen.findByRole('dialog');
+    await fireEvent.update(within(dialog).getByLabelText('规则名称'), '压力高');
+    await fireEvent.update(within(dialog).getByLabelText('测点编码'), 'pressure');
+    await fireEvent.update(within(dialog).getByLabelText('阈值'), '12.5');
+    const saveButton = within(dialog).getByRole('button', { name: /保\s*存/ });
+    await fireEvent.click(saveButton);
+    await fireEvent.click(saveButton);
+
+    await waitFor(() => expect(createAlarmRule).toHaveBeenCalledTimes(1));
+    const cancelButton = within(dialog).getByRole('button', { name: /Cancel|取\s*消/ });
+    expect(cancelButton).toBeDisabled();
+    expect(screen.getByRole('button', { name: '新建规则' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '编辑规则 温度高' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '删除规则 温度高' })).toBeDisabled();
+    await fireEvent.click(cancelButton);
+    expect(screen.getByRole('dialog')).toBeVisible();
+
+    const modalElement = dialog.querySelector('.ant-modal');
+    expect(modalElement).not.toBeNull();
+    pendingCreate.resolve({ ...alarmRules[0]!, id: 12, name: '压力高' });
+    await waitFor(() => expect(modalElement).not.toBeVisible());
+    expect(createAlarmRule).toHaveBeenCalledTimes(1);
+  });
+
   it('prefills an edited rule and updates the exact id and writable payload', async () => {
     render(TestHost);
     await screen.findByText('当前有 1 个未确认告警');
@@ -442,6 +475,31 @@ describe('AlarmsPage', () => {
     const deleteSignal = vi.mocked(deleteAlarmRule).mock.calls[0]![1];
     expect(deleteSignal).toBeInstanceOf(AbortSignal);
     expect(deleteSignal?.aborted).toBe(false);
+  });
+
+  it('allows only one delete confirmation and one pending delete request', async () => {
+    const pendingDelete = deferred<void>();
+    vi.mocked(deleteAlarmRule).mockReturnValueOnce(pendingDelete.promise);
+
+    render(TestHost);
+    await screen.findByText('当前有 1 个未确认告警');
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    const deleteButton = screen.getByRole('button', { name: '删除规则 温度高' });
+    await fireEvent.click(deleteButton);
+    await fireEvent.click(deleteButton);
+
+    expect(screen.getAllByText('删除规则 "温度高" ?')).toHaveLength(1);
+    const confirmButton = await screen.findByRole('button', { name: /OK|确\s*定/ });
+    await fireEvent.click(confirmButton);
+    await fireEvent.click(confirmButton);
+
+    await waitFor(() => expect(deleteAlarmRule).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('button', { name: '编辑规则 温度高' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '删除规则 温度高' })).toBeDisabled();
+
+    pendingDelete.resolve(undefined);
+    await waitFor(() => expect(deleteButton).not.toBeDisabled());
+    expect(deleteAlarmRule).toHaveBeenCalledTimes(1);
   });
 
   it('aborts active read and write signals when the page unmounts', async () => {

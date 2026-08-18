@@ -160,6 +160,7 @@ const ruleErrorMessage = ref<string | null>(null);
 const actionErrorMessage = ref<string | null>(null);
 const acknowledgingId = ref<number | null>(null);
 const deletingRuleId = ref<number | null>(null);
+const pendingDeleteRuleId = ref<number | null>(null);
 const savingRule = ref(false);
 const ruleModalOpen = ref(false);
 const editingRule = ref<AlarmRule | null>(null);
@@ -175,6 +176,12 @@ const firingCount = computed(
   () => alarms.value.filter((alarm) => alarm.status === 'firing').length,
 );
 const rangeOperator = computed(() => isRangeAlarmOperator(ruleForm.operator));
+const ruleWriteBusy = computed(
+  () =>
+    savingRule.value ||
+    deletingRuleId.value !== null ||
+    pendingDeleteRuleId.value !== null,
+);
 
 function statusMeta(status: string) {
   return STATUS_META[status] ?? { label: status || '未知', badge: 'default' as const };
@@ -277,6 +284,7 @@ async function ackAlarm(id: number): Promise<void> {
 }
 
 function openRuleModal(rule?: AlarmRule): void {
+  if (ruleWriteBusy.value) return;
   editingRule.value = rule ?? null;
   Object.assign(
     ruleForm,
@@ -294,8 +302,18 @@ function openRuleModal(rule?: AlarmRule): void {
 }
 
 function closeRuleModal(): void {
+  if (savingRule.value) return;
   ruleModalOpen.value = false;
   editingRule.value = null;
+}
+
+function finishRuleModal(): void {
+  ruleModalOpen.value = false;
+  editingRule.value = null;
+}
+
+function handleRuleModalOpenChange(open: boolean): void {
+  if (!open) closeRuleModal();
 }
 
 function rulePayload(): AlarmRuleWritePayload {
@@ -313,27 +331,30 @@ function rulePayload(): AlarmRuleWritePayload {
 }
 
 async function saveRule(): Promise<void> {
-  try {
-    await ruleFormRef.value?.validate();
-  } catch {
-    return;
-  }
-
-  actionErrorMessage.value = null;
+  if (ruleWriteBusy.value) return;
   savingRule.value = true;
   try {
-    if (editingRule.value) {
+    try {
+      await ruleFormRef.value?.validate();
+    } catch {
+      return;
+    }
+
+    actionErrorMessage.value = null;
+    const editingRuleId = editingRule.value?.id ?? null;
+    const payload = rulePayload();
+    if (editingRuleId !== null) {
       await updateAlarmRule(
-        editingRule.value.id,
-        rulePayload(),
+        editingRuleId,
+        payload,
         mutationController.signal,
       );
       message.success('规则已更新');
     } else {
-      await createAlarmRule(rulePayload(), mutationController.signal);
+      await createAlarmRule(payload, mutationController.signal);
       message.success('规则已创建');
     }
-    closeRuleModal();
+    finishRuleModal();
     await refresh();
   } catch (error) {
     if (!mutationController.signal.aborted) {
@@ -345,6 +366,7 @@ async function saveRule(): Promise<void> {
 }
 
 async function performDeleteRule(rule: AlarmRule): Promise<void> {
+  if (savingRule.value || deletingRuleId.value !== null) return;
   actionErrorMessage.value = null;
   deletingRuleId.value = rule.id;
   try {
@@ -362,11 +384,19 @@ async function performDeleteRule(rule: AlarmRule): Promise<void> {
 }
 
 function confirmDeleteRule(rule: AlarmRule): void {
+  if (ruleWriteBusy.value) return;
+  pendingDeleteRuleId.value = rule.id;
   modal.confirm({
     title: `删除规则 "${rule.name}" ?`,
     content: '已产生的告警记录会保留。',
     okType: 'danger',
-    onOk: () => performDeleteRule(rule),
+    onOk: () => {
+      pendingDeleteRuleId.value = null;
+      return performDeleteRule(rule);
+    },
+    onCancel: () => {
+      pendingDeleteRuleId.value = null;
+    },
   });
 }
 
@@ -409,6 +439,7 @@ onBeforeUnmount(() => {
             v-if="activeTab === 'rules'"
             type="primary"
             aria-label="新建规则"
+            :disabled="ruleWriteBusy"
             @click="openRuleModal()"
           >
             <template #icon><PlusOutlined /></template>
@@ -544,6 +575,7 @@ onBeforeUnmount(() => {
                   <AButton
                     size="small"
                     :aria-label="`编辑规则 ${record.name}`"
+                    :disabled="ruleWriteBusy"
                     @click="openRuleModal(asAlarmRule(record))"
                   >
                     <template #icon><EditOutlined /></template>
@@ -553,6 +585,7 @@ onBeforeUnmount(() => {
                     size="small"
                     :aria-label="`删除规则 ${record.name}`"
                     :loading="deletingRuleId === record.id"
+                    :disabled="ruleWriteBusy"
                     @click="confirmDeleteRule(asAlarmRule(record))"
                   >
                     <template #icon><DeleteOutlined /></template>
@@ -566,13 +599,18 @@ onBeforeUnmount(() => {
     </ACard>
 
     <AModal
-      v-model:open="ruleModalOpen"
+      :open="ruleModalOpen"
       :title="editingRule ? '编辑规则' : '新建规则'"
       ok-text="保存"
       cancel-text="取消"
       :confirm-loading="savingRule"
+      :closable="!savingRule"
+      :mask-closable="!savingRule"
+      :keyboard="!savingRule"
+      :cancel-button-props="{ disabled: savingRule }"
       :destroy-on-close="true"
       :width="640"
+      @update:open="handleRuleModalOpenChange"
       @ok="saveRule"
       @cancel="closeRuleModal"
     >
@@ -628,7 +666,7 @@ onBeforeUnmount(() => {
               label="阈值上限（区间）"
               :required="ruleForm.is_active && rangeOperator"
               :rules="[{ validator: validateThresholdHigh, trigger: ['change', 'blur'] }]"
-              extra="between/outside 必填，且不得小于阈值。"
+              extra="启用的 between/outside 规则必填，且不得小于阈值。"
             >
               <AInputNumber v-model:value="ruleForm.threshold_high" class="full-width" />
             </AFormItem>
