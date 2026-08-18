@@ -1,0 +1,76 @@
+name: M0 isolated recovery drill
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/backup/**
+      - scripts/recovery/**
+      - docs/migration/m0-**
+      - .github/workflows/m0-recovery-drill.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m0-recovery-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  recovery-drill:
+    name: SQLite + Influx + immutable image rollback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v4
+
+      - name: Install Node for the rollback web image
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Static and unit safety gates
+        run: bash scripts/recovery/tests/test_static.sh
+
+      - name: Prepare frontend artifact explicitly
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Prepare every Docker image explicitly
+        env:
+          PREP_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker pull redis:7.0.10
+          docker pull influxdb:2.7
+          docker pull docker:27-dind
+          docker build --pull -f backend/Dockerfile -t "m0-backend:${PREP_TAG}" backend
+          docker build --pull -f deploy/offline/Dockerfile.web -t "m0-web:${PREP_TAG}" .
+          docker build --pull -f scripts/recovery/Dockerfile.tool -t "m0-recovery-tool:${PREP_TAG}" .
+
+          {
+            echo "M0_BACKEND_IMAGE_ID=$(docker image inspect "m0-backend:${PREP_TAG}" --format '{{.Id}}')"
+            echo "M0_WEB_IMAGE_ID=$(docker image inspect "m0-web:${PREP_TAG}" --format '{{.Id}}')"
+            echo "M0_REDIS_IMAGE_ID=$(docker image inspect redis:7.0.10 --format '{{.Id}}')"
+            echo "M0_INFLUX_IMAGE_ID=$(docker image inspect influxdb:2.7 --format '{{.Id}}')"
+            echo "M0_TOOL_IMAGE_ID=$(docker image inspect "m0-recovery-tool:${PREP_TAG}" --format '{{.Id}}')"
+            echo "M0_DIND_IMAGE_ID=$(docker image inspect docker:27-dind --format '{{.Id}}')"
+          } >> "$GITHUB_ENV"
+
+      - name: Run isolated recovery and SHA-pinned rollback
+        env:
+          M0_IMAGES_PREPARED: "1"
+        run: |
+          set -euo pipefail
+          project="m0ci-gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          evidence="${RUNNER_TEMP}/evidence-${project}"
+          bash scripts/recovery/m0_ci_drill.sh \
+            --project "$project" \
+            --allowed-root "$RUNNER_TEMP" \
+            --evidence "$evidence"

@@ -1,0 +1,219 @@
+x-backend-environment: &backend-environment
+  DJANGO_SETTINGS_MODULE: control_plane.settings
+  DJANGO_DB_NAME: /data/restored.sqlite3
+  SECRET_KEY: ${M0_DJANGO_SECRET_KEY:?ephemeral Django secret required}
+  DEBUG: "False"
+  ALLOWED_HOSTS: 127.0.0.1,localhost,web,django
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/0
+  INFLUXDB_HOST: influx
+  INFLUXDB_PORT: "8086"
+  INFLUXDB_TOKEN: ${M0_INFLUX_TOKEN:?ephemeral drill token required}
+  INFLUXDB_ORG: m0-ci
+  INFLUXDB_BUCKET: m0-restored
+  INFLUX_SPILL_DB_PATH: /data/influx-spill.sqlite3
+
+x-light-limits: &light-limits
+  mem_limit: 128m
+  cpus: 0.50
+  pids_limit: 128
+
+x-backend-limits: &backend-limits
+  mem_limit: 512m
+  cpus: 1.00
+  pids_limit: 256
+
+x-influx-limits: &influx-limits
+  mem_limit: 768m
+  cpus: 1.50
+  pids_limit: 512
+
+services:
+  redis:
+    <<: *light-limits
+    image: ${M0_REDIS_IMAGE_ID:?immutable Redis ID required}
+    pull_policy: never
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [drill]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  influx:
+    <<: *influx-limits
+    image: ${M0_INFLUX_IMAGE_ID:?immutable Influx ID required}
+    pull_policy: never
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: m0-ci-admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${M0_INFLUX_INIT_PASSWORD:?ephemeral init password required}
+      DOCKER_INFLUXDB_INIT_ORG: m0-ci
+      DOCKER_INFLUXDB_INIT_BUCKET: m0-source
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${M0_INFLUX_TOKEN:?ephemeral drill token required}
+    networks: [drill]
+    volumes:
+      - influx-data:/var/lib/influxdb2
+      - influx-config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping", "--host", "http://127.0.0.1:8086"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  volume-init:
+    <<: *backend-limits
+    image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
+    pull_policy: never
+    profiles: [prep]
+    user: "0:0"
+    command: ["sh", "-c", "chown ${M0_UID:?uid required}:${M0_GID:?gid required} /data /app/logs && chmod 0750 /data /app/logs"]
+    volumes:
+      - app-db:/data
+      - app-logs:/app/logs
+    networks: [drill]
+
+  migrate:
+    <<: *backend-limits
+    image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
+    pull_policy: never
+    profiles: [prep]
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    environment: *backend-environment
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    volumes:
+      - app-db:/data
+      - app-logs:/app/logs
+    networks: [drill]
+
+  seed:
+    <<: *backend-limits
+    image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
+    pull_policy: never
+    profiles: [prep]
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    environment: *backend-environment
+    command: ["python", "manage.py", "shell", "-c", "exec(open('/recovery/seed_fixture.py', encoding='utf-8').read())"]
+    volumes:
+      - app-db:/data
+      - app-logs:/app/logs
+      - ${M0_REPO_ROOT:?repository root required}/scripts/recovery:/recovery:ro
+    networks: [drill]
+
+  recovery-tool:
+    <<: *backend-limits
+    image: ${M0_TOOL_IMAGE_ID:?immutable recovery tool ID required}
+    pull_policy: never
+    profiles: [tools]
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    working_dir: /repo
+    environment:
+      HOME: /tmp
+      INFLUX_TOKEN: ${M0_INFLUX_TOKEN:?ephemeral drill token required}
+    volumes:
+      - app-db:/data
+      - ${M0_EVIDENCE_ROOT:?evidence root required}:/evidence
+      - ${M0_TOKEN_FILE:?token file required}:/run/secrets/influx.token:ro
+    networks: [drill]
+
+  stack-smoke:
+    <<: *light-limits
+    image: ${M0_TOOL_IMAGE_ID:?immutable recovery tool ID required}
+    pull_policy: never
+    profiles: [tools]
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+    volumes:
+      - ${M0_REPO_ROOT:?repository root required}/scripts/recovery:/recovery:ro
+    networks: [drill]
+
+  django:
+    <<: *backend-limits
+    image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
+    pull_policy: never
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    environment: *backend-environment
+    command: ["daphne", "-b", "0.0.0.0", "-p", "8000", "control_plane.asgi:application"]
+    volumes:
+      - app-db:/data
+      - app-logs:/app/logs
+    networks: [drill]
+    depends_on:
+      redis:
+        condition: service_healthy
+      influx:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/config/sites/', timeout=3).read()"]
+      interval: 2s
+      timeout: 4s
+      retries: 60
+
+  celery-acq:
+    <<: *backend-limits
+    image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
+    pull_policy: never
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    environment: *backend-environment
+    hostname: "${COMPOSE_PROJECT_NAME:?project required}-acq"
+    command: ["celery", "-A", "control_plane", "worker", "-l", "warning", "--pool=solo", "--concurrency=1", "-Q", "acquisition", "-n", "m0-acq@${COMPOSE_PROJECT_NAME:?project required}-acq"]
+    volumes:
+      - app-db:/data
+      - app-logs:/app/logs
+    networks: [drill]
+    depends_on:
+      redis:
+        condition: service_healthy
+      influx:
+        condition: service_healthy
+
+  celery-short:
+    <<: *backend-limits
+    image: ${M0_BACKEND_IMAGE_ID:?immutable backend ID required}
+    pull_policy: never
+    user: "${M0_UID:?uid required}:${M0_GID:?gid required}"
+    environment: *backend-environment
+    hostname: "${COMPOSE_PROJECT_NAME:?project required}-short"
+    command: ["celery", "-A", "control_plane", "worker", "-l", "warning", "--pool=solo", "--concurrency=1", "-Q", "short", "-n", "m0-short@${COMPOSE_PROJECT_NAME:?project required}-short"]
+    volumes:
+      - app-db:/data
+      - app-logs:/app/logs
+    networks: [drill]
+    depends_on:
+      redis:
+        condition: service_healthy
+      influx:
+        condition: service_healthy
+
+  web:
+    <<: *light-limits
+    image: ${M0_WEB_IMAGE_ID:?immutable web ID required}
+    pull_policy: never
+    environment:
+      BACKEND_UPSTREAM: django:8000
+      WEB_PORT: "80"
+    networks: [drill]
+    depends_on:
+      django:
+        condition: service_healthy
+
+networks:
+  drill:
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+
+volumes:
+  app-db:
+  app-logs:
+  influx-data:
+  influx-config:

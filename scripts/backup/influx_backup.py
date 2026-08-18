@@ -828,12 +828,30 @@ def assert_bucket_absent(
 ) -> None:
     output = run_influx(
         influx_bin,
-        ["bucket", "list", "--host", host, "--org", org, "--name", bucket, "--json"],
+        # Do not use ``--name`` here.  Influx CLI 2.x returns HTTP 404 / exit 1
+        # when that filtered name is absent, which is exactly the safe state a
+        # restore needs to prove.  Enumerate the explicit org successfully and
+        # perform an exact local name comparison instead.
+        [
+            "bucket",
+            "list",
+            "--host",
+            host,
+            "--org",
+            org,
+            # Make the successful enumeration explicitly complete.  Influx
+            # CLI documents zero as "return all" for this option.
+            "--limit",
+            "0",
+            "--json",
+        ],
         token,
         command_timeout,
     )
+    if not output.strip():
+        raise BackupError("empty bucket-list response; refusing restore")
     try:
-        payload = json.loads(output or "[]")
+        payload = json.loads(output)
     except json.JSONDecodeError as exc:
         raise BackupError("could not determine whether restore bucket exists") from exc
     if isinstance(payload, dict):
@@ -845,7 +863,12 @@ def assert_bucket_absent(
             raise BackupError("unrecognized bucket-list response; refusing restore")
     if not isinstance(payload, list):
         raise BackupError("unrecognized bucket-list response; refusing restore")
-    if payload:
+    bucket_names = []
+    for entry in payload:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise BackupError("unrecognized bucket-list response; refusing restore")
+        bucket_names.append(entry["name"])
+    if bucket in bucket_names:
         raise BackupError(f"refusing to restore over existing bucket: {org}/{bucket}")
 
 
