@@ -108,7 +108,11 @@
     "payload_key": "data",
     "keys": ["batch_count", "chunk_count", "chunk_index", "readings", "session_id", "timestamp"],
     "reading_keys": ["point_code", "quality", "timestamp", "value"],
-    "batch_count_rule": "Present on the first chunk and represents consumed readings before latest-per-point deduplication."
+    "batch_count_rule": {
+      "present_on_every_chunk": true,
+      "first_chunk_source": "raw_reading_count_before_latest_per_point_deduplication",
+      "later_chunk_value": 0
+    }
   },
   "browser_policy": {
     "hook_default_auto_reconnect": true,

@@ -214,18 +214,38 @@ def test_client_frames_are_ignored_and_replay_is_absent() -> None:
 
 def test_data_batch_is_built_by_production_websocket_sink() -> None:
     contract = load_contract("websocket-v1.json")["data_batch"]
+    batch_count_rule = contract["batch_count_rule"]
     session_id = 73
     sink = WebSocketSink(SimpleNamespace(id=session_id), broadcast_interval=60)
     sink._stop.set()
     sink._thread.join(timeout=1)
     layer = _ChannelLayer()
     sink._channel_layer = layer
+    raw_readings = [
+        Reading(
+            point_code=f"synthetic-point-{index:03d}",
+            value=index,
+            timestamp_ns=(index + 1) * 1_000_000_000,
+            quality="good",
+        )
+        for index in range(201)
+    ]
+    # The latest duplicate must replace point 000's value without changing its
+    # insertion position. 202 raw readings therefore become 201 unique points,
+    # forcing the production 200-reading frame cap to emit two chunks.
+    raw_readings.append(
+        Reading(
+            point_code="synthetic-point-000",
+            value=9999,
+            timestamp_ns=999_000_000_000,
+            quality="good",
+        )
+    )
+    assert len(raw_readings) == 202
+    expected_point_codes = {f"synthetic-point-{index:03d}" for index in range(201)}
+    assert {reading.point_code for reading in raw_readings} == expected_point_codes
     with sink._lock:
-        sink._buffer = [
-            Reading(point_code="p1", value=1, timestamp_ns=1_000_000_000, quality="good"),
-            Reading(point_code="p1", value=2, timestamp_ns=2_000_000_000, quality="good"),
-            Reading(point_code="p2", value=True, timestamp_ns=3_000_000_000, quality="good"),
-        ]
+        sink._buffer = raw_readings
 
     sink._broadcast_once()
 
@@ -233,22 +253,64 @@ def test_data_batch_is_built_by_production_websocket_sink() -> None:
         group.replace("{session_id}", str(session_id))
         for group in contract["groups"]
     ]
-    assert [group for group, _message in layer.sent] == expected_groups
-    for _group, envelope in layer.sent:
-        assert envelope["type"] == contract["event_type"]
-        payload = envelope[contract["payload_key"]]
-        assert sorted(payload) == contract["keys"]
-        assert payload["batch_count"] == 3
-        assert payload["chunk_index"] == 0
-        assert payload["chunk_count"] == 1
-        assert payload["session_id"] == session_id
-        assert len(payload["readings"]) == 2
-        assert all(
-            sorted(reading) == contract["reading_keys"]
-            for reading in payload["readings"]
+    assert [group for group, _message in layer.sent] == [
+        expected_groups[0],
+        expected_groups[1],
+        expected_groups[0],
+        expected_groups[1],
+    ]
+
+    for group in expected_groups:
+        envelopes = [message for target, message in layer.sent if target == group]
+        assert len(envelopes) == 2
+        assert all(sorted(envelope) == ["data", "type"] for envelope in envelopes)
+        assert all(envelope["type"] == contract["event_type"] for envelope in envelopes)
+
+        payloads = [envelope[contract["payload_key"]] for envelope in envelopes]
+        assert all(sorted(payload) == contract["keys"] for payload in payloads)
+        assert batch_count_rule["present_on_every_chunk"] is True
+        assert all("batch_count" in payload for payload in payloads)
+        assert [payload["chunk_index"] for payload in payloads] == [0, 1]
+        assert [payload["chunk_count"] for payload in payloads] == [2, 2]
+        batch_counts = [payload["batch_count"] for payload in payloads]
+        assert batch_count_rule["first_chunk_source"] == (
+            "raw_reading_count_before_latest_per_point_deduplication"
         )
-        for key in ("event_id", "sequence", "resume_cursor"):
-            assert key not in envelope
+        assert batch_counts == [
+            len(raw_readings),
+            batch_count_rule["later_chunk_value"],
+        ]
+        assert batch_counts == [202, 0]
+        assert batch_counts[0] != len(expected_point_codes)
+        # A non-zero later chunk would double-count one broadcast cycle in the
+        # browser. These assertions intentionally fail if that legacy wire
+        # semantic is changed to repeat the raw total on every frame.
+        assert batch_counts[1:] == [batch_count_rule["later_chunk_value"]] * (
+            len(payloads) - 1
+        )
+        assert sum(batch_counts) == len(raw_readings)
+        assert all(payload["session_id"] == session_id for payload in payloads)
+        assert all(len(payload["readings"]) <= 200 for payload in payloads)
+        assert [len(payload["readings"]) for payload in payloads] == [200, 1]
+
+        readings = [
+            reading
+            for payload in payloads
+            for reading in payload["readings"]
+        ]
+        assert all(sorted(reading) == contract["reading_keys"] for reading in readings)
+        point_codes = [reading["point_code"] for reading in readings]
+        assert len(point_codes) == 201
+        assert len(set(point_codes)) == 201
+        assert set(point_codes) == expected_point_codes
+        assert next(
+            reading["value"]
+            for reading in readings
+            if reading["point_code"] == "synthetic-point-000"
+        ) == 9999
+        for envelope in envelopes:
+            for key in ("event_id", "sequence", "resume_cursor"):
+                assert key not in envelope
 
 
 def test_browser_reconnect_and_resync_rules_are_explicitly_pinned() -> None:
