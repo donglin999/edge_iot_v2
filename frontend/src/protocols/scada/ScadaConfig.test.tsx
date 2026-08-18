@@ -105,7 +105,8 @@ describe('新建 scada 设备', () => {
     expect(screen.queryByPlaceholderText(/task-zhongshan/)).not.toBeInTheDocument();
 
     await user.type(screen.getByPlaceholderText(/A0201010001150403/), 'A0201010001150403');
-    await user.type(screen.getAllByPlaceholderText(/N270400150027/)[0], 'N270400150027');
+    const pointInputs = await screen.findAllByPlaceholderText(/N270400150027/);
+    await user.type(pointInputs[0], 'N270400150027');
 
     await waitFor(async () => {
       expect(await ref.current?.submit()).toBe(true);
@@ -138,7 +139,8 @@ describe('新建 scada 设备', () => {
     const { ref } = renderConfig();
     await waitFor(() => expect(screen.getByText(/连接参数已由网关提供/)).toBeInTheDocument());
 
-    await user.type(screen.getAllByPlaceholderText(/N270400150027/)[0], 'N270400150027');
+    const pointInputs = await screen.findAllByPlaceholderText(/N270400150027/);
+    await user.type(pointInputs[0], 'N270400150027');
     expect(await ref.current?.submit()).toBe(false);
 
     await waitFor(() =>
