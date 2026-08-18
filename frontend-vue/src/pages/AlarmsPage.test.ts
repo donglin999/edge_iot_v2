@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/vue';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/vue';
 import { App as AntApp } from 'ant-design-vue';
 import { defineComponent, h } from 'vue';
 
@@ -101,6 +107,50 @@ function deferred<T>(): {
   return { promise, resolve };
 }
 
+async function renderRulesTab(): Promise<void> {
+  // Rule-editor tests do not need the alarm table. Keeping that unrelated table
+  // empty makes these Ant Design integration tests substantially cheaper while
+  // still exercising the real page, rule table, modal and App context.
+  vi.mocked(fetchAlarms).mockResolvedValueOnce([]);
+  render(TestHost);
+  const rulesTab = await screen.findByRole('tab', { name: '阈值规则 (1)' });
+  await waitFor(() => {
+    expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+  });
+  await fireEvent.click(rulesTab);
+}
+
+async function waitForRuleWriteLifecycle(dialog: HTMLElement): Promise<void> {
+  // AModal keeps its portal wrapper mounted by design, but it is not closed
+  // until its modal content becomes hidden. Also wait for the post-write refresh
+  // so no mutation continuation leaks into the following test.
+  await waitFor(() => {
+    const modal = dialog.querySelector<HTMLElement>('.ant-modal');
+    if (modal) expect(modal).not.toBeVisible();
+  });
+  await waitFor(() => {
+    expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+  });
+  await waitFor(() => expect(fetchAlarmRules).toHaveBeenCalledTimes(2));
+  await waitFor(() => {
+    expect(screen.getByRole('button', { name: '新建规则' })).not.toBeDisabled();
+  });
+}
+
+async function waitForConfirmWriteLifecycle(dialog: HTMLElement): Promise<void> {
+  await waitFor(() => {
+    const modal = dialog.querySelector<HTMLElement>('.ant-modal');
+    if (modal) expect(modal).not.toBeVisible();
+  });
+  await waitFor(() => {
+    expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+  });
+  await waitFor(() => expect(fetchAlarmRules).toHaveBeenCalledTimes(2));
+  await waitFor(() => {
+    expect(screen.getByRole('button', { name: '删除规则 温度高' })).not.toBeDisabled();
+  });
+}
+
 beforeEach(() => {
   vi.mocked(fetchAlarms).mockReset().mockResolvedValue(alarmRecords);
   vi.mocked(fetchAlarmRules).mockReset().mockResolvedValue(alarmRules);
@@ -119,7 +169,10 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('AlarmsPage', () => {
+// Full Ant Design table/form/modal integration is intentionally retained here.
+// The hosted CI runner measured the heaviest cases at 8.1s under file-level
+// contention, so keep the expanded budget local to this suite.
+describe('AlarmsPage', { timeout: 12_000 }, () => {
   it('exposes initial loading then renders alarms, categories and firing count', async () => {
     const pending = deferred<AlarmRecord[]>();
     vi.mocked(fetchAlarms).mockReturnValueOnce(pending.promise);
@@ -268,10 +321,7 @@ describe('AlarmsPage', () => {
   });
 
   it('creates a rule from the rules tab with the complete writable payload', async () => {
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
 
     const dialog = await screen.findByRole('dialog');
@@ -298,15 +348,14 @@ describe('AlarmsPage', () => {
         expect.any(AbortSignal),
       );
     });
+    await waitForRuleWriteLifecycle(dialog);
   });
 
   it('locks the rule editor and deduplicates saves until the request settles', async () => {
     const pendingCreate = deferred<AlarmRule>();
     vi.mocked(createAlarmRule).mockReturnValueOnce(pendingCreate.promise);
 
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
 
     const dialog = await screen.findByRole('dialog');
@@ -326,18 +375,13 @@ describe('AlarmsPage', () => {
     await fireEvent.click(cancelButton);
     expect(screen.getByRole('dialog')).toBeVisible();
 
-    const modalElement = dialog.querySelector('.ant-modal');
-    expect(modalElement).not.toBeNull();
     pendingCreate.resolve({ ...alarmRules[0]!, id: 12, name: '压力高' });
-    await waitFor(() => expect(modalElement).not.toBeVisible());
+    await waitForRuleWriteLifecycle(dialog);
     expect(createAlarmRule).toHaveBeenCalledTimes(1);
   });
 
   it('prefills an edited rule and updates the exact id and writable payload', async () => {
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     await fireEvent.click(screen.getByRole('button', { name: '编辑规则 温度高' }));
 
     const dialog = await screen.findByRole('dialog');
@@ -375,13 +419,11 @@ describe('AlarmsPage', () => {
     const updateSignal = vi.mocked(updateAlarmRule).mock.calls[0]![2];
     expect(updateSignal).toBeInstanceOf(AbortSignal);
     expect(updateSignal?.aborted).toBe(false);
+    await waitForRuleWriteLifecycle(dialog);
   });
 
   it('creates an inactive range draft without requiring either threshold', async () => {
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
 
     const dialog = await screen.findByRole('dialog');
@@ -409,14 +451,12 @@ describe('AlarmsPage', () => {
         expect.any(AbortSignal),
       );
     });
+    await waitForRuleWriteLifecycle(dialog);
   });
 
   it('edits an existing inactive range draft without forcing thresholds', async () => {
     vi.mocked(fetchAlarmRules).mockResolvedValueOnce([inactiveRangeDraft]);
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     await fireEvent.click(
       screen.getByRole('button', { name: '编辑规则 温度区间草稿' }),
     );
@@ -443,30 +483,38 @@ describe('AlarmsPage', () => {
         expect.any(AbortSignal),
       );
     });
+    await waitForRuleWriteLifecycle(dialog);
   });
 
-  it('deletes a rule only after the confirmation dialog is accepted', async () => {
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+  it('keeps a rule when the delete confirmation is cancelled', async () => {
+    await renderRulesTab();
     const deleteButton = screen.getByRole('button', { name: '删除规则 温度高' });
     await fireEvent.click(deleteButton);
 
-    const cancelDialog = await screen.findByRole('dialog');
-    expect(within(cancelDialog).getByText('删除规则 "温度高" ?')).toBeInTheDocument();
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('删除规则 "温度高" ?')).toBeInTheDocument();
+    const modal = dialog.querySelector<HTMLElement>('.ant-modal');
+    expect(modal).not.toBeNull();
     await fireEvent.click(
-      within(cancelDialog).getByRole('button', { name: /Cancel|取\s*消/ }),
+      within(dialog).getByRole('button', { name: /Cancel|取\s*消/ }),
     );
-    const cancelledModal = cancelDialog.querySelector('.ant-modal');
-    expect(cancelledModal).not.toBeNull();
-    await waitFor(() => {
-      expect(cancelledModal).not.toBeVisible();
-    });
+    await waitFor(() => expect(modal).not.toBeVisible());
     expect(deleteAlarmRule).not.toHaveBeenCalled();
+    expect(deleteButton).not.toBeDisabled();
+  });
 
-    await fireEvent.click(deleteButton);
-    await fireEvent.click(await screen.findByRole('button', { name: /OK|确\s*定/ }));
+  it('deletes a rule only after the confirmation dialog is accepted', async () => {
+    await renderRulesTab();
+    await fireEvent.click(
+      screen.getByRole('button', { name: '删除规则 温度高' }),
+    );
+    const confirmDialog = await screen.findByRole('dialog');
+    expect(
+      within(confirmDialog).getByText('删除规则 "温度高" ?'),
+    ).toBeInTheDocument();
+    await fireEvent.click(
+      within(confirmDialog).getByRole('button', { name: /OK|确\s*定/ }),
+    );
 
     await waitFor(() => {
       expect(deleteAlarmRule).toHaveBeenCalledWith(11, expect.any(AbortSignal));
@@ -475,21 +523,23 @@ describe('AlarmsPage', () => {
     const deleteSignal = vi.mocked(deleteAlarmRule).mock.calls[0]![1];
     expect(deleteSignal).toBeInstanceOf(AbortSignal);
     expect(deleteSignal?.aborted).toBe(false);
+    await waitForConfirmWriteLifecycle(confirmDialog);
   });
 
   it('allows only one delete confirmation and one pending delete request', async () => {
     const pendingDelete = deferred<void>();
     vi.mocked(deleteAlarmRule).mockReturnValueOnce(pendingDelete.promise);
 
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     const deleteButton = screen.getByRole('button', { name: '删除规则 温度高' });
     await fireEvent.click(deleteButton);
     await fireEvent.click(deleteButton);
 
     expect(screen.getAllByText('删除规则 "温度高" ?')).toHaveLength(1);
-    const confirmButton = await screen.findByRole('button', { name: /OK|确\s*定/ });
+    const confirmDialog = await screen.findByRole('dialog');
+    const confirmButton = within(confirmDialog).getByRole('button', {
+      name: /OK|确\s*定/,
+    });
     await fireEvent.click(confirmButton);
     await fireEvent.click(confirmButton);
 
@@ -498,7 +548,8 @@ describe('AlarmsPage', () => {
     expect(screen.getByRole('button', { name: '删除规则 温度高' })).toBeDisabled();
 
     pendingDelete.resolve(undefined);
-    await waitFor(() => expect(deleteButton).not.toBeDisabled());
+    await waitForConfirmWriteLifecycle(confirmDialog);
+    expect(screen.getByRole('button', { name: '删除规则 温度高' })).not.toBeDisabled();
     expect(deleteAlarmRule).toHaveBeenCalledTimes(1);
   });
 
@@ -545,10 +596,7 @@ describe('AlarmsPage', () => {
   });
 
   it('validates and submits a between rule as an ordered interval', async () => {
-    render(TestHost);
-    await screen.findByText('当前有 1 个未确认告警');
-
-    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (1)' }));
+    await renderRulesTab();
     await fireEvent.click(screen.getByRole('button', { name: '新建规则' }));
 
     const dialog = await screen.findByRole('dialog');
@@ -586,5 +634,6 @@ describe('AlarmsPage', () => {
         expect.any(AbortSignal),
       );
     });
+    await waitForRuleWriteLifecycle(dialog);
   });
 });
