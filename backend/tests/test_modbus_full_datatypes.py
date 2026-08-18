@@ -75,6 +75,33 @@ def _connected_protocol(srv: ModbusMockServer, byte_order: str = "big") -> Modbu
     return proto
 
 
+def test_mock_server_start_returns_only_after_tcp_is_ready(monkeypatch):
+    """Regression: modbus_tk starts bind/listen on a background thread."""
+    real_create_connection = socket.create_connection
+    attempts = 0
+
+    def delayed_connect(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ConnectionRefusedError("synthetic bind/listen delay")
+        return real_create_connection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "acquisition.testing.modbus_mock_server.socket.create_connection",
+        delayed_connect,
+    )
+    port = _free_port()
+    srv = ModbusMockServer(host="127.0.0.1", port=port, slave_ids=[1])
+    try:
+        srv.start()
+        assert attempts >= 3
+        with real_create_connection((srv.host, srv.port), timeout=0.5):
+            pass
+    finally:
+        srv.stop()
+
+
 # ---------------------------------------------------------------------------
 # 1) 全部数据类型,含负数 / 边界值 —— 通过真实 TCP round-trip
 # ---------------------------------------------------------------------------

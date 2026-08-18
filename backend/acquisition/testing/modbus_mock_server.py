@@ -10,6 +10,7 @@ modbus 解码路径才暴露的 bug,用它才查得出 —— simulator 永远�
 """
 from __future__ import annotations
 
+import socket
 import struct
 import threading
 import time
@@ -133,9 +134,35 @@ class ModbusMockServer:
         self._updater: threading.Thread | None = None
 
     # ------------------------------------------------------------------
-    def start(self) -> None:
+    def start(self, timeout: float = 2.0) -> None:
+        """Start the TCP server and return only after its socket accepts.
+
+        ``modbus_tk.TcpServer.start()`` only launches a background thread; its
+        bind/listen happens later in that thread.  Callers used to race that
+        bind and occasionally saw ``ConnectionRefusedError`` immediately
+        after ``start()`` (most visibly in the parameterized datatype suite).
+        """
         self._stop.clear()
         self._server.start()
+        deadline = time.monotonic() + timeout
+        connect_host = "127.0.0.1" if self.host in {"", "0.0.0.0", "::"} else self.host
+        last_error: OSError | None = None
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((connect_host, self.port), timeout=0.1):
+                    server_thread = getattr(self._server, "_thread", None)
+                    if server_thread is None or server_thread.is_alive():
+                        break
+                    last_error = OSError("modbus_tk server thread exited before readiness")
+            except OSError as exc:
+                last_error = exc
+            time.sleep(0.01)
+        else:
+            self._server.stop()
+            raise OSError(
+                f"Modbus mock server did not listen on {connect_host}:{self.port} "
+                f"within {timeout:.1f}s: {last_error}"
+            )
         self._updater = threading.Thread(target=self._update_loop, daemon=True)
         self._updater.start()
 
