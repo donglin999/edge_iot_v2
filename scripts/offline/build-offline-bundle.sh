@@ -10,8 +10,8 @@
 #   dist/offline/zhongshan-monolith-amd64/manifest.txt        （镜像清单 + 架构 + 大小）
 #   dist/offline/zhongshan-monolith-amd64/{docker-compose.yml,load-and-up.sh,.env.example,README...}
 #
-# 注意：redis:7.0.10 / influxdb:2.4 **不打进包**（目标机已有）。仅 build+save
-# 两个应用镜像 edge-iot/backend、edge-iot/web。
+# 注意：redis:7.0.10 会随应用镜像一起打进包；InfluxDB 由现场环境提供，
+# 不在本安装包内。
 #
 # 前置：docker buildx；且已在宿主机跑过 `cd frontend && npm ci && npm run build`
 # （脚本会校验 frontend/dist 存在 —— 教训 frontend-build-on-host：SPA 不在跨架构
@@ -77,6 +77,7 @@ for img in "${BUNDLED_PULLED_IMAGES[@]}"; do
 done
 docker save --platform "$PLATFORM" "${BUILT_IMAGES[@]}" "${BUNDLED_PULLED_IMAGES[@]}" -o "$OUT/images.tar"
 ( cd "$OUT" && shasum -a 256 images.tar > images.tar.sha256 )
+python3 -I scripts/offline/verify-image-archive.py "$OUT/images.tar" "$OUT/images.tar.sha256"
 : > "$OUT/manifest.txt"
 echo "# 镜像（全部已打包在 images.tar 内,完全自包含）" >> "$OUT/manifest.txt"
 for img in "${BUILT_IMAGES[@]}" "${BUNDLED_PULLED_IMAGES[@]}"; do
@@ -90,16 +91,20 @@ echo "images.tar 大小: $(du -h "$OUT/images.tar" | cut -f1)" >> "$OUT/manifest
 echo "==> [5/5] 打包运行材料"
 cp deploy/offline/docker-compose.offline.yml "$OUT/docker-compose.yml"
 cp scripts/offline/load-and-up.sh            "$OUT/"
+cp scripts/offline/validate-env.sh            "$OUT/"
+cp scripts/offline/prepare-env.py             "$OUT/"
+cp scripts/offline/verify-image-archive.py    "$OUT/"
 cp scripts/offline/import-and-start.sh       "$OUT/"
 cp scripts/offline/status.sh                 "$OUT/"
 cp deploy/offline/.env.example               "$OUT/.env.example"
 cp docs/deploy/offline-amd64-monolith.md     "$OUT/README.md" 2>/dev/null || true
-chmod +x "$OUT/load-and-up.sh" "$OUT/import-and-start.sh" "$OUT/status.sh"
+chmod +x "$OUT/load-and-up.sh" "$OUT/validate-env.sh" "$OUT/prepare-env.py" \
+  "$OUT/verify-image-archive.py" "$OUT/import-and-start.sh" "$OUT/status.sh"
 
 echo ""
 echo "==> 完成。安装包目录："
 echo "    $OUT"
 echo "    ├── images.tar ($(du -h "$OUT/images.tar" | cut -f1)) + .sha256"
-echo "    ├── docker-compose.yml / .env.example / load-and-up.sh / README.md"
+echo "    ├── docker-compose.yml / .env.example / load-and-up.sh / 安全校验器 / README.md"
 echo "    └── manifest.txt"
 cat "$OUT/manifest.txt"

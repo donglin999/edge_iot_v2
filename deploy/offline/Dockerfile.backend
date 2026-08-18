@@ -14,8 +14,11 @@ WORKDIR /app
 
 # 无需 apt / gcc —— 每个依赖都从预构建的 manylinux wheel 安装。
 COPY deploy/offline/wheelhouse /wheels
-COPY backend/requirements.txt /app/
-RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+COPY backend/requirements.txt backend/constraints-py310.txt /app/
+RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
+    --constraint constraints-py310.txt \
+    --requirement requirements.txt \
+    && python -m pip check \
     && rm -rf /wheels
 
 COPY backend/ /app/

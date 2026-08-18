@@ -12,7 +12,8 @@ on:
   push:
     branches: ['**']        # 推到任意分支都跑
   pull_request:
-    branches: [master]      # 针对 master 开的 PR 也跑
+    # 迁移里程碑先汇入 integration；最终 PR 再进入 master。
+    branches: [master, codex/remediation-integration]
 
 # 同一分支新 push 时，取消上一次还没跑完的 CI，省时间省额度
 concurrency:
@@ -20,6 +21,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── 仓库政策：迁移路线与依赖可复现性 ────────────────────────────────
+  policy:
+    name: 迁移政策门禁 (无 C++ 后端 + Python constraints)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: Shell 静态检查
+        run: bash -n scripts/ci/*.sh scripts/offline/build-wheelhouse.sh backend/run_tests.sh
+
+      - name: C++ 后端排除门禁自测
+        run: bash scripts/ci/test-guard-no-cpp-backend.sh
+
+      - name: Wheelhouse Python 3.10 解析器门禁自测
+        run: bash scripts/ci/test-wheelhouse-python.sh
+
+      - name: 离线部署密钥 fail-closed 门禁
+        run: bash scripts/ci/test-offline-secret-safety.sh
+
+      - name: C++ 后端排除门禁
+        run: bash scripts/ci/guard-no-cpp-backend.sh
+
+      - name: Python constraints 消费链检查
+        run: bash scripts/ci/check-python-constraints.sh
+
   # ── 后端：Django + pytest ────────────────────────────────────────────
   backend:
     name: 后端测试 (pytest)
@@ -39,13 +67,23 @@ jobs:
         with:
           python-version: '3.10'
           cache: pip           # 缓存 pip 下载，后续跑得更快
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/tests/requirements-test.txt
+            backend/constraints-py310.txt
 
-      # 3. 装依赖：业务依赖 + 测试依赖
+      # 3. 单次解析业务 + 测试依赖；精确 constraints 避免 resolver 回溯。
       - name: 安装依赖
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r tests/requirements-test.txt
+          python -m pip install "pip==23.0.1"
+          python -m pip install \
+            --constraint constraints-py310.txt \
+            --requirement requirements.txt \
+            --requirement tests/requirements-test.txt
+          python -m pip check
+
+      - name: 验证已安装依赖全部受 constraints 约束
+        run: bash ../scripts/ci/check-python-constraints.sh --installed
 
       # 4. 跑测试（SQLite + Celery eager，无需 Redis/InfluxDB）
       - name: 运行测试

@@ -23,6 +23,7 @@ import threading
 import time
 
 import pytest
+from django.db.utils import OperationalError
 
 from acquisition import models as acq_models
 from acquisition.services.acquisition_service import AcquisitionService
@@ -108,13 +109,31 @@ def _port_accepting(host: str, port: int, timeout: float = 0.2) -> bool:
         s.close()
 
 
+def _is_transient_sqlite_lock(exc: OperationalError) -> bool:
+    message = str(exc).lower()
+    return message.startswith("database table is locked")
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if predicate():
-            return True
+        try:
+            if predicate():
+                return True
+        except OperationalError as exc:
+            # The worker writes alarms from another thread.  SQLite can expose
+            # that short transaction as SQLITE_LOCKED instead of waiting for
+            # the configured busy timeout; polling should retry that transient
+            # state, while every other database error must still fail loudly.
+            if not _is_transient_sqlite_lock(exc):
+                raise
         time.sleep(interval)
-    return predicate()
+    try:
+        return predicate()
+    except OperationalError as exc:
+        if not _is_transient_sqlite_lock(exc):
+            raise
+        return False
 
 
 @pytest.fixture
@@ -254,6 +273,7 @@ class TestChaosReconnect:
 
                 # ---- chaos: kill the server ---------------------------------
                 server.stop()
+                assert server._updater is None
 
                 # worker must detect the outage, raise ONE persisted alarm,
                 # flip the device to offline, and — critically — NOT die.
@@ -282,6 +302,8 @@ class TestChaosReconnect:
                 assert _wait_until(lambda: _port_accepting(host, port), timeout=2.0), (
                     "mock server failed to rebind the same port after stop()/start()"
                 )
+                assert not server._stop.is_set()
+                assert server._updater is not None and server._updater.is_alive()
 
                 assert _wait_until(
                     lambda: _firing_alarms(dedup_key).count() == 0, timeout=20.0,

@@ -33,8 +33,11 @@ where ``<serialized>`` is the standard :class:`AlarmSerializer` payload.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
+from django.db import connection
+from django.db.utils import OperationalError
 from django.utils import timezone
 
 from acquisition.models import Alarm
@@ -48,6 +51,37 @@ ALARM_WS_GROUP = "acquisition_global"
 # Browser-facing event discriminators carried in the ``event`` field.
 ALARM_EVENT_CREATED = "created"
 ALARM_EVENT_CLEARED = "cleared"
+
+# SQLITE_LOCKED is returned immediately for some shared-cache/table-lock
+# conflicts, even when ``busy_timeout`` is configured.  Alarm transitions are
+# state changes (offline/online), so losing the one clear attempt would leave a
+# stale firing alarm indefinitely.  Keep retries short and bounded so the
+# acquisition loop is never held up for more than roughly half a second. Do
+# not retry plain ``database is locked`` here: SQLITE_BUSY already waits for
+# the configured 30-second busy timeout and repeating it would multiply that
+# blocking time.
+_SQLITE_LOCK_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16, 0.20)
+
+
+def _is_transient_sqlite_lock(exc: OperationalError) -> bool:
+    if connection.vendor != "sqlite":
+        return False
+    message = str(exc).lower()
+    return message.startswith("database table is locked")
+
+
+def _retry_transient_db_lock(operation):
+    """Run one alarm DB transition, retrying only immediate SQLite table locks."""
+    for delay in (*_SQLITE_LOCK_RETRY_DELAYS, None):
+        try:
+            return operation()
+        except OperationalError as exc:
+            if delay is None or not _is_transient_sqlite_lock(exc):
+                raise
+            logger.debug("transient SQLite alarm lock; retrying in %.3fs", delay)
+            time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def _serialize_alarm(alarm: Alarm) -> dict:
@@ -130,7 +164,8 @@ def raise_system_alarm(
         swallowed (logged, never raised — the acquisition loop must not break).
     """
     payload = {} if value is None else value
-    try:
+
+    def _persist_alarm():
         if dedup_key:
             existing = Alarm.objects.filter(
                 dedup_key=dedup_key, status=Alarm.STATUS_FIRING,
@@ -141,8 +176,7 @@ def raise_system_alarm(
                 existing.severity = severity
                 existing.save(update_fields=["message", "value", "severity",
                                              "updated_at"])
-                broadcast_alarm(existing, ALARM_EVENT_CREATED)
-                return existing
+                return existing, False
 
         alarm = Alarm.objects.create(
             rule=None,
@@ -156,36 +190,50 @@ def raise_system_alarm(
             status=Alarm.STATUS_FIRING,
             message=message,
         )
+        return alarm, True
+
+    try:
+        alarm, created = _retry_transient_db_lock(_persist_alarm)
     except Exception as exc:  # noqa: BLE001 — reporting must not break the loop
         logger.warning("raise_system_alarm(%s, dedup_key=%s) failed: %s",
                        category, dedup_key, exc)
         return None
 
-    logger.warning("SYSTEM ALARM %s/%s: %s", category, severity, message)
+    if created:
+        logger.warning("SYSTEM ALARM %s/%s: %s", category, severity, message)
     broadcast_alarm(alarm, ALARM_EVENT_CREATED)
     return alarm
 
 
-def clear_system_alarm(dedup_key: str) -> int:
+def clear_system_alarm(dedup_key: str) -> Optional[int]:
     """Resolve every FIRING alarm carrying ``dedup_key`` (firing → cleared).
 
     Broadcasts a ``cleared`` event for each closed alarm and returns the
     number closed. An empty ``dedup_key`` is a no-op (returns 0) so it can
-    never accidentally clear the whole firing set. DB errors are logged, not
-    raised.
+    never accidentally clear the whole firing set. DB errors are logged and
+    return ``None``; callers that maintain transition state can then retry
+    instead of confusing a failed write with a successful no-op.
     """
     if not dedup_key:
         return 0
-    try:
+
+    def _clear_alarms():
         qs = Alarm.objects.filter(dedup_key=dedup_key, status=Alarm.STATUS_FIRING)
         alarms = list(qs)
         if not alarms:
-            return 0
+            return [], 0, None
         now = timezone.now()
         # ``update()`` bypasses ``auto_now``, so set updated_at explicitly.
         count = qs.update(status=Alarm.STATUS_CLEARED, cleared_at=now, updated_at=now)
+        return alarms, count, now
+
+    try:
+        alarms, count, now = _retry_transient_db_lock(_clear_alarms)
     except Exception as exc:  # noqa: BLE001
         logger.warning("clear_system_alarm(%s) failed: %s", dedup_key, exc)
+        return None
+
+    if not alarms:
         return 0
 
     for alarm in alarms:

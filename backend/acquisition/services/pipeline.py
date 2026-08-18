@@ -50,6 +50,8 @@ _READ_FAILED_WINDOW_S = 5.0
 class ReadWorker(threading.Thread):
     """One device, one thread, one persistent protocol connection."""
 
+    ALARM_DB_RETRY_INTERVAL_S = 1.0
+
     def __init__(
         self,
         device,
@@ -125,6 +127,8 @@ class ReadWorker(threading.Thread):
         self._last_dropped_seen = 0
         self._last_drop_increase_at: Optional[float] = None
         self._drop_alarm_raised = False
+        self._drop_alarm_raise_retry_at = 0.0
+        self._drop_alarm_clear_retry_at = 0.0
         # Tracks whether ``gave_up`` has already been emitted for the
         # current backoff window so we don't repeat it every loop.
         self._gave_up_emitted = False
@@ -134,6 +138,10 @@ class ReadWorker(threading.Thread):
         # cycle; this alarm must fire once and be cleared once, so it needs a
         # flag whose lifetime spans the whole downtime (not per-cycle).
         self._offline_alarm_raised = False
+        # A failed clear must be retried while the connection stays healthy;
+        # throttle those retries so a persistently unavailable SQLite DB does
+        # not stall every acquisition cycle.
+        self._offline_alarm_clear_retry_at = 0.0
         # Aggregation state for read_failed events.
         self._failed_count = 0
         self._failed_window_start: Optional[float] = None
@@ -265,7 +273,7 @@ class ReadWorker(threading.Thread):
         from acquisition.services.reporting import raise_system_alarm
 
         code = self.device.code
-        raise_system_alarm(
+        alarm = raise_system_alarm(
             category="connectivity",
             severity="critical",
             message=f"设备 {code} 连接失败，已离线",
@@ -277,7 +285,10 @@ class ReadWorker(threading.Thread):
             },
             dedup_key=f"connectivity:{code}",
         )
-        self._offline_alarm_raised = True
+        # ``None`` means persistence failed even after its bounded retry. Keep
+        # the guard open so the next downtime retry cycle compensates.
+        if alarm is not None:
+            self._offline_alarm_raised = True
 
     def _clear_offline_alarm(self) -> None:
         """Resolve the persisted connectivity alarm on recovery + re-arm.
@@ -288,10 +299,19 @@ class ReadWorker(threading.Thread):
         """
         if not self._offline_alarm_raised:
             return
+        now = time.monotonic()
+        if now < self._offline_alarm_clear_retry_at:
+            return
         from acquisition.services.reporting import clear_system_alarm
 
-        clear_system_alarm(f"connectivity:{self.device.code}")
+        cleared = clear_system_alarm(f"connectivity:{self.device.code}")
+        if cleared is None:
+            self._offline_alarm_clear_retry_at = (
+                time.monotonic() + self.ALARM_DB_RETRY_INTERVAL_S
+            )
+            return
         self._offline_alarm_raised = False
+        self._offline_alarm_clear_retry_at = 0.0
 
     # ------------------------------------------------------ push keep-alive
     def _emit_keepalive(self) -> None:
@@ -351,10 +371,16 @@ class ReadWorker(threading.Thread):
             self._last_drop_increase_at = now
             self._update_health(dropped_messages=total)
             if not self._drop_alarm_raised:
+                retry_now = time.monotonic()
+                if retry_now < self._drop_alarm_raise_retry_at:
+                    # Preserve the pending transition while the retry gate is
+                    # closed; health still reports the real cumulative total.
+                    self._last_dropped_seen -= delta
+                    return
                 from acquisition.services.reporting import raise_system_alarm
 
                 code = self.device.code
-                raise_system_alarm(
+                alarm = raise_system_alarm(
                     category="data_loss",
                     severity="warning",
                     message=(
@@ -367,16 +393,34 @@ class ReadWorker(threading.Thread):
                     value={"dropped_total": total, "dropped_delta": delta},
                     dedup_key=f"data_loss:{code}",
                 )
-                self._drop_alarm_raised = True
+                if alarm is not None:
+                    self._drop_alarm_raised = True
+                    self._drop_alarm_raise_retry_at = 0.0
+                else:
+                    # Leave the observed count behind so the next cycle sees
+                    # growth again and retries the lost transition.
+                    self._last_dropped_seen -= delta
+                    self._drop_alarm_raise_retry_at = (
+                        time.monotonic() + self.ALARM_DB_RETRY_INTERVAL_S
+                    )
         elif (
             self._drop_alarm_raised
             and self._last_drop_increase_at is not None
             and (now - self._last_drop_increase_at) >= self.DROP_ALARM_CLEAR_WINDOW_S
         ):
+            retry_now = time.monotonic()
+            if retry_now < self._drop_alarm_clear_retry_at:
+                return
             from acquisition.services.reporting import clear_system_alarm
 
-            clear_system_alarm(f"data_loss:{self.device.code}")
+            cleared = clear_system_alarm(f"data_loss:{self.device.code}")
+            if cleared is None:
+                self._drop_alarm_clear_retry_at = (
+                    time.monotonic() + self.ALARM_DB_RETRY_INTERVAL_S
+                )
+                return
             self._drop_alarm_raised = False
+            self._drop_alarm_clear_retry_at = 0.0
 
     def _flush_failed_events(self, *, force: bool = False) -> None:
         """Emit a ``read_failed`` aggregate when the burst threshold or
@@ -537,6 +581,11 @@ class ReadWorker(threading.Thread):
                 self._connect()
 
             if self.protocol and getattr(self.protocol, "is_connected", False):
+                # The connect transition attempts this once immediately. If
+                # SQLite remained locked past the bounded retry, keep
+                # compensating on healthy cycles until the persisted alarm is
+                # actually cleared (the helper applies a one-second throttle).
+                self._clear_offline_alarm()
                 self._read_cycle()
                 # Window-based flush in the healthy path.
                 self._flush_failed_events()

@@ -2,7 +2,7 @@
 
 ## 环境要求
 
-- Python 3.10+
+- CPython 3.10（依赖约束按该版本生成）
 - Node.js 18+
 - Docker & Docker Compose
 - Redis 7+
@@ -22,14 +22,17 @@ docker ps
 ```bash
 cd backend
 
-# 安装依赖
-pip install -r requirements.txt
+# 安装与 Docker/CI 相同的受约束依赖
+python3.10 -m pip install \
+  --constraint constraints-py310.txt \
+  --requirement requirements.txt
+python3.10 -m pip check
 
 # 数据库迁移
-python3 manage.py migrate
+python3.10 manage.py migrate
 
 # 启动Django服务
-python3 manage.py runserver 0.0.0.0:8000
+python3.10 manage.py runserver 0.0.0.0:8000
 ```
 
 ## 三、Celery Worker
@@ -38,7 +41,7 @@ python3 manage.py runserver 0.0.0.0:8000
 cd backend
 
 # 启动Celery Worker
-celery -A control_plane worker -l info --pool=solo
+python3.10 -m celery -A control_plane worker -l info --pool=solo
 ```
 
 ## 四、前端服务

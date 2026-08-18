@@ -239,6 +239,12 @@ backend/uploads/
 mock/data/
 !mock/data/.gitkeep
 
+# Retired local C++ backend experiments.  The migration keeps the Python
+# compatibility runtime and moves directly to FastAPI; CI rejects this path if
+# it is ever tracked again.
+/backend_cpp/
+/docs/cpp-migration/
+
 # Generated documentation
 docs/_build/
 docs/build/

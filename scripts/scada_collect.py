@@ -18,7 +18,7 @@
         "time":          "1755653755532"      # 字符串毫秒
     }}
 
-只采 DEVICE_NAME 这一台设备的 POINTS 里那几个测点（精确订阅，不用通配符）。
+只采 SCADA_DEVICE_NAME 这一台设备的 POINTS 里那几个测点（精确订阅，不用通配符）。
 设备ID 与测点编码直接取自报文（比解析话题更可靠）；话题解析仅作兜底。
 
 不限频：来多少收多少。MQTT 回调只解析+入队（绝不阻塞网络线程），
@@ -26,37 +26,78 @@
 
 依赖 paho-mqtt + influxdb-client —— 工控机无网装不了，直接用后端镜像跑：
 
+    # /run/secrets/scada-collect.env 需 chmod 600，不得放入 Git/日志
+    # 必填:SCADA_MQTT_BROKER、SCADA_MQTT_PORT、SCADA_MQTT_USERNAME、
+    #      SCADA_MQTT_PASSWORD、SCADA_MQTT_CA_FILE、SCADA_PRODUCT_KEY、
+    #      SCADA_DEVICE_NAME、INFLUXDB_URL/TOKEN/ORG/BUCKET
     docker run -d --name scada-collect --restart unless-stopped --network host \
+      --env-file /run/secrets/scada-collect.env \
+      -v /run/secrets/plant-mqtt-ca.pem:/run/secrets/plant-mqtt-ca.pem:ro \
       -v /apps/edge_iot/scada_collect.py:/collect.py \
       edge-iot/backend:offline-amd64 python /collect.py
 
     docker logs -f scada-collect
 """
 import json
+import os
 import queue
 import re
 import ssl
+import sys
 import threading
 import time
 
-import paho.mqtt.client as mqtt
-from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import SYNCHRONOUS
+
+def required_env(name):
+    """Read a required runtime value without ever logging its contents."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise SystemExit(f"missing required environment variable: {name}")
+    return value
+
+
+def required_port(name):
+    raw = required_env(name)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer") from exc
+    if not 1 <= value <= 65535:
+        raise SystemExit(f"{name} must be between 1 and 65535")
+    return value
+
 
 # ---------------- MQTT ----------------
-BROKER, PORT = "10.134.14.147", 8883
-USERNAME = "ZYY_XJDZS"
-PASSWORD = "6e2eccc95e654a14bcb0f5bab2b1347e"
-USE_TLS = True                    # 若 8883 其实是明文，改 False
-MQTT_VERSION = mqtt.MQTTv311      # 连不上可试 mqtt.MQTTv5
-PRODUCT_KEY = "123daffb91264286adcdf3bfe55194c7"
-DEVICE_NAME = "A0201010001150403"   # 只采这一台设备
+BROKER = required_env("SCADA_MQTT_BROKER")
+PORT = required_port("SCADA_MQTT_PORT")
+USERNAME = required_env("SCADA_MQTT_USERNAME")
+PASSWORD = required_env("SCADA_MQTT_PASSWORD")
+MQTT_CA_FILE = required_env("SCADA_MQTT_CA_FILE")
+USE_TLS = True
+SCADA_PRODUCT_KEY = required_env("SCADA_PRODUCT_KEY")
+SCADA_DEVICE_NAME = required_env("SCADA_DEVICE_NAME")   # 只采这一台设备
 
 # ---------------- InfluxDB ----------------
-INFLUX_URL = "http://127.0.0.1:8086"
-INFLUX_TOKEN = "tKwtme7RYKb3c9LmBxxVKhWv-MF9TT9XTXFdlm5Q6eU6Q1RS0Ywjk2ND8a1S_CQUcpaNeEHWJwk9NQFnzJZa1g=="
-INFLUX_ORG = "Midea"
-INFLUX_BUCKET = "Record"
+INFLUX_URL = required_env("INFLUXDB_URL")
+INFLUX_TOKEN = required_env("INFLUXDB_TOKEN")
+INFLUX_ORG = required_env("INFLUXDB_ORG")
+INFLUX_BUCKET = required_env("INFLUXDB_BUCKET")
+
+# 启动时就加载现场 CA，保留证书链与主机名校验；无效/缺失 CA 硬失败。
+MQTT_TLS_CONTEXT = ssl.create_default_context(cafile=MQTT_CA_FILE)
+if not MQTT_TLS_CONTEXT.check_hostname or MQTT_TLS_CONTEXT.verify_mode != ssl.CERT_REQUIRED:
+    raise SystemExit("SCADA MQTT TLS certificate and hostname verification must remain enabled")
+
+# 离线包可在不安装业务依赖时执行启动级配置/TLS 预检。
+if sys.argv[1:] == ["--check-config"]:
+    print("[OK] SCADA emergency collector configuration and TLS CA verified")
+    raise SystemExit(0)
+
+import paho.mqtt.client as mqtt  # noqa: E402  (config check intentionally runs first)
+from influxdb_client import InfluxDBClient, Point, WritePrecision  # noqa: E402
+from influxdb_client.client.write_api import SYNCHRONOUS  # noqa: E402
+
+MQTT_VERSION = mqtt.MQTTv311      # 连不上可试 mqtt.MQTTv5
 
 # ---------------- 吞吐调优 ----------------
 QUEUE_MAX = 200_000     # 有界缓冲；满了丢最旧的（保新数据），内存不会失控
@@ -83,7 +124,7 @@ POINTS = {
 
 # 精确订阅这台设备的这几个测点话题（不用通配符，broker 只会推这 4 个话题给我们）
 TOPICS = [
-    (f"/sys/{PRODUCT_KEY}/device/{DEVICE_NAME}/thing/property/{code}/post", 0)
+    (f"/sys/{SCADA_PRODUCT_KEY}/device/{SCADA_DEVICE_NAME}/thing/property/{code}/post", 0)
     for code in POINTS
 ]
 
@@ -175,7 +216,7 @@ def _guess_ts_ns(payload):
 
 
 def on_connect(client, userdata, flags, rc, *_):
-    print(f"[MQTT] 已连接 rc={rc} → 订阅 {DEVICE_NAME} 的 {len(TOPICS)} 个测点话题:", flush=True)
+    print(f"[MQTT] 已连接 rc={rc} → 订阅 {SCADA_DEVICE_NAME} 的 {len(TOPICS)} 个测点话题:", flush=True)
     for topic, _qos in TOPICS:
         print(f"         {topic}", flush=True)
     client.subscribe(TOPICS)
@@ -308,7 +349,8 @@ def main():
     if USERNAME:
         client.username_pw_set(USERNAME, PASSWORD)
     if USE_TLS:
-        client.tls_set_context(ssl.SSLContext(ssl.PROTOCOL_TLSv1_2))   # 内网自签，不校验证书
+        # 现场自签/内部 CA 必须显式挂载；保留证书链和主机名校验。
+        client.tls_set_context(MQTT_TLS_CONTEXT)
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect

@@ -12,8 +12,8 @@
 - 主远端：`origin`（GitHub）；镜像远端：`midea`
 - 当前结论：**M0 准备中，尚未 accepted，禁止开始改变运行行为的迁移实现。**
 
-未完成门禁包括：真实 Mock 全链路、SQLite/Influx 备份恢复演练、API/采集性能基线、
-离线镜像回滚演练。没有对应证据时，不得把本文件当作生产验收报告。
+未完成门禁包括：独立栈的 Mock 全流程与断连恢复、Influx 备份恢复演练、稳定期
+采集性能以及离线镜像回滚演练。没有对应证据时，不得把本文件当作生产验收报告。
 
 ## 2. 技术栈与服务拓扑
 
@@ -66,7 +66,10 @@ SQLite 通过 `app-db:/data` 在后端服务之间共享。
 - Redis 无持久卷。
 - Influx spill SQLite 默认位于 `/app/influx_spill.sqlite3`，没有落入 `/data` volume；
   容器替换可能丢失待回放批次。
-- Compose 带默认 Influx token、Django secret 与 `DEBUG=True`；生产必须改为必填密钥。
+- 基线时 Compose 曾带默认 Influx token、Django secret 与 `DEBUG=True`；现已改为
+  受保护 env 必填、安全默认和启动前 fail-closed 校验。
+- 历史凭据即使从 HEAD 删除仍视为已暴露；MQTT/InfluxDB 侧吊销、轮换、
+  Django `SECRET_KEY` 更新及证据留存是 M0 外部验收硬门禁，未完成前不得上线。
 
 ## 3. 数据职责和 schema
 
@@ -170,22 +173,71 @@ C++ 文件不删除、不迁入新分支。
   的 44 条均属于两个真实 Mosquitto 文件；随后在同一基线 SHA 的 `/Users` 工作区单独
   复跑这 44 条，结果 44 passed；
 - 后端 e2e 子集：29 passed、1240 deselected。
+- GitHub PR #3 的目标环境门禁已通过：Frontend（Node 20）与 Backend
+  （Python 3.10）均为 success。
 
 ### 7.2 环境限制（不计为代码结果）
 
 - macOS 沙箱中的首次后端测试因禁止监听本地测试端口而失败；
 - Docker Desktop 总内存约 1.9 GiB，且已有用户服务容器常驻。amd64 模拟和原生
   arm64 Python 3.10 临时容器均被 OOM 以 137 终止，因此未取得容器内 pytest 结论；
-- 本机有效后端结果来自 Python 3.9.6。push 后仍需由仓库 CI 的目标 Python 环境再次
-  验证；不得用上述容器 OOM 代替 CI 结论。
+- 本机有效后端结果来自 Python 3.9.6；仓库 CI 已在 Python 3.10 再次通过。上述容器
+  OOM 仅记录环境边界，不能替代 CI 结论。
 
-### 7.3 M0 accepted 前必须补齐
+### 7.3 本机只读性能样本
 
-- GitHub CI 的 Python 3.10 后端全量 pytest 与 e2e 子集；
+2026-08-17 11:04（Asia/Shanghai）在当前本机已运行的开发栈上，以 5 次预热后串行
+50 次 GET 采样。该结果只用于发现迁移后的明显退化，不代表现场并发容量：
+
+| 端点 | 成功 | median | p95 | max |
+|---|---:|---:|---:|---:|
+| Frontend `/` | 50/50 | 0.626 ms | 1.398 ms | 3.794 ms |
+| Edge 同源 `/api/config/sites/` | 50/50 | 5.516 ms | 10.710 ms | 11.535 ms |
+| Edge Influx `/health` | 50/50 | 0.610 ms | 0.996 ms | 1.016 ms |
+
+复现工具为 `scripts/validation/http_latency.py`；它只允许 HTTP(S) GET、拒绝 URL 凭据
+和重定向，并从报告移除 query 与 fragment。
+本机同时存在分布式中心端，Edge 实例实际映射为 Web `25173`、Django `28000`、Influx
+`28086`；采样使用 Edge 同源代理/Edge Influx，未把宿主 `8000` 的中心端混入结果。
+同一时刻 `docker stats --no-stream` 的瞬时内存样本为：Frontend 54.18 MiB、Django
+178.2 MiB、celery-acq 125.3 MiB、celery-short 116 MiB、Redis 15.34 MiB、InfluxDB
+75.56 MiB。CPU 是瞬时值且采集 worker 当时有负载，不能作为容量承诺。
+
+### 7.4 浏览器与运行栈只读核验
+
+2026-08-17 使用同源入口 `http://localhost:25173` 完成浏览器核验：`/`、
+`/acquisition`、`/devices`、`/data`、`/import`、`/alarms`、`/versions` 以及一个动态
+设备详情路由均能渲染业务主体。全局 WebSocket 首帧为 `active_sessions`，报告 1 个
+`running` 会话；采集页显示“实时连接已建立”。必须使用与页面一致的 `localhost`
+Host/Origin，改用 `127.0.0.1` 会触发当前 Vite WebSocket 代理的 Host 不匹配。
+
+设备最新值只读查询返回 9/9 个测点有值、质量均为 `good`，最新 Influx 时间戳为
+2026-08-17 11:08:41（Asia/Shanghai），证明 Mock Modbus→Influx→REST 的读链路曾经打通。
+浏览器没有阻断性异常；React `findDOMNode` 与 AntD Card/Spin/Dropdown 弃用提示记为
+既有技术债。
+
+首次核验仍不构成 Mock 全链路通过：采样期间 Docker 内存压力触发 `celery-acq` OOM
+重启（容器 `OOMKilled=true`，累计 restart 9）。最后一次 worker 重启时，会话 61 的
+心跳尚未超过 stale 阈值，启动钩子保留了 `running` 状态，却没有重新接管 pipeline；
+随后心跳和 Influx 时间戳停止推进。开发栈的 `celery-short` 又未运行 Beat，watchdog
+不会自动补救。因此 UI/REST 的 `running` 不能作为实际采集存活证明，必须在独立测试
+栈复现并修复重启恢复门禁。
+
+停止造成内存竞争的 QEMU 构建后，显式停止失去 worker 的会话 61，并以原任务创建
+会话 62。启动校验为 9/9 测点健康；两次持久化计数从 1,754 增至 5,462，间隔
+20.466 秒，观测入库约 181.18 points/s（目标 180），`dropped_messages=0`。同源
+WebSocket 随后收到会话 62 的 `data_point_update`，单帧 9 readings；浏览器数据页显示
+9 个实时测点且均为约 2 秒内更新。选择一个测点后，近 1 小时历史趋势也成功返回并
+渲染（原始 20,882 点，页面采用 3 秒极值包络）。至此当前本地展示栈的 Mock→采集→
+Influx→REST→WebSocket→前端最新值与历史曲线链路已恢复。断连恢复、稳定运行和
+独立数据集验证仍属于 M0 未完成门禁。
+
+### 7.5 M0 accepted 前必须补齐
+
 - 独立测试栈的 Mock 配置→采集→Influx→API→WS→前端曲线与断连恢复；
 - SQLite `PRAGMA integrity_check` 及恢复前后关键表计数；
 - Influx 恢复前后 measurement/field 计数与时间范围；
-- API p95、实际入库速率、丢弃/重复数及 `docker stats`；
+- 隔离数据集上的实际入库速率、丢弃/重复数和稳定期资源样本；
 - 旧镜像 immutable tag/digest、load、切换及回滚验证。
 
 生产数据、现场硬件或独立 amd64 测试机未提供时，不能宣称生产备份可恢复、真实负载

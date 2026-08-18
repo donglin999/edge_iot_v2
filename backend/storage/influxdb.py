@@ -39,11 +39,31 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+try:  # POSIX containers use this to coordinate replay across processes.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None
+
 from influxdb_client import InfluxDBClient as InfluxClient
 from influxdb_client.client.write_api import SYNCHRONOUS, WriteOptions, WriteType
 
 from .base import BaseStorage, StorageError, StorageRegistry, WriteError
 from .spill_queue import SpillQueue
+
+
+# A Celery threads worker may own several InfluxDBStorage instances, all
+# pointing at the same durable spill file.  SQLite serialises individual SQL
+# statements, but the replay transaction is deliberately split around a
+# network call (peek -> Influx write -> delete).  Serialise that compound
+# operation in-process; ``flock`` in ``_drain_spill_once`` covers a future
+# second process/container sharing the same file.
+_REPLAY_LOCKS_GUARD = threading.Lock()
+_REPLAY_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def _replay_lock_for(db_path: str) -> threading.Lock:
+    with _REPLAY_LOCKS_GUARD:
+        return _REPLAY_LOCKS.setdefault(db_path, threading.Lock())
 
 
 @StorageRegistry.register("influxdb")
@@ -86,12 +106,18 @@ class InfluxDBStorage(BaseStorage):
         self.write_exponential_base = int(config.get("write_exponential_base", 2))
 
         # --- M4: spill queue + replay tuning --------------------------------
-        # The spill DB lives next to the Django db by default so it shares the
-        # instance's data directory and survives restarts.
-        spill_path = config.get("spill_db_path") or os.path.join(
+        # An explicit per-storage config wins, followed by the deployment-wide
+        # environment variable.  The final fallback is intentionally the
+        # historical backend/influx_spill.sqlite3 path so local development
+        # remains byte-for-byte compatible.
+        spill_path = config.get("spill_db_path") or os.environ.get(
+            "INFLUX_SPILL_DB_PATH"
+        ) or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), os.pardir, "influx_spill.sqlite3"
         )
         self.spill_db_path = os.path.abspath(spill_path)
+        self._replay_lock = _replay_lock_for(self.spill_db_path)
+        self._replay_lock_path = f"{self.spill_db_path}-replay.lock"
         self.replay_interval = float(config.get("replay_interval", 5.0))  # seconds
         # Circuit breaker: after this many consecutive failures is_available()
         # reports unavailable until a cooldown elapses (then a half-open probe).
@@ -338,10 +364,11 @@ class InfluxDBStorage(BaseStorage):
         """Replay spilled batches back into InfluxDB until the queue is empty.
 
         Uses the SYNCHRONOUS ``replay_api`` so a batch is deleted from the
-        durable queue only after the write is confirmed. Re-written points are
-        idempotent in InfluxDB (same measurement/tags/field/timestamp), so a
-        concurrent replayer or a crash mid-drain causes at most a harmless
-        duplicate, never data loss.
+        durable queue only after the write is confirmed.  A process-local lock
+        plus a POSIX advisory lock serialise the compound peek/write/delete
+        operation across storage instances and containers.  A process crash
+        may still replay the last confirmed-but-not-deleted batch (at-least-once
+        delivery), but two live replay workers cannot send the same row.
         """
         if not self.is_connected or not self.replay_api or self._spill is None:
             return
@@ -350,6 +377,53 @@ class InfluxDBStorage(BaseStorage):
         if self._consecutive_failures >= self.circuit_failure_threshold:
             if (time.time() - self._last_failure_time) < self.circuit_cooldown:
                 return
+
+        # Do not queue replay threads behind a slow InfluxDB request.  The
+        # current lease holder will drain the queue; skipped workers retry on
+        # their next normal replay interval.
+        if not self._replay_lock.acquire(blocking=False):
+            return
+
+        replay_lock_file = None
+        try:
+            if fcntl is not None:
+                try:
+                    replay_lock_file = open(self._replay_lock_path, "a+b")
+                    fcntl.flock(
+                        replay_lock_file.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    if replay_lock_file is not None:
+                        replay_lock_file.close()
+                        replay_lock_file = None
+                    return
+                except OSError as exc:
+                    if replay_lock_file is not None:
+                        replay_lock_file.close()
+                        replay_lock_file = None
+                    self.logger.warning(
+                        "Cannot acquire spill replay lock %s: %s",
+                        self._replay_lock_path,
+                        exc,
+                    )
+                    return
+
+            self._drain_spill_locked()
+        finally:
+            try:
+                if replay_lock_file is not None:
+                    try:
+                        fcntl.flock(replay_lock_file.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        replay_lock_file.close()
+            finally:
+                # Never strand the in-process lock, even if unlocking or
+                # closing the advisory-lock file raises unexpectedly.
+                self._replay_lock.release()
+
+    def _drain_spill_locked(self) -> None:
+        """Drain while the caller holds the per-file replay lease."""
 
         replayed = 0
         while not self._replay_stop.is_set():

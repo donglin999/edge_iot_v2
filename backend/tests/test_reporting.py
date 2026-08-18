@@ -4,6 +4,7 @@ Covers :mod:`acquisition.services.reporting` plus the model/serializer changes
 that let an Alarm represent a rule-less connectivity/system/lifecycle failure.
 """
 import pytest
+from django.db.utils import OperationalError
 
 from acquisition import models as acq_models
 from acquisition.services import reporting
@@ -100,6 +101,25 @@ class TestRaiseSystemAlarm:
         assert alarm is not None
         assert alarm.pk is not None
 
+    def test_retries_transient_sqlite_lock(self, monkeypatch):
+        real_create = acq_models.Alarm.objects.create
+        attempts = 0
+
+        def flaky_create(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OperationalError("database table is locked: acquisition_alarm")
+            return real_create(*args, **kwargs)
+
+        monkeypatch.setattr(acq_models.Alarm.objects, "create", flaky_create)
+        monkeypatch.setattr(reporting.time, "sleep", lambda _delay: None)
+
+        alarm = reporting.raise_system_alarm(category="system", message="retry")
+
+        assert alarm is not None
+        assert attempts == 2
+
 
 @pytest.mark.django_db
 class TestClearSystemAlarm:
@@ -119,6 +139,28 @@ class TestClearSystemAlarm:
     def test_clear_no_firing_returns_zero(self):
         assert reporting.clear_system_alarm("nonexistent:key") == 0
 
+    def test_retries_transient_sqlite_lock(self, monkeypatch):
+        reporting.raise_system_alarm(
+            category="connectivity",
+            message="断线",
+            dedup_key="connectivity:PLC-04",
+        )
+        real_filter = acq_models.Alarm.objects.filter
+        attempts = 0
+
+        def flaky_filter(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OperationalError("database table is locked: acquisition_alarm")
+            return real_filter(*args, **kwargs)
+
+        monkeypatch.setattr(acq_models.Alarm.objects, "filter", flaky_filter)
+        monkeypatch.setattr(reporting.time, "sleep", lambda _delay: None)
+
+        assert reporting.clear_system_alarm("connectivity:PLC-04") == 1
+        assert attempts == 2
+
     def test_empty_dedup_key_is_noop(self):
         # A blank key must never clear the whole firing set.
         reporting.raise_system_alarm(category="system", message="keep me")
@@ -126,6 +168,19 @@ class TestClearSystemAlarm:
         assert acq_models.Alarm.objects.filter(
             status=acq_models.Alarm.STATUS_FIRING,
         ).count() == 1
+
+    def test_busy_timeout_lock_is_not_retried(self, monkeypatch):
+        attempts = 0
+
+        def broken_filter(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise OperationalError("database is locked")
+
+        monkeypatch.setattr(acq_models.Alarm.objects, "filter", broken_filter)
+
+        assert reporting.clear_system_alarm("connectivity:PLC-05") is None
+        assert attempts == 1
 
 
 @pytest.mark.django_db

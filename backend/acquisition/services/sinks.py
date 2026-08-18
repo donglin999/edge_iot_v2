@@ -158,6 +158,7 @@ class InfluxDBSink(Sink):
             "token": getattr(settings, "INFLUXDB_TOKEN", ""),
             "org": getattr(settings, "INFLUXDB_ORG", "default"),
             "bucket": getattr(settings, "INFLUXDB_BUCKET", "default"),
+            "spill_db_path": getattr(settings, "INFLUX_SPILL_DB_PATH", None),
             "docker_mode": False,
         }
         try:

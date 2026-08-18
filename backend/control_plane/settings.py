@@ -202,6 +202,12 @@ INFLUXDB_PORT = env.int("INFLUXDB_PORT", default=8086)
 INFLUXDB_TOKEN = env.str("INFLUXDB_TOKEN", default="")
 INFLUXDB_ORG = env.str("INFLUXDB_ORG", default="default")
 INFLUXDB_BUCKET = env.str("INFLUXDB_BUCKET", default="default")
+# Durable queue for failed Influx writes.  Local development keeps the
+# historical backend/influx_spill.sqlite3 location; offline deployment points
+# this at its persistent /data volume.
+INFLUX_SPILL_DB_PATH = env.str(
+    "INFLUX_SPILL_DB_PATH", default=str(BASE_DIR / "influx_spill.sqlite3")
+)
 
 # Kafka Settings (Optional)
 KAFKA_ENABLED = env.bool("KAFKA_ENABLED", default=False)

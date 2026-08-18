@@ -28,29 +28,33 @@ tests/
 
 ```bash
 cd backend
-pip install -r tests/requirements-test.txt
+python3.10 -m pip install \
+  --constraint constraints-py310.txt \
+  --requirement requirements.txt \
+  --requirement tests/requirements-test.txt
+python3.10 -m pip check
 ```
 
 #### 2. 运行所有测试
 
 ```bash
 # 运行所有测试
-pytest
+python3.10 -m pytest
 
 # 详细输出
-pytest -v
+python3.10 -m pytest -v
 
 # 显示覆盖率
-pytest --cov=acquisition --cov=storage
+python3.10 -m pytest --cov=acquisition --cov=storage
 
 # 运行特定测试文件
-pytest tests/test_protocols.py
+python3.10 -m pytest tests/test_protocols.py
 
 # 运行特定测试类
-pytest tests/test_protocols.py::TestMockModbusTCP
+python3.10 -m pytest tests/test_protocols.py::TestMockModbusTCP
 
 # 运行特定测试方法
-pytest tests/test_protocols.py::TestMockModbusTCP::test_connection_success
+python3.10 -m pytest tests/test_protocols.py::TestMockModbusTCP::test_connection_success
 ```
 
 ---
@@ -196,7 +200,7 @@ def test_example(create_site, create_device, create_point, create_task):
 
 ```bash
 # 生成HTML报告
-pytest --cov=acquisition --cov=storage --cov-report=html
+python3.10 -m pytest --cov=acquisition --cov=storage --cov-report=html
 
 # 打开报告
 open htmlcov/index.html  # macOS
@@ -230,13 +234,13 @@ start htmlcov/index.html  # Windows
 #### 查看详细输出
 
 ```bash
-pytest -vv --tb=long
+python3.10 -m pytest -vv --tb=long
 ```
 
 #### 仅运行失败的测试
 
 ```bash
-pytest --lf  # last-failed
+python3.10 -m pytest --lf  # last-failed
 ```
 
 #### 进入调试器
@@ -250,13 +254,13 @@ def test_example():
 或使用pytest断点:
 
 ```bash
-pytest --pdb  # 失败时自动进入调试器
+python3.10 -m pytest --pdb  # 失败时自动进入调试器
 ```
 
 #### 显示打印输出
 
 ```bash
-pytest -s  # 显示print()输出
+python3.10 -m pytest -s  # 显示print()输出
 ```
 
 ---
@@ -269,7 +273,7 @@ A: 确保在backend目录运行测试,或设置PYTHONPATH:
 
 ```bash
 export PYTHONPATH=/path/to/backend:$PYTHONPATH
-pytest
+python3.10 -m pytest
 ```
 
 **Q: 数据库错误?**
