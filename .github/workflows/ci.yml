@@ -39,6 +39,9 @@ jobs:
       - name: Wheelhouse Python 3.10 解析器门禁自测
         run: bash scripts/ci/test-wheelhouse-python.sh
 
+      - name: 离线部署密钥 fail-closed 门禁
+        run: bash scripts/ci/test-offline-secret-safety.sh
+
       - name: C++ 后端排除门禁
         run: bash scripts/ci/guard-no-cpp-backend.sh
 
