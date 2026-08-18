@@ -12,34 +12,13 @@
   },
   "platform_routes": [
     {
-      "path": "/schema/",
-      "methods": [
-        "GET"
-      ],
-      "scope": "OpenAPI schema"
-    },
-    {
-      "path": "/api/docs/",
-      "methods": [
-        "GET"
-      ],
-      "scope": "Swagger UI"
-    },
-    {
-      "path": "/api/redoc/",
-      "methods": [
-        "GET"
-      ],
-      "scope": "ReDoc UI"
-    },
-    {
       "path": "/api/auth/login/",
       "methods": [
         "GET",
         "POST",
         "PUT"
       ],
-      "scope": "DRF browsable-session login; not application auth"
+      "name": "login"
     },
     {
       "path": "/api/auth/logout/",
@@ -47,9 +26,31 @@
         "GET",
         "POST"
       ],
-      "scope": "DRF browsable-session logout; not application auth"
+      "name": "logout"
+    },
+    {
+      "path": "/api/docs/",
+      "methods": [
+        "GET"
+      ],
+      "name": "api-docs"
+    },
+    {
+      "path": "/api/redoc/",
+      "methods": [
+        "GET"
+      ],
+      "name": "api-redoc"
+    },
+    {
+      "path": "/schema/",
+      "methods": [
+        "GET"
+      ],
+      "name": "schema"
     }
   ],
+  "platform_route_scope": "Every non-business production URL under /api/ or /schema/; Django /admin/ UI is excluded. /api/auth is DRF browsable-session UI, not application authentication.",
   "routes": [
     {
       "path": "/api/acquisition/",
@@ -550,9 +551,34 @@
     "task.sample_rate_hz": "3.75"
   },
   "json_value_rules": {
-    "data_point_value": "JSONField preserves the stored JSON scalar type.",
+    "data_point_value": "JSONField preserves each stored non-null JSON scalar type; Python None is rejected by the database NOT NULL constraint.",
     "influx_latest_value": "int/float/bool/null pass through; numeric-looking non-JSON strings become float; other strings remain strings.",
-    "influx_history_value": "int/float pass through; numeric-looking strings become float; other strings remain strings."
+    "influx_history_value": "int/float/bool pass through; numeric-looking strings become float; other strings remain strings; null-valued records are omitted.",
+    "examples": {
+      "data_point_value": {
+        "integer": 7,
+        "float": 2.5,
+        "boolean": true,
+        "numeric_string": "3.25",
+        "text": "synthetic"
+      },
+      "influx_latest_value": {
+        "integer": 7,
+        "float": 2.5,
+        "boolean": true,
+        "null": null,
+        "numeric_string": 3.25,
+        "text": "synthetic"
+      },
+      "influx_history_value": {
+        "integer": 7,
+        "float": 2.5,
+        "boolean": true,
+        "numeric_string": 3.25,
+        "text": "synthetic"
+      },
+      "data_point_null_accepted": false
+    }
   },
   "error_families": {
     "drf_validation": {
@@ -625,6 +651,115 @@
       "legacy": true
     }
   },
+  "legacy_endpoint_behaviors": {
+    "ignored_query_parameters": [
+      {
+        "path": "/api/config/tasks/",
+        "parameter": "site_code",
+        "behavior": "ignored; the generic task list returns tasks from every site"
+      }
+    ],
+    "malformed_numeric_query": {
+      "path": "/api/acquisition/sessions/point-history/",
+      "parameter": "limit",
+      "example": "not-an-integer",
+      "status": 500
+    },
+    "device_test_connection_failure": {
+      "path": "/api/config/devices/{id}/test-connection/",
+      "status": 200,
+      "success": false,
+      "top_level_keys": [
+        "details",
+        "message",
+        "protocol",
+        "steps",
+        "success",
+        "summary"
+      ]
+    },
+    "control_actions": {
+      "config_task_start": {
+        "path": "/api/config/tasks/{id}/start/",
+        "status": 200,
+        "top_level_keys": [
+          "celery_task_id",
+          "detail",
+          "message",
+          "run_id"
+        ]
+      },
+      "config_task_stop": {
+        "path": "/api/config/tasks/{id}/stop/",
+        "status": 200,
+        "top_level_keys": [
+          "detail",
+          "run_id",
+          "session_id"
+        ]
+      },
+      "acquisition_start_task": {
+        "path": "/api/acquisition/sessions/start-task/",
+        "status": 201,
+        "top_level_keys": [
+          "celery_task_id",
+          "detail",
+          "elapsed_seconds",
+          "session_id",
+          "task_code",
+          "validation"
+        ],
+        "validation_keys": [
+          "all_healthy",
+          "device_results",
+          "failed_points_count",
+          "total_points"
+        ]
+      },
+      "acquisition_session_stop": {
+        "path": "/api/acquisition/sessions/{id}/stop/",
+        "status": 200,
+        "top_level_keys": [
+          "current_status",
+          "detail",
+          "session_id"
+        ]
+      }
+    },
+    "custom_collection_actions": [
+      {
+        "path": "/api/config/tasks/{id}/points/",
+        "status": 200,
+        "top_level_type": "array"
+      },
+      {
+        "path": "/api/config/tasks/overview/",
+        "status": 200,
+        "top_level_type": "object",
+        "top_level_keys": [
+          "active_tasks",
+          "generated_at",
+          "recent_runs",
+          "status",
+          "total_tasks"
+        ]
+      },
+      {
+        "path": "/api/acquisition/sessions/active/",
+        "status": 200,
+        "top_level_type": "array"
+      },
+      {
+        "path": "/api/acquisition/sessions/{id}/data-points/",
+        "status": 200,
+        "top_level_type": "object",
+        "top_level_keys": [
+          "count",
+          "results"
+        ]
+      }
+    ]
+  },
   "known_legacy_defects": [
     {
       "id": "REST-LEGACY-001",
@@ -650,6 +785,21 @@
       "id": "REST-LEGACY-005",
       "behavior": "Several custom list actions return bare arrays/objects and are not wrapped by global pagination.",
       "migration_rule": "Preserve endpoint-by-endpoint; do not infer pagination from the URL alone."
+    },
+    {
+      "id": "REST-LEGACY-006",
+      "behavior": "The generic /api/config/tasks/ list silently ignores site_code while /api/config/tasks/overview/ applies it.",
+      "migration_rule": "Add filtering only as a coordinated behavior change; shadow comparison must account for the current cross-site list."
+    },
+    {
+      "id": "REST-LEGACY-007",
+      "behavior": "A device connection-test worker failure returns HTTP 200 with success=false instead of a non-2xx status.",
+      "migration_rule": "Keep the boolean failure contract until clients switch to a versioned status/error model."
+    },
+    {
+      "id": "REST-LEGACY-008",
+      "behavior": "Task-control and acquisition-session start/stop endpoints expose two different status codes and response envelopes for overlapping operations.",
+      "migration_rule": "Do not merge the two control surfaces without an explicit caller migration and rollback window."
     }
   ]
 }

@@ -26,148 +26,200 @@
         "device": [
           {
             "name": "device_name",
-            "required": false,
+            "label": "设备名称",
             "kind": "string",
+            "required": false,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "工作簿内唯一；「测点」sheet 用它引用设备；留空则回落用身份字段拼出的编码",
+            "example": null
           },
           {
             "name": "device_code",
-            "required": false,
+            "label": "设备编码(导出携带,新建留空)",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "系统内部编码;导出文件自动带上以保证原样导回;新建设备留空即可",
+            "example": null
           },
           {
             "name": "site_code",
-            "required": false,
+            "label": "站点编码",
             "kind": "string",
+            "required": false,
             "default": "default",
-            "choices": []
+            "choices": null,
+            "help_text": "可选，默认 default",
+            "example": null
           },
           {
             "name": "sample_rate_hz",
-            "required": false,
+            "label": "采样频率(Hz)",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "该设备采集任务(task-{设备编码})的采样频率；一设备一任务",
+            "example": null
           },
           {
             "name": "serial_port",
-            "required": true,
+            "label": "串口设备",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "如 /dev/ttyUSB0 或 COM3",
+            "example": "/dev/ttyUSB0"
           },
           {
             "name": "baudrate",
-            "required": false,
+            "label": "波特率",
             "kind": "int",
+            "required": false,
             "default": 9600,
-            "choices": []
+            "choices": null,
+            "help_text": "常见值: 9600 / 19200 / 38400 / 115200",
+            "example": null
           },
           {
             "name": "parity",
-            "required": false,
+            "label": "校验位",
             "kind": "enum",
+            "required": false,
             "default": "N",
             "choices": [
               "N",
               "E",
               "O"
-            ]
+            ],
+            "help_text": "N=无, E=偶校验, O=奇校验",
+            "example": null
           },
           {
             "name": "bytesize",
-            "required": false,
+            "label": "数据位",
             "kind": "enum",
+            "required": false,
             "default": 8,
             "choices": [
               8
-            ]
+            ],
+            "help_text": "RTU 帧固定 8 数据位;7 位数据位是 Modbus ASCII 模式,RTU 不支持",
+            "example": null
           },
           {
             "name": "stopbits",
-            "required": false,
+            "label": "停止位",
             "kind": "enum",
+            "required": false,
             "default": 1,
             "choices": [
               1,
               2
-            ]
+            ],
+            "help_text": "",
+            "example": null
           },
           {
             "name": "slave_id",
-            "required": true,
+            "label": "从站地址",
             "kind": "int",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "RS-485 总线上每台从机的唯一地址 1-247",
+            "example": 1
           },
           {
             "name": "byte_order",
-            "required": false,
+            "label": "字节序",
             "kind": "enum",
+            "required": false,
             "default": "big",
             "choices": [
               "big",
               "little",
               "big-swap",
               "little-swap"
-            ]
+            ],
+            "help_text": "",
+            "example": null
           },
           {
             "name": "timeout",
-            "required": false,
+            "label": "超时(秒)",
             "kind": "float",
-            "default": 2,
-            "choices": []
+            "required": false,
+            "default": 2.0,
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
         ],
         "point": [
           {
             "name": "device_name",
-            "required": true,
+            "label": "设备名称",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "引用「设备」sheet 中的 device_name",
+            "example": null
           },
           {
             "name": "code",
-            "required": true,
+            "label": "测点编码",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "设备内唯一",
+            "example": null
           },
           {
             "name": "description",
-            "required": false,
+            "label": "中文名称",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "address",
-            "required": true,
+            "label": "寄存器地址",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "支持 0-based 直接地址、SCADA 风格 (D100/I101/C001/T102) 或 4xxxx/3xxxx",
+            "example": "40001"
           },
           {
             "name": "function_code",
-            "required": false,
+            "label": "功能码",
             "kind": "enum",
+            "required": false,
             "default": 3,
             "choices": [
               1,
               2,
               3,
               4
-            ]
+            ],
+            "help_text": "3=保持寄存器(默认), 4=输入寄存器, 1=线圈, 2=离散输入",
+            "example": null
           },
           {
             "name": "data_type",
-            "required": false,
+            "label": "数据类型",
             "kind": "enum",
+            "required": false,
             "default": "uint16",
             "choices": [
               "bool",
@@ -179,172 +231,201 @@
               "uint64",
               "float32",
               "float64"
-            ]
+            ],
+            "help_text": "决定多寄存器组合规则;uint16/int16=1 个寄存器, float32/int32=2 个, float64/int64=4 个",
+            "example": null
           },
           {
             "name": "num",
-            "required": false,
+            "label": "寄存器数量",
             "kind": "int",
+            "required": false,
             "default": 1,
-            "choices": []
+            "choices": null,
+            "help_text": "float32 填 2, float64 填 4, 否则一般为 1",
+            "example": 1
           },
           {
             "name": "unit",
-            "required": false,
+            "label": "单位",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": "℃"
           },
           {
             "name": "coefficient",
-            "required": false,
+            "label": "系数",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "原始值乘以该系数",
+            "example": null
           }
-        ],
-        "device_labels": [
-          "设备名称",
-          "设备编码(导出携带,新建留空)",
-          "站点编码",
-          "采样频率(Hz)",
-          "串口设备",
-          "波特率",
-          "校验位",
-          "数据位",
-          "停止位",
-          "从站地址",
-          "字节序",
-          "超时(秒)"
-        ],
-        "point_labels": [
-          "设备名称",
-          "测点编码",
-          "中文名称",
-          "寄存器地址",
-          "功能码",
-          "数据类型",
-          "寄存器数量",
-          "单位",
-          "系数"
         ]
       },
       "modbus_tcp": {
         "device": [
           {
             "name": "device_name",
-            "required": false,
+            "label": "设备名称",
             "kind": "string",
+            "required": false,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "工作簿内唯一；「测点」sheet 用它引用设备；留空则回落用身份字段拼出的编码",
+            "example": null
           },
           {
             "name": "device_code",
-            "required": false,
+            "label": "设备编码(导出携带,新建留空)",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "系统内部编码;导出文件自动带上以保证原样导回;新建设备留空即可",
+            "example": null
           },
           {
             "name": "site_code",
-            "required": false,
+            "label": "站点编码",
             "kind": "string",
+            "required": false,
             "default": "default",
-            "choices": []
+            "choices": null,
+            "help_text": "可选，默认 default",
+            "example": null
           },
           {
             "name": "sample_rate_hz",
-            "required": false,
+            "label": "采样频率(Hz)",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "该设备采集任务(task-{设备编码})的采样频率；一设备一任务",
+            "example": null
           },
           {
             "name": "source_ip",
-            "required": true,
+            "label": "IP 地址",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": "192.168.1.100"
           },
           {
             "name": "source_port",
-            "required": false,
+            "label": "端口",
             "kind": "int",
+            "required": false,
             "default": 502,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": 502
           },
           {
             "name": "slave_id",
-            "required": false,
+            "label": "单元标识符 (Unit ID)",
             "kind": "int",
+            "required": false,
             "default": 1,
-            "choices": []
+            "choices": null,
+            "help_text": "Modbus TCP 单元标识符(MBAP Unit Id);直连设备一般填 1,经 TCP/RTU 网关时填后端串行从机地址",
+            "example": null
           },
           {
             "name": "byte_order",
-            "required": false,
+            "label": "字节序",
             "kind": "enum",
+            "required": false,
             "default": "big",
             "choices": [
               "big",
               "little",
               "big-swap",
               "little-swap"
-            ]
+            ],
+            "help_text": "float32/int32 多字节解析顺序;ABCD=big, DCBA=little, BADC=big-swap, CDAB=little-swap",
+            "example": null
           },
           {
             "name": "timeout",
-            "required": false,
+            "label": "超时(秒)",
             "kind": "float",
-            "default": 10,
-            "choices": []
+            "required": false,
+            "default": 10.0,
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
         ],
         "point": [
           {
             "name": "device_name",
-            "required": true,
+            "label": "设备名称",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "引用「设备」sheet 中的 device_name",
+            "example": null
           },
           {
             "name": "code",
-            "required": true,
+            "label": "测点编码",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "设备内唯一",
+            "example": null
           },
           {
             "name": "description",
-            "required": false,
+            "label": "中文名称",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "address",
-            "required": true,
+            "label": "寄存器地址",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "支持 0-based 直接地址、SCADA 风格 (D100/I101/C001/T102) 或 4xxxx/3xxxx",
+            "example": "40001"
           },
           {
             "name": "function_code",
-            "required": false,
+            "label": "功能码",
             "kind": "enum",
+            "required": false,
             "default": 3,
             "choices": [
               1,
               2,
               3,
               4
-            ]
+            ],
+            "help_text": "3=保持寄存器(默认), 4=输入寄存器, 1=线圈, 2=离散输入",
+            "example": null
           },
           {
             "name": "data_type",
-            "required": false,
+            "label": "数据类型",
             "kind": "enum",
+            "required": false,
             "default": "uint16",
             "choices": [
               "bool",
@@ -356,341 +437,408 @@
               "uint64",
               "float32",
               "float64"
-            ]
+            ],
+            "help_text": "决定多寄存器组合规则;uint16/int16=1 个寄存器, float32/int32=2 个, float64/int64=4 个",
+            "example": null
           },
           {
             "name": "num",
-            "required": false,
+            "label": "寄存器数量",
             "kind": "int",
+            "required": false,
             "default": 1,
-            "choices": []
+            "choices": null,
+            "help_text": "float32 填 2, float64 填 4, 否则一般为 1",
+            "example": 1
           },
           {
             "name": "unit",
-            "required": false,
+            "label": "单位",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": "℃"
           },
           {
             "name": "coefficient",
-            "required": false,
+            "label": "系数",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "原始值乘以该系数",
+            "example": null
           }
-        ],
-        "device_labels": [
-          "设备名称",
-          "设备编码(导出携带,新建留空)",
-          "站点编码",
-          "采样频率(Hz)",
-          "IP 地址",
-          "端口",
-          "单元标识符 (Unit ID)",
-          "字节序",
-          "超时(秒)"
-        ],
-        "point_labels": [
-          "设备名称",
-          "测点编码",
-          "中文名称",
-          "寄存器地址",
-          "功能码",
-          "数据类型",
-          "寄存器数量",
-          "单位",
-          "系数"
         ]
       },
       "mqtt": {
         "device": [
           {
             "name": "device_name",
-            "required": false,
+            "label": "设备名称",
             "kind": "string",
+            "required": false,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "工作簿内唯一；「测点」sheet 用它引用设备；留空则回落用身份字段拼出的编码",
+            "example": null
           },
           {
             "name": "device_code",
-            "required": false,
+            "label": "设备编码(导出携带,新建留空)",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "系统内部编码;导出文件自动带上以保证原样导回;新建设备留空即可",
+            "example": null
           },
           {
             "name": "site_code",
-            "required": false,
+            "label": "站点编码",
             "kind": "string",
+            "required": false,
             "default": "default",
-            "choices": []
+            "choices": null,
+            "help_text": "可选，默认 default",
+            "example": null
           },
           {
             "name": "sample_rate_hz",
-            "required": false,
+            "label": "采样频率(Hz)",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "该设备采集任务(task-{设备编码})的采样频率；一设备一任务",
+            "example": null
           },
           {
             "name": "source_ip",
-            "required": true,
+            "label": "Broker 地址",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": "broker.example.com"
           },
           {
             "name": "source_port",
-            "required": false,
+            "label": "Broker 端口",
             "kind": "int",
+            "required": false,
             "default": 1883,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": 1883
           },
           {
             "name": "mqtt_topics",
-            "required": true,
+            "label": "订阅话题",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "多个话题用逗号或分号分隔,支持 + 与 # 通配",
+            "example": "sensor/+/temp"
           },
           {
             "name": "mqtt_qos",
-            "required": false,
+            "label": "QoS",
             "kind": "enum",
+            "required": false,
             "default": 0,
             "choices": [
               0,
               1,
               2
-            ]
+            ],
+            "help_text": "",
+            "example": null
           },
           {
             "name": "mqtt_username",
-            "required": false,
+            "label": "用户名",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "mqtt_password",
-            "required": false,
+            "label": "密码",
             "kind": "secret",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "mqtt_use_tls",
-            "required": false,
+            "label": "启用 TLS",
             "kind": "bool",
+            "required": false,
             "default": false,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "mqtt_client_id",
-            "required": false,
+            "label": "ClientID",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "留空自动生成",
+            "example": null
           },
           {
             "name": "mqtt_read_timeout",
-            "required": false,
+            "label": "读取超时(秒)",
             "kind": "float",
-            "default": 5,
-            "choices": []
+            "required": false,
+            "default": 5.0,
+            "choices": null,
+            "help_text": "采集循环从消息队列拉数据时的最长等待时间;队列空闲超过该值即结束本轮读取",
+            "example": null
           },
           {
             "name": "mqtt_queue_size",
-            "required": false,
+            "label": "接收队列容量",
             "kind": "int",
+            "required": false,
             "default": 1000,
-            "choices": []
+            "choices": null,
+            "help_text": "消息推送快于消费时的缓冲上限;持续吞吐上限≈容量×采集频率(条/秒)。队列满时丢弃新消息并计数(会话健康指标 dropped_messages + 数据丢弃告警)",
+            "example": null
           }
         ],
         "point": [
           {
             "name": "device_name",
-            "required": true,
+            "label": "设备名称",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "引用「设备」sheet 中的 device_name",
+            "example": null
           },
           {
             "name": "code",
-            "required": true,
+            "label": "测点编码",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "设备内唯一",
+            "example": null
           },
           {
             "name": "description",
-            "required": false,
+            "label": "中文名称",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "topic_filter",
-            "required": false,
+            "label": "话题过滤",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "可选,只接收指定话题的消息(支持通配)",
+            "example": null
           },
           {
             "name": "payload_path",
-            "required": false,
+            "label": "JSON 路径",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "形如 'data.value';留空时按 code 取顶层字段",
+            "example": null
           },
           {
             "name": "data_type",
-            "required": false,
+            "label": "数据类型",
             "kind": "enum",
+            "required": false,
             "default": "float",
             "choices": [
               "string",
               "int",
               "float",
               "bool"
-            ]
+            ],
+            "help_text": "",
+            "example": null
           },
           {
             "name": "unit",
-            "required": false,
+            "label": "单位",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
-        ],
-        "device_labels": [
-          "设备名称",
-          "设备编码(导出携带,新建留空)",
-          "站点编码",
-          "采样频率(Hz)",
-          "Broker 地址",
-          "Broker 端口",
-          "订阅话题",
-          "QoS",
-          "用户名",
-          "密码",
-          "启用 TLS",
-          "ClientID",
-          "读取超时(秒)",
-          "接收队列容量"
-        ],
-        "point_labels": [
-          "设备名称",
-          "测点编码",
-          "中文名称",
-          "话题过滤",
-          "JSON 路径",
-          "数据类型",
-          "单位"
         ]
       },
       "opcua": {
         "device": [
           {
             "name": "device_name",
-            "required": false,
+            "label": "设备名称",
             "kind": "string",
+            "required": false,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "工作簿内唯一；「测点」sheet 用它引用设备；留空则回落用身份字段拼出的编码",
+            "example": null
           },
           {
             "name": "device_code",
-            "required": false,
+            "label": "设备编码(导出携带,新建留空)",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "系统内部编码;导出文件自动带上以保证原样导回;新建设备留空即可",
+            "example": null
           },
           {
             "name": "site_code",
-            "required": false,
+            "label": "站点编码",
             "kind": "string",
+            "required": false,
             "default": "default",
-            "choices": []
+            "choices": null,
+            "help_text": "可选，默认 default",
+            "example": null
           },
           {
             "name": "sample_rate_hz",
-            "required": false,
+            "label": "采样频率(Hz)",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "该设备采集任务(task-{设备编码})的采样频率；一设备一任务",
+            "example": null
           },
           {
             "name": "endpoint_url",
-            "required": true,
+            "label": "Endpoint URL",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "OPC-UA 服务端点,以 opc.tcp:// 开头",
+            "example": "opc.tcp://192.168.1.50:4840"
           },
           {
             "name": "security_policy",
-            "required": false,
+            "label": "安全策略",
             "kind": "enum",
+            "required": false,
             "default": "None",
             "choices": [
               "None"
-            ]
+            ],
+            "help_text": "当前仅支持无加密(None);加密策略需要客户端证书/私钥支持,后续版本再加",
+            "example": null
           },
           {
             "name": "opcua_username",
-            "required": false,
+            "label": "用户名",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "opcua_password",
-            "required": false,
+            "label": "密码",
             "kind": "secret",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "timeout",
-            "required": false,
+            "label": "超时(秒)",
             "kind": "float",
-            "default": 5,
-            "choices": []
+            "required": false,
+            "default": 5.0,
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
         ],
         "point": [
           {
             "name": "device_name",
-            "required": true,
+            "label": "设备名称",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "引用「设备」sheet 中的 device_name",
+            "example": null
           },
           {
             "name": "code",
-            "required": true,
+            "label": "测点编码",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "设备内唯一",
+            "example": null
           },
           {
             "name": "description",
-            "required": false,
+            "label": "中文名称",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "address",
-            "required": true,
+            "label": "NodeId",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "OPC-UA 节点 ID,例如 'ns=2;s=...' 或 'i=85'",
+            "example": "ns=2;s=Channel1.Device1.Tag1"
           },
           {
             "name": "data_type",
-            "required": false,
+            "label": "数据类型",
             "kind": "enum",
+            "required": false,
             "default": "auto",
             "choices": [
               "auto",
@@ -702,98 +850,109 @@
               "float32",
               "double",
               "string"
-            ]
+            ],
+            "help_text": "auto = 让 OPC-UA 自己解析",
+            "example": null
           },
           {
             "name": "unit",
-            "required": false,
+            "label": "单位",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
-        ],
-        "device_labels": [
-          "设备名称",
-          "设备编码(导出携带,新建留空)",
-          "站点编码",
-          "采样频率(Hz)",
-          "Endpoint URL",
-          "安全策略",
-          "用户名",
-          "密码",
-          "超时(秒)"
-        ],
-        "point_labels": [
-          "设备名称",
-          "测点编码",
-          "中文名称",
-          "NodeId",
-          "数据类型",
-          "单位"
         ]
       },
       "siemens_s7": {
         "device": [
           {
             "name": "device_name",
-            "required": false,
+            "label": "设备名称",
             "kind": "string",
+            "required": false,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "工作簿内唯一；「测点」sheet 用它引用设备；留空则回落用身份字段拼出的编码",
+            "example": null
           },
           {
             "name": "device_code",
-            "required": false,
+            "label": "设备编码(导出携带,新建留空)",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "系统内部编码;导出文件自动带上以保证原样导回;新建设备留空即可",
+            "example": null
           },
           {
             "name": "site_code",
-            "required": false,
+            "label": "站点编码",
             "kind": "string",
+            "required": false,
             "default": "default",
-            "choices": []
+            "choices": null,
+            "help_text": "可选，默认 default",
+            "example": null
           },
           {
             "name": "sample_rate_hz",
-            "required": false,
+            "label": "采样频率(Hz)",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "该设备采集任务(task-{设备编码})的采样频率；一设备一任务",
+            "example": null
           },
           {
             "name": "source_ip",
-            "required": true,
+            "label": "PLC IP",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": "192.168.1.10"
           },
           {
             "name": "source_port",
-            "required": false,
+            "label": "端口",
             "kind": "int",
+            "required": false,
             "default": 102,
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "rack",
-            "required": false,
+            "label": "Rack 号",
             "kind": "int",
+            "required": false,
             "default": 0,
-            "choices": []
+            "choices": null,
+            "help_text": "S7-1200/1500 一般为 0",
+            "example": null
           },
           {
             "name": "slot",
-            "required": false,
+            "label": "Slot 号",
             "kind": "int",
+            "required": false,
             "default": 1,
-            "choices": []
+            "choices": null,
+            "help_text": "S7-1200/1500 一般为 1, S7-300/400 一般为 2",
+            "example": null
           },
           {
             "name": "plc_type",
-            "required": false,
+            "label": "PLC 型号",
             "kind": "enum",
+            "required": false,
             "default": "S7-1200",
             "choices": [
               "S7-200",
@@ -801,49 +960,67 @@
               "S7-400",
               "S7-1200",
               "S7-1500"
-            ]
+            ],
+            "help_text": "S7-200 经典款走 TSAP 而非 rack/slot;当前 rack/slot 连接方式主要适配 S7-300/400/1200/1500",
+            "example": null
           },
           {
             "name": "timeout",
-            "required": false,
+            "label": "超时(秒)",
             "kind": "float",
-            "default": 5,
-            "choices": []
+            "required": false,
+            "default": 5.0,
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
         ],
         "point": [
           {
             "name": "device_name",
-            "required": true,
+            "label": "设备名称",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "引用「设备」sheet 中的 device_name",
+            "example": null
           },
           {
             "name": "code",
-            "required": true,
+            "label": "测点编码",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "设备内唯一",
+            "example": null
           },
           {
             "name": "description",
-            "required": false,
+            "label": "中文名称",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "address",
-            "required": true,
+            "label": "地址",
             "kind": "string",
+            "required": true,
             "default": null,
-            "choices": []
+            "choices": null,
+            "help_text": "DB1.DBD0 / DB10.DBX2.3 / MW100 / I0.0 / QW20",
+            "example": "DB1.DBD0"
           },
           {
             "name": "data_type",
-            "required": false,
+            "label": "数据类型",
             "kind": "enum",
+            "required": false,
             "default": "float32",
             "choices": [
               "bool",
@@ -856,51 +1033,40 @@
               "float64",
               "lreal",
               "string"
-            ]
+            ],
+            "help_text": "float64/lreal 用于 S7-1200/1500 的 LReal(8 字节,地址仍填 DBD 起始字节); string 的读取长度由 str_length 字段决定,与地址写的是 DBB/DBW/DBD 无关",
+            "example": null
           },
           {
             "name": "str_length",
-            "required": false,
+            "label": "字符串长度",
             "kind": "int",
+            "required": false,
             "default": 32,
-            "choices": []
+            "choices": null,
+            "help_text": "仅 data_type=string 时生效:声明的字符容量(不含头部),对应 PLC 侧 STRING[str_length] 的声明长度;实际会从地址起始字节读取 2+str_length 字节(西门子 STRING 格式:[max_len(1B)][actual_len(1B)][chars...])",
+            "example": null
           },
           {
             "name": "unit",
-            "required": false,
+            "label": "单位",
             "kind": "string",
+            "required": false,
             "default": "",
-            "choices": []
+            "choices": null,
+            "help_text": "",
+            "example": null
           },
           {
             "name": "coefficient",
-            "required": false,
+            "label": "系数",
             "kind": "float",
-            "default": 1,
-            "choices": []
+            "required": false,
+            "default": 1.0,
+            "choices": null,
+            "help_text": "",
+            "example": null
           }
-        ],
-        "device_labels": [
-          "设备名称",
-          "设备编码(导出携带,新建留空)",
-          "站点编码",
-          "采样频率(Hz)",
-          "PLC IP",
-          "端口",
-          "Rack 号",
-          "Slot 号",
-          "PLC 型号",
-          "超时(秒)"
-        ],
-        "point_labels": [
-          "设备名称",
-          "测点编码",
-          "中文名称",
-          "地址",
-          "数据类型",
-          "字符串长度",
-          "单位",
-          "系数"
         ]
       }
     }
@@ -920,104 +1086,138 @@
     "field_specs": [
       {
         "name": "serial_port",
-        "required": true,
+        "label": "串口设备",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "如 /dev/ttyUSB0 或 COM3",
+        "example": "/dev/ttyUSB0"
       },
       {
         "name": "baudrate",
-        "required": false,
+        "label": "波特率",
         "kind": "int",
+        "required": false,
         "default": 9600,
-        "choices": []
+        "choices": null,
+        "help_text": "常见值: 9600 / 19200 / 38400 / 115200",
+        "example": null
       },
       {
         "name": "parity",
-        "required": false,
+        "label": "校验位",
         "kind": "enum",
+        "required": false,
         "default": "N",
         "choices": [
           "N",
           "E",
           "O"
-        ]
+        ],
+        "help_text": "N=无, E=偶校验, O=奇校验",
+        "example": null
       },
       {
         "name": "bytesize",
-        "required": false,
+        "label": "数据位",
         "kind": "enum",
+        "required": false,
         "default": 8,
         "choices": [
           8
-        ]
+        ],
+        "help_text": "RTU 帧固定 8 数据位;7 位数据位是 Modbus ASCII 模式,RTU 不支持",
+        "example": null
       },
       {
         "name": "stopbits",
-        "required": false,
+        "label": "停止位",
         "kind": "enum",
+        "required": false,
         "default": 1,
         "choices": [
           1,
           2
-        ]
+        ],
+        "help_text": "",
+        "example": null
       },
       {
         "name": "slave_id",
-        "required": true,
+        "label": "从站地址",
         "kind": "int",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "RS-485 总线上每台从机的唯一地址 1-247",
+        "example": 1
       },
       {
         "name": "byte_order",
-        "required": false,
+        "label": "字节序",
         "kind": "enum",
+        "required": false,
         "default": "big",
         "choices": [
           "big",
           "little",
           "big-swap",
           "little-swap"
-        ]
+        ],
+        "help_text": "",
+        "example": null
       },
       {
         "name": "timeout",
-        "required": false,
+        "label": "超时(秒)",
         "kind": "float",
-        "default": 2,
-        "choices": []
+        "required": false,
+        "default": 2.0,
+        "choices": null,
+        "help_text": "",
+        "example": null
       },
       {
         "name": "code",
-        "required": true,
+        "label": "测点编码",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "测点唯一标识,如 'temp_01'",
+        "example": "temp_01"
       },
       {
         "name": "address",
-        "required": true,
+        "label": "寄存器地址",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "支持 0-based 直接地址、SCADA 风格 (D100/I101/C001/T102) 或 4xxxx/3xxxx",
+        "example": "40001"
       },
       {
         "name": "function_code",
-        "required": false,
+        "label": "功能码",
         "kind": "enum",
+        "required": false,
         "default": 3,
         "choices": [
           1,
           2,
           3,
           4
-        ]
+        ],
+        "help_text": "3=保持寄存器(默认), 4=输入寄存器, 1=线圈, 2=离散输入",
+        "example": null
       },
       {
         "name": "data_type",
-        "required": false,
+        "label": "数据类型",
         "kind": "enum",
+        "required": false,
         "default": "uint16",
         "choices": [
           "bool",
@@ -1029,193 +1229,271 @@
           "uint64",
           "float32",
           "float64"
-        ]
+        ],
+        "help_text": "决定多寄存器组合规则;uint16/int16=1 个寄存器, float32/int32=2 个, float64/int64=4 个",
+        "example": null
       },
       {
         "name": "num",
-        "required": false,
+        "label": "寄存器数量",
         "kind": "int",
+        "required": false,
         "default": 1,
-        "choices": []
+        "choices": null,
+        "help_text": "float32 填 2, float64 填 4, 否则一般为 1",
+        "example": 1
       },
       {
         "name": "unit",
-        "required": false,
+        "label": "单位",
         "kind": "string",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": "℃"
       },
       {
         "name": "description",
-        "required": false,
+        "label": "中文名称",
         "kind": "string",
+        "required": false,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": "温度"
       },
       {
         "name": "coefficient",
-        "required": false,
+        "label": "系数",
         "kind": "float",
-        "default": 1,
-        "choices": []
+        "required": false,
+        "default": 1.0,
+        "choices": null,
+        "help_text": "原始值乘以该系数",
+        "example": null
       },
       {
         "name": "source_ip",
-        "required": true,
+        "label": "IP 地址",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": "192.168.1.100"
       },
       {
         "name": "source_port",
-        "required": false,
+        "label": "端口",
         "kind": "int",
+        "required": false,
         "default": 502,
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": 502
       },
       {
         "name": "mqtt_topics",
-        "required": true,
+        "label": "订阅话题",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "多个话题用逗号或分号分隔,支持 + 与 # 通配",
+        "example": "sensor/+/temp"
       },
       {
         "name": "mqtt_qos",
-        "required": false,
+        "label": "QoS",
         "kind": "enum",
+        "required": false,
         "default": 0,
         "choices": [
           0,
           1,
           2
-        ]
+        ],
+        "help_text": "",
+        "example": null
       },
       {
         "name": "mqtt_username",
-        "required": false,
+        "label": "用户名",
         "kind": "string",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": null
       },
       {
         "name": "mqtt_password",
-        "required": false,
+        "label": "密码",
         "kind": "secret",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": null
       },
       {
         "name": "mqtt_use_tls",
-        "required": false,
+        "label": "启用 TLS",
         "kind": "bool",
+        "required": false,
         "default": false,
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": null
       },
       {
         "name": "mqtt_client_id",
-        "required": false,
+        "label": "ClientID",
         "kind": "string",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "留空自动生成",
+        "example": null
       },
       {
         "name": "mqtt_read_timeout",
-        "required": false,
+        "label": "读取超时(秒)",
         "kind": "float",
-        "default": 5,
-        "choices": []
+        "required": false,
+        "default": 5.0,
+        "choices": null,
+        "help_text": "采集循环从消息队列拉数据时的最长等待时间;队列空闲超过该值即结束本轮读取",
+        "example": null
       },
       {
         "name": "mqtt_queue_size",
-        "required": false,
+        "label": "接收队列容量",
         "kind": "int",
+        "required": false,
         "default": 1000,
-        "choices": []
+        "choices": null,
+        "help_text": "消息推送快于消费时的缓冲上限;持续吞吐上限≈容量×采集频率(条/秒)。队列满时丢弃新消息并计数(会话健康指标 dropped_messages + 数据丢弃告警)",
+        "example": null
       },
       {
         "name": "topic_filter",
-        "required": false,
+        "label": "话题过滤",
         "kind": "string",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "可选,只接收指定话题的消息(支持通配)",
+        "example": null
       },
       {
         "name": "payload_path",
-        "required": false,
+        "label": "JSON 路径",
         "kind": "string",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "形如 'data.value';留空时按 code 取顶层字段",
+        "example": null
       },
       {
         "name": "endpoint_url",
-        "required": true,
+        "label": "Endpoint URL",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "OPC-UA 服务端点,以 opc.tcp:// 开头",
+        "example": "opc.tcp://192.168.1.50:4840"
       },
       {
         "name": "security_policy",
-        "required": false,
+        "label": "安全策略",
         "kind": "enum",
+        "required": false,
         "default": "None",
         "choices": [
           "None"
-        ]
+        ],
+        "help_text": "当前仅支持无加密(None);加密策略需要客户端证书/私钥支持,后续版本再加",
+        "example": null
       },
       {
         "name": "opcua_username",
-        "required": false,
+        "label": "用户名",
         "kind": "string",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": null
       },
       {
         "name": "opcua_password",
-        "required": false,
+        "label": "密码",
         "kind": "secret",
+        "required": false,
         "default": "",
-        "choices": []
+        "choices": null,
+        "help_text": "",
+        "example": null
       },
       {
         "name": "scada_product_key",
-        "required": true,
+        "label": "产品 Key",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "话题中的 {product_key} 段",
+        "example": "123daffb91264286adcdf3bfe55194c7"
       },
       {
         "name": "scada_device_name",
-        "required": true,
+        "label": "设备名",
         "kind": "string",
+        "required": true,
         "default": null,
-        "choices": []
+        "choices": null,
+        "help_text": "话题中的 {device_name} 段",
+        "example": "A0201010001150403"
       },
       {
         "name": "scada_topic_template",
-        "required": false,
+        "label": "话题模板",
         "kind": "string",
+        "required": false,
         "default": "/sys/{product_key}/device/{device_name}/thing/property/{code}/post",
-        "choices": []
+        "choices": null,
+        "help_text": "支持 {product_key} {device_name} {code} 占位符;{code} 为逐测点编码;留空则使用默认模板",
+        "example": "/sys/{product_key}/device/{device_name}/thing/property/{code}/post"
       },
       {
         "name": "rack",
-        "required": false,
+        "label": "Rack 号",
         "kind": "int",
+        "required": false,
         "default": 0,
-        "choices": []
+        "choices": null,
+        "help_text": "S7-1200/1500 一般为 0",
+        "example": null
       },
       {
         "name": "slot",
-        "required": false,
+        "label": "Slot 号",
         "kind": "int",
+        "required": false,
         "default": 1,
-        "choices": []
+        "choices": null,
+        "help_text": "S7-1200/1500 一般为 1, S7-300/400 一般为 2",
+        "example": null
       },
       {
         "name": "plc_type",
-        "required": false,
+        "label": "PLC 型号",
         "kind": "enum",
+        "required": false,
         "default": "S7-1200",
         "choices": [
           "S7-200",
@@ -1223,14 +1501,19 @@
           "S7-400",
           "S7-1200",
           "S7-1500"
-        ]
+        ],
+        "help_text": "S7-200 经典款走 TSAP 而非 rack/slot;当前 rack/slot 连接方式主要适配 S7-300/400/1200/1500",
+        "example": null
       },
       {
         "name": "str_length",
-        "required": false,
+        "label": "字符串长度",
         "kind": "int",
+        "required": false,
         "default": 32,
-        "choices": []
+        "choices": null,
+        "help_text": "仅 data_type=string 时生效:声明的字符容量(不含头部),对应 PLC 侧 STRING[str_length] 的声明长度;实际会从地址起始字节读取 2+str_length 字节(西门子 STRING 格式:[max_len(1B)][actual_len(1B)][chars...])",
+        "example": null
       }
     ]
   },
@@ -1272,7 +1555,8 @@
     "legacy": "Single English header row, multi-protocol wide sheet, ImportJob validation/apply workflow, retained for stored files.",
     "scada": "Single English header row with Chinese comments; shared gateway row plus device/point rows; synchronous transactional upsert; errors include protocol but not sheet/kind.",
     "integer_cells": "Integer-kind fields must remain Excel integers and must not acquire a .0 suffix.",
-    "round_trip": "An unchanged export re-imports idempotently; no rows outside the workbook are implicitly deleted."
+    "round_trip": "Generated workbooks parse again entirely in memory; an unchanged export re-imports idempotently and no rows outside the workbook are implicitly deleted.",
+    "credential_values": "The fixture records schema metadata only. Secret defaults are empty and examples are null/placeholders; tests use an unmistakably synthetic in-memory sentinel to prove plaintext round-trip behavior without committing a usable credential."
   },
   "known_legacy_defects": [
     {

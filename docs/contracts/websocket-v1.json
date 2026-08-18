@@ -5,13 +5,38 @@
     {
       "path": "/ws/acquisition/sessions/{session_id}/",
       "django_regex": "ws/acquisition/sessions/(?P<session_id>\\d+)/$",
-      "on_connect": {"type": "session_status", "payload_key": "data"},
+      "on_connect": {
+        "type": "session_status",
+        "frame_keys": ["data", "type"],
+        "payload_key": "data",
+        "payload_type": "object",
+        "payload_keys": [
+          "duration_seconds",
+          "error_count",
+          "error_message",
+          "last_read_time",
+          "points_read",
+          "session_id",
+          "started_at",
+          "status",
+          "stopped_at",
+          "task_code",
+          "task_name"
+        ]
+      },
       "client_to_server": "Frames are accepted and ignored."
     },
     {
       "path": "/ws/acquisition/global/",
       "django_regex": "ws/acquisition/global/$",
-      "on_connect": {"type": "active_sessions", "payload_key": "data", "maximum_sessions": 50},
+      "on_connect": {
+        "type": "active_sessions",
+        "frame_keys": ["data", "type"],
+        "payload_key": "data",
+        "payload_type": "array",
+        "item_keys": ["session_id", "started_at", "status", "task_code", "task_id"],
+        "maximum_sessions": 50
+      },
       "client_to_server": "Frames are accepted and ignored."
     }
   ],
@@ -79,9 +104,11 @@
     }
   ],
   "data_batch": {
+    "event_type": "data_point_update",
+    "groups": ["acquisition_session_{session_id}", "acquisition_global"],
     "payload_key": "data",
-    "keys": ["session_id", "timestamp", "readings", "batch_count", "chunk_index", "chunk_count"],
-    "reading_keys": ["point_code", "value", "quality", "timestamp"],
+    "keys": ["batch_count", "chunk_count", "chunk_index", "readings", "session_id", "timestamp"],
+    "reading_keys": ["point_code", "quality", "timestamp", "value"],
     "batch_count_rule": "Present on the first chunk and represents consumed readings before latest-per-point deduplication."
   },
   "browser_policy": {
