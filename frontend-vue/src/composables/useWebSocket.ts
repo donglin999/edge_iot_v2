@@ -101,10 +101,13 @@ export function useWebSocket(options: UseWebSocketOptions) {
       };
 
       candidate.onclose = () => {
-        options.onClose?.();
-        if (socket.value !== candidate) return;
+        // A close event can arrive after a URL/enabled change or scope disposal.
+        // In those cases the candidate is intentionally stale and must not notify
+        // the replacement component state or schedule another reconnect.
+        if (disposed || socket.value !== candidate) return;
         socket.value = null;
         status.value = WebSocketStatus.DISCONNECTED;
+        options.onClose?.();
         scheduleReconnect();
       };
     } catch (error) {

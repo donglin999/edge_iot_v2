@@ -83,13 +83,19 @@ describe('useWebSocket', () => {
 
   it('reconnects after the configured delay, but not after scope disposal', () => {
     vi.useFakeTimers();
+    const onClose = vi.fn();
     const scope = effectScope();
     const api = scope.run(() =>
-      useWebSocket({ url: 'ws://localhost/ws/global/', reconnectInterval: 250 }),
+      useWebSocket({
+        url: 'ws://localhost/ws/global/',
+        reconnectInterval: 250,
+        onClose,
+      }),
     )!;
 
     FakeWebSocket.instances[0]!.serverClose();
     expect(api.status.value).toBe(WebSocketStatus.DISCONNECTED);
+    expect(onClose).toHaveBeenCalledOnce();
     vi.advanceTimersByTime(249);
     expect(FakeWebSocket.instances).toHaveLength(1);
     vi.advanceTimersByTime(1);
@@ -99,15 +105,17 @@ describe('useWebSocket', () => {
     scope.stop();
     vi.advanceTimersByTime(250);
     expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 
   it('reacts to enabled and url changes without leaving stale reconnect timers', async () => {
     vi.useFakeTimers();
     const enabled = ref(false);
     const url = ref('https://example.test/ws/one/');
+    const onClose = vi.fn();
     const scope = effectScope();
     const api = scope.run(() =>
-      useWebSocket({ url, enabled, reconnectInterval: 10 }),
+      useWebSocket({ url, enabled, reconnectInterval: 10, onClose }),
     )!;
 
     expect(FakeWebSocket.instances).toHaveLength(0);
@@ -120,6 +128,7 @@ describe('useWebSocket', () => {
     url.value = 'https://example.test/ws/two/';
     await nextTick();
     expect(first.close).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
     expect(FakeWebSocket.instances[1]!.url).toBe('wss://example.test/ws/two/');
     vi.advanceTimersByTime(20);
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -128,7 +137,19 @@ describe('useWebSocket', () => {
     await nextTick();
     expect(api.status.value).toBe(WebSocketStatus.DISCONNECTED);
     expect(FakeWebSocket.instances[1]!.close).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
     scope.stop();
+  });
+
+  it('does not notify a disposed consumer when its socket closes', () => {
+    const onClose = vi.fn();
+    const scope = effectScope();
+    scope.run(() => useWebSocket({ url: 'ws://localhost/ws/global/', onClose }));
+    const ws = FakeWebSocket.instances[0]!;
+
+    scope.stop();
+    expect(ws.close).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('ignores malformed frames without disconnecting the socket', () => {
