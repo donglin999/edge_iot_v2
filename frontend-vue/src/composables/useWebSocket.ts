@@ -58,6 +58,9 @@ export function useWebSocket(options: UseWebSocketOptions) {
     if (disposed || !shouldConnect || !isEnabled() || !shouldReconnect()) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
+      // autoReconnect/enabled can be reactive and may change while the timer
+      // is pending. Re-check every gate at execution time before opening I/O.
+      if (disposed || !shouldConnect || !isEnabled() || !shouldReconnect()) return;
       connect();
     }, reconnectDelay());
   };

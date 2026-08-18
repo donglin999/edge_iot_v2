@@ -152,6 +152,26 @@ describe('useWebSocket', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it('cancels a pending reconnect when reactive autoReconnect becomes false', () => {
+    vi.useFakeTimers();
+    const autoReconnect = ref(true);
+    const scope = effectScope();
+    scope.run(() =>
+      useWebSocket({
+        url: 'ws://localhost/ws/global/',
+        autoReconnect,
+        reconnectInterval: 100,
+      }),
+    );
+
+    FakeWebSocket.instances[0]!.serverClose();
+    autoReconnect.value = false;
+    vi.advanceTimersByTime(100);
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    scope.stop();
+  });
+
   it('ignores malformed frames without disconnecting the socket', () => {
     const onMessage = vi.fn();
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
