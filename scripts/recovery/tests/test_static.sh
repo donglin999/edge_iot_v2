@@ -12,7 +12,6 @@ bash -n "$RECOVERY_DIR/m0_ci_drill.sh" "$SCRIPT_DIR/test_static.sh"
 python3 -m py_compile \
   "$RECOVERY_DIR/safety.py" \
   "$RECOVERY_DIR/celery_smoke.py" \
-  "$RECOVERY_DIR/dind_tls.py" \
   "$RECOVERY_DIR/evidence_io.py" \
   "$RECOVERY_DIR/image_archive.py" \
   "$RECOVERY_DIR/influx_value_check.py" \
@@ -41,13 +40,16 @@ grep -q 'O_EXCL' "$RECOVERY_DIR/evidence_io.py"
 grep -q 'O_NOFOLLOW' "$RECOVERY_DIR/evidence_io.py"
 grep -q 'docker network create --driver bridge --internal' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q -- '--memory 768m --cpus 1.50 --pids-limit 512' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q 'DOCKER_TLS_CERTDIR=/certs' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q '2376' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q 'openssl verify -CAfile /certs/client/ca.pem' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q '"$DIND_TLS" capture' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q 'docker exec "$DIND_ID" cat "/certs/client/$certificate"' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q -- '--tlsverify' "$RECOVERY_DIR/m0_ci_drill.sh"
-grep -q -- '--docker-tls-key' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'dockerd --host=unix:///var/run/docker.sock' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'docker exec "$DIND_ID" docker info' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q -- '--docker-container "$DIND_ID"' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'python3 "$SAFETY" dind-container' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'python3 "$SAFETY" dind-network' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'python3 "$SAFETY" recovery-scripts --root "$SCRIPT_DIR"' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'docker rm -f -v "$DIND_ID"' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'docker container ls -aq --no-trunc' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'docker volume ls -q' "$RECOVERY_DIR/m0_ci_drill.sh"
+grep -q 'docker network ls -q --no-trunc' "$RECOVERY_DIR/m0_ci_drill.sh"
 grep -q '_stream_load_to_docker' "$RECOVERY_DIR/image_archive.py"
 grep -q 'bytes delivered to Docker do not match archive checksum' "$RECOVERY_DIR/image_archive.py"
 grep -q 'active_queues' "$RECOVERY_DIR/m0_ci_drill.sh"

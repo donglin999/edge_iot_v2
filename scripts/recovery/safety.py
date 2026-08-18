@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import stat
@@ -13,6 +15,7 @@ from typing import Iterable, Optional, Sequence
 
 PROJECT_RE = re.compile(r"^m0ci-[a-z0-9](?:[a-z0-9-]{6,46}[a-z0-9])$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RECOVERY_SCRIPT_SHA256 = "b16868aa0f4a6b2e62328643723e2f78d285421910bb85247d1f3e8332b5f799"
 INFLUX_CLI_URL = (
     "https://dl.influxdata.com/influxdb/releases/"
     "influxdb2-client-2.7.5-linux-amd64.tar.gz"
@@ -160,10 +163,107 @@ def validate_compose_source(path_value: str) -> Path:
     return path
 
 
-def validate_recovery_scripts(root_value: str) -> Path:
-    root = Path(root_value).resolve(strict=True)
-    if not root.is_dir():
-        raise SafetyError("recovery script root must be a directory")
+def _strip_shell_comment(line: str) -> str:
+    """Remove a shell comment without treating quoted # characters as comments."""
+    quote: Optional[str] = None
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if character == '"':
+                quote = None
+            continue
+        if character in ("'", '"'):
+            quote = character
+            continue
+        if character == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
+
+
+def _shell_without_heredocs(text: str) -> str:
+    outside: list[str] = []
+    delimiter: Optional[str] = None
+    strip_tabs = False
+    heredoc = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+    for raw_line in text.splitlines(keepends=True):
+        comparable = raw_line.rstrip("\r\n")
+        if delimiter is not None:
+            candidate = comparable.lstrip("\t") if strip_tabs else comparable
+            if candidate == delimiter:
+                delimiter = None
+                strip_tabs = False
+            continue
+        outside.append(raw_line)
+        code = _strip_shell_comment(comparable)
+        matches = tuple(heredoc.finditer(code))
+        if "<<" in code.replace("<<<", "") and not matches:
+            raise SafetyError("recovery script contains an unsupported heredoc form")
+        if len(matches) > 1:
+            raise SafetyError("recovery script contains multiple heredocs in one command")
+        if matches:
+            strip_tabs = matches[0].group(1) == "-"
+            delimiter = matches[0].group(3)
+    if delimiter is not None:
+        raise SafetyError("recovery script contains an unterminated heredoc")
+    return "".join(outside)
+
+
+def _shell_logical_code(text: str) -> tuple[str, ...]:
+    joined = _shell_without_heredocs(text).replace("\\\n", " ")
+    return tuple(
+        code.strip()
+        for raw_line in joined.splitlines()
+        if (code := _strip_shell_comment(raw_line)).strip()
+    )
+
+
+def _validate_direct_dind_run(line: str) -> None:
+    """Allow one literal DinD launch whose only daemon listener is Unix."""
+    normalized = " ".join(line.split())
+    without_approved_host = normalized.replace(
+        "--host=unix:///var/run/docker.sock", ""
+    )
+    forbidden = (
+        r"(?:^|\s)-p[^\s]*",
+        r"(?:^|\s)--publish(?:\s|=|$)",
+        r"(?:^|\s)-P(?:\s|$)",
+        r"(?:^|\s)--publish-all(?:\s|=|$)",
+        r"(?:^|\s)-H[^\s]*",
+        r"(?:^|\s)--host(?:\s|=|$)",
+        r"(?:^|\s)DOCKER_HOST\s*=",
+        r"(?:^|\s)--network(?:\s+|=)host(?:\s|$)",
+        r"(?:^|\s)--entrypoint(?:\s|=|$)",
+        r"\beval\b",
+        r"\balias\b",
+        r"\b2375\b",
+        r"\b2376\b",
+        r"tcp://",
+    )
+    if any(re.search(pattern, without_approved_host) for pattern in forbidden):
+        raise SafetyError("recovery script exposes DinD instead of using internal exec")
+    expected = (
+        'DIND_ID="$(docker run -d --pull=never --privileged --name "$DIND_NAME" '
+        '--label "com.edge-iot.m0.project=$PROJECT" '
+        '--network "$DIND_NETWORK_ID" '
+        '--memory 768m --cpus 1.50 --pids-limit 512 '
+        '-e DOCKER_TLS_CERTDIR= '
+        '"$M0_DIND_IMAGE_ID" dockerd --host=unix:///var/run/docker.sock)"'
+    )
+    if normalized != expected:
+        raise SafetyError("recovery script exposes DinD instead of using internal exec")
+
+
+def _validate_recovery_script_structure(text: str) -> None:
     broad_cleanup = re.compile(
         r"\bdocker\s+(?:system|image|volume|network)\s+prune\b"
         r"|\bdocker\s+compose\s+down\b"
@@ -171,26 +271,218 @@ def validate_recovery_scripts(root_value: str) -> Path:
     unsafe_evidence_redirect = re.compile(
         r">{1,2}\s*[\"']?\$\{?EVIDENCE_ROOT\}?"
     )
-    for path in sorted(root.rglob("*.sh")):
-        relative = path.relative_to(root)
-        if "tests" in relative.parts:
-            continue
-        text = path.read_text(encoding="utf-8")
-        if broad_cleanup.search(text):
-            raise SafetyError(f"recovery script contains broad cleanup: {relative}")
-        if unsafe_evidence_redirect.search(text):
-            raise SafetyError(
-                f"recovery script bypasses exclusive evidence capture: {relative}"
-            )
-        if "2375" in text or "--tls=false" in text:
-            raise SafetyError(
-                f"recovery script contains plaintext DinD transport: {relative}"
-            )
-        if re.search(r"\bdocker[ \t]+cp\b", text):
-            raise SafetyError(
-                f"recovery script contains mutable-path DinD copy: {relative}"
-            )
+    direct_dind_runs: list[str] = []
+    logical_lines = _shell_logical_code(text)
+    code = "\n".join(logical_lines)
+    if broad_cleanup.search(code):
+        raise SafetyError("recovery script contains broad cleanup")
+    if unsafe_evidence_redirect.search(code):
+        raise SafetyError("recovery script bypasses exclusive evidence capture")
+    if (
+        "--tls=false" in code
+        or "--docker-host" in code
+        or re.search(r"\bDOCKER_HOST\s*=", code)
+        or re.search(r"\bdocker\s+(?:-H\S*|--host(?:\s|=))", code)
+    ):
+        raise SafetyError("recovery script exposes DinD instead of using internal exec")
+    if re.search(r"\bdocker[ \t]+cp\b", code):
+        raise SafetyError("recovery script contains mutable-path DinD copy")
+    for line in logical_lines:
+        if re.search(r"\bdocker[ \t]+run\b", line):
+            _validate_direct_dind_run(line)
+            direct_dind_runs.append(line)
+    if len(direct_dind_runs) != 1:
+        raise SafetyError("recovery scripts require exactly one direct internal DinD run")
+
+
+def validate_recovery_scripts(root_value: str) -> Path:
+    root = Path(root_value).resolve(strict=True)
+    if not root.is_dir():
+        raise SafetyError("recovery script root must be a directory")
+    scripts = tuple(
+        path
+        for path in sorted(root.rglob("*.sh"))
+        if "tests" not in path.relative_to(root).parts
+    )
+    if tuple(path.relative_to(root).as_posix() for path in scripts) != (
+        "m0_ci_drill.sh",
+    ):
+        raise SafetyError("recovery scripts do not match the approved executable allowlist")
+    if re.fullmatch(r"[0-9a-f]{64}", RECOVERY_SCRIPT_SHA256) is None:
+        raise SafetyError("approved recovery script digest is malformed")
+    path = scripts[0]
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise SafetyError("approved recovery script must be one regular non-symlink file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if identity != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            raise SafetyError("approved recovery script changed before it was opened")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    final_path = os.lstat(path)
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or identity != (
+        final_path.st_dev,
+        final_path.st_ino,
+        final_path.st_size,
+        final_path.st_mtime_ns,
+        final_path.st_ctime_ns,
+    ):
+        raise SafetyError("approved recovery script changed while it was read")
+    if hashlib.sha256(raw).hexdigest() != RECOVERY_SCRIPT_SHA256:
+        raise SafetyError("recovery script does not match the approved source digest")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SafetyError("recovery script must be UTF-8") from exc
+    _validate_recovery_script_structure(text)
     return root
+
+
+def validate_dind_container(
+    raw: str,
+    container_id: str,
+    image_id: str,
+    network_id: str,
+    network_name: str,
+    project: str,
+) -> str:
+    """Validate the immutable runtime facts of the isolated DinD container."""
+    validate_project(project)
+    validate_image_ids((image_id,))
+    if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+        raise SafetyError("DinD container ID must be one immutable 64-character ID")
+    if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+        raise SafetyError("DinD network ID must be one immutable 64-character ID")
+    if network_name != f"{project}-dind-net":
+        raise SafetyError("DinD network name does not match the disposable project")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SafetyError("DinD inspect JSON is invalid") from exc
+    if not isinstance(document, list) or len(document) != 1 or not isinstance(document[0], dict):
+        raise SafetyError("DinD inspect must contain exactly one container")
+    item = document[0]
+    config = item.get("Config") or {}
+    host = item.get("HostConfig") or {}
+    network_settings = item.get("NetworkSettings") or {}
+    networks = network_settings.get("Networks") or {}
+    if item.get("Id") != container_id or item.get("Image") != image_id:
+        raise SafetyError("DinD immutable container or image identity mismatch")
+    if item.get("Name") != f"/{project}-dind" or not (item.get("State") or {}).get("Running"):
+        raise SafetyError("DinD runtime name or running state mismatch")
+    if config.get("Image") != image_id:
+        raise SafetyError("DinD configured image reference is not immutable")
+    if config.get("Cmd") != ["dockerd", "--host=unix:///var/run/docker.sock"]:
+        raise SafetyError("DinD command must expose only the Unix socket")
+    if (config.get("Labels") or {}).get("com.edge-iot.m0.project") != project:
+        raise SafetyError("DinD project label mismatch")
+    if "DOCKER_TLS_CERTDIR=" not in (config.get("Env") or []):
+        raise SafetyError("DinD TLS entrypoint environment is not explicitly disabled")
+    if host.get("PublishAllPorts") is not False or host.get("PortBindings") not in (None, {}):
+        raise SafetyError("DinD must not publish host ports")
+    if (
+        host.get("Privileged") is not True
+        or host.get("Memory") != 768 * 1024 * 1024
+        or host.get("NanoCpus") != 1_500_000_000
+        or host.get("PidsLimit") != 512
+        or host.get("Binds") not in (None, [])
+    ):
+        raise SafetyError("DinD runtime isolation or resource limits mismatch")
+    if host.get("NetworkMode") != network_id:
+        raise SafetyError("DinD host network mode is not the isolated network ID")
+    if set(networks) != {network_name}:
+        raise SafetyError("DinD must join exactly one project-private network")
+    attachment = networks[network_name] or {}
+    if attachment.get("NetworkID") != network_id:
+        raise SafetyError("DinD network attachment identity mismatch")
+    mounts = item.get("Mounts") or []
+    docker_data_mounts = [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict) and mount.get("Destination") == "/var/lib/docker"
+    ]
+    if len(mounts) != 1 or len(docker_data_mounts) != 1:
+        raise SafetyError("DinD must have one disposable Docker data volume")
+    docker_data = docker_data_mounts[0]
+    volume_name = docker_data.get("Name")
+    if (
+        docker_data.get("Type") != "volume"
+        or not isinstance(volume_name, str)
+        or re.fullmatch(r"[0-9a-f]{64}", volume_name) is None
+    ):
+        raise SafetyError("DinD Docker data mount is not one anonymous volume")
+    return volume_name
+
+
+def validate_dind_network(
+    raw: str,
+    network_id: str,
+    network_name: str,
+    container_id: str,
+    project: str,
+) -> None:
+    """Validate the actual disposable network rather than trusting shell text."""
+    validate_project(project)
+    if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+        raise SafetyError("DinD network ID must be one immutable 64-character ID")
+    if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+        raise SafetyError("DinD container ID must be one immutable 64-character ID")
+    if network_name != f"{project}-dind-net":
+        raise SafetyError("DinD network name does not match the disposable project")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SafetyError("DinD network inspect JSON is invalid") from exc
+    if not isinstance(document, list) or len(document) != 1 or not isinstance(document[0], dict):
+        raise SafetyError("DinD network inspect must contain exactly one network")
+    item = document[0]
+    labels = item.get("Labels") or {}
+    containers = item.get("Containers") or {}
+    if item.get("Id") != network_id or item.get("Name") != network_name:
+        raise SafetyError("DinD network immutable identity mismatch")
+    if (
+        item.get("Driver") != "bridge"
+        or item.get("Scope") != "local"
+        or item.get("Internal") is not True
+        or item.get("Attachable") is not False
+        or item.get("Ingress") is not False
+    ):
+        raise SafetyError("DinD network is not one local internal bridge")
+    if labels.get("com.edge-iot.m0.project") != project:
+        raise SafetyError("DinD network project label mismatch")
+    if set(containers) != {container_id}:
+        raise SafetyError("DinD network must contain exactly the isolated daemon")
+    if (containers[container_id] or {}).get("Name") != f"{project}-dind":
+        raise SafetyError("DinD network container name mismatch")
 
 
 def _dockerfile_instructions(text: str) -> tuple[str, ...]:
@@ -255,6 +547,17 @@ def build_parser() -> argparse.ArgumentParser:
     compose.add_argument("path")
     scripts = subparsers.add_parser("recovery-scripts")
     scripts.add_argument("--root", required=True)
+    dind = subparsers.add_parser("dind-container")
+    dind.add_argument("--container-id", required=True)
+    dind.add_argument("--image-id", required=True)
+    dind.add_argument("--network-id", required=True)
+    dind.add_argument("--network-name", required=True)
+    dind.add_argument("--project", required=True)
+    dind_network = subparsers.add_parser("dind-network")
+    dind_network.add_argument("--network-id", required=True)
+    dind_network.add_argument("--network-name", required=True)
+    dind_network.add_argument("--container-id", required=True)
+    dind_network.add_argument("--project", required=True)
     tool = subparsers.add_parser("tool-dockerfile")
     tool.add_argument("path")
     return parser
@@ -275,6 +578,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             validate_compose_source(args.path)
         elif args.command == "recovery-scripts":
             validate_recovery_scripts(args.root)
+        elif args.command == "dind-container":
+            print(
+                validate_dind_container(
+                    sys.stdin.read(),
+                    args.container_id,
+                    args.image_id,
+                    args.network_id,
+                    args.network_name,
+                    args.project,
+                )
+            )
+        elif args.command == "dind-network":
+            validate_dind_network(
+                sys.stdin.read(),
+                args.network_id,
+                args.network_name,
+                args.container_id,
+                args.project,
+            )
         elif args.command == "tool-dockerfile":
             validate_recovery_tool_dockerfile(args.path)
         else:  # pragma: no cover - argparse makes this unreachable.

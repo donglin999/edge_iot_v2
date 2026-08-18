@@ -9,13 +9,15 @@
 ## 隔离边界
 
 - Compose project 必须匹配 `m0ci-…` 且在启动前不存在任何同 project 容器、卷或网络。
+- 真正执行前会对唯一的非测试 Shell 入口 `m0_ci_drill.sh` 原始字节做已审 SHA-256 冻结校验；
+  这是“源码发生任何变化就必须重新审查并更新摘要”的完整性回归门禁，不宣称能推导任意 Shell 语义。
 - Compose 文件不允许 `container_name`、`network_mode: host` 或 external resource；应用网络是
   `internal: true` 的 bridge。DinD 另建仅属于本 project 的 internal bridge，并在结束时按
-  Docker 返回的 network ID 精确删除。DinD 只发布 loopback TLS 2376；入口自动生成的客户端
-  CA/cert/key 通过 `docker exec cat` 的 stdout 直接写入 evidence 外 project 私有 `0700` 目录中
-  预先以 `O_EXCL|O_NOFOLLOW` 创建并持有的 `0600` FD；采集前后复核目录及文件
-  device/inode/mode/size/nlink 和 PEM 边界。客户端强制 `--tlsverify`，结束时按目录
-  device/inode 精确清理。
+  Docker 返回的 network ID 精确删除。DinD 不发布任何宿主端口，只监听容器内 Unix socket；
+  held-fd 镜像流通过宿主 `docker exec -i <immutable-container-id> docker image load` 送入该 socket。
+  container ID 必须是 `docker run` 返回的完整 64 位 immutable ID，不接受可变容器名，也不落盘
+  客户端证书或暴露远程 Docker API。启动后还会核对实际 image/command/label/空 port binding/唯一
+  network；退出时使用精确 container ID 和 `rm -v` 删除 `/var/lib/docker` 匿名卷并验证它已不存在。
 - Web 与 Influx 的随机宿主端口只绑定 `127.0.0.1`。Redis、Django、Celery 不发布端口。
 - SQLite、Influx data/config 都使用 project 私有新卷。退出 trap 只删除这个已验证 project
   的资源，从不调用 prune，也不按模糊名称删除资源。
@@ -42,7 +44,8 @@
    scope 文档；Linux 使用 `linkat(fd)`、Darwin 使用 `fclonefileat(fd)`，不解析可变 staging
    pathname。load 时从同一个 held fd 分块读取，每块在写入 Docker stdin 的同时更新 SHA-256；
    最终流摘要必须与 scope 文档一致，避免“加载攻击字节后再把源文件恢复”的前后哈希绕过。
-   该流通过双向 TLS 送入独立、空白 DinD daemon，并逐个 inspect 原 ID。
+   该流通过 internal network 上无宿主端口的 `docker exec -i` 送入独立、空白 DinD daemon，
+   并逐个 inspect 原 ID。
 5. 用恢复后的 SQLite、恢复后的 Influx bucket 以及 SHA-pinned backend/web/Redis 启动回滚栈。
    对每个运行容器重新核对顶层 `.Image`。
 6. 经 Nginx 真实执行 SPA HTTP、Site/Session/DataPoint/Alarm API、RFC 6455 WebSocket upgrade
@@ -53,7 +56,7 @@
 
 成功证据在 runner-local `summary.json` 汇总；SQLite/Influx wrapper 报告、archive checksum、
 DinD load 报告、静态事实源 smoke 报告以及大体积镜像 tar 都只存在于本次 runner 的私有
-evidence 目录。workflow 不调用 artifact uploader，因而 token、TLS material、数据库、tar、
+evidence 目录。workflow 不调用 artifact uploader，因而 token、数据库、tar、
 hardlink/别名或报告元数据都没有 GitHub Actions artifact 上传边界；CI 日志只输出门禁成功/失败
 状态。Influx restore wrapper 按安全设计保留只读 restore staging，随 project/evidence 生命周期
 结束，不会触碰源 bucket。

@@ -7,7 +7,6 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.m0-ci.yml"
 SAFETY="$SCRIPT_DIR/safety.py"
 EVIDENCE_IO="$SCRIPT_DIR/evidence_io.py"
-DIND_TLS="$SCRIPT_DIR/dind_tls.py"
 
 usage() {
   echo "usage: $0 --project m0ci-<unique> --evidence <new-path> --allowed-root <private-root>" >&2
@@ -39,6 +38,7 @@ for variable in "${required_variables[@]}"; do
   test -n "${!variable:-}" || { echo "SAFETY ERROR: $variable is required" >&2; exit 2; }
 done
 
+python3 "$SAFETY" recovery-scripts --root "$SCRIPT_DIR"
 python3 "$SAFETY" project "$PROJECT"
 python3 "$SAFETY" images \
   "$M0_BACKEND_IMAGE_ID" "$M0_WEB_IMAGE_ID" "$M0_REDIS_IMAGE_ID" \
@@ -91,11 +91,6 @@ if docker network inspect "$DIND_NETWORK_NAME" >/dev/null 2>&1; then
   echo "SAFETY ERROR: disposable DinD network already exists" >&2
   exit 2
 fi
-DIND_CERT_ROOT="$ALLOWED_ROOT/.${PROJECT}.dind-client"
-if test -e "$DIND_CERT_ROOT" || test -L "$DIND_CERT_ROOT"; then
-  echo "SAFETY ERROR: disposable DinD client TLS path already exists" >&2
-  exit 2
-fi
 M0_TOKEN_FILE="$ALLOWED_ROOT/.${PROJECT}.influx.token"
 if test -e "$M0_TOKEN_FILE" || test -L "$M0_TOKEN_FILE"; then
   echo "SAFETY ERROR: disposable token path already exists" >&2
@@ -108,8 +103,7 @@ export COMPOSE_PROJECT_NAME="$PROJECT"
 compose=(docker compose -p "$PROJECT" -f "$COMPOSE_FILE")
 DIND_ID=""
 DIND_NETWORK_ID=""
-DIND_CERT_DEVICE=""
-DIND_CERT_INODE=""
+DIND_VOLUME_NAME=""
 STACK_STARTED=0
 TOKEN_DEVICE=""
 TOKEN_INODE=""
@@ -140,32 +134,65 @@ try:
         and metadata.st_ino == int(expected_inode)
     ):
         os.unlink(path)
-except OSError:
-    pass
+    else:
+        raise SystemExit("token path identity changed; refusing path cleanup")
+except FileNotFoundError:
+    raise SystemExit(0)
+if os.path.lexists(path):
+    raise SystemExit("token path survived cleanup")
 PY
 }
 
-cleanup_dind_certs() {
-  if test -n "$DIND_CERT_DEVICE" && test -n "$DIND_CERT_INODE"; then
-    python3 "$DIND_TLS" cleanup \
-      --path "$DIND_CERT_ROOT" \
-      --device "$DIND_CERT_DEVICE" --inode "$DIND_CERT_INODE"
-  fi
-}
-
 cleanup() {
+  local original_status=$?
+  local cleanup_failed=0
+  local remaining=""
+  local compose_containers=""
+  local compose_volumes=""
+  local compose_networks=""
   set +e
   if test -n "$DIND_ID"; then
-    docker rm -f "$DIND_ID" >/dev/null 2>&1
+    # docker:dind declares /var/lib/docker as a VOLUME.  Removing the
+    # container with -v is required to remove that project-private anonymous
+    # volume and the rollback images it contains.
+    docker rm -f -v "$DIND_ID" >/dev/null 2>&1 || cleanup_failed=1
+    remaining="$(docker container ls -aq --no-trunc)" || cleanup_failed=1
+    if printf '%s\n' "$remaining" | grep -Fqx -- "$DIND_ID"; then
+      echo "SAFETY ERROR: disposable DinD container survived cleanup" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if test -n "$DIND_VOLUME_NAME"; then
+    remaining="$(docker volume ls -q)" || cleanup_failed=1
+    if printf '%s\n' "$remaining" | grep -Fqx -- "$DIND_VOLUME_NAME"; then
+      echo "SAFETY ERROR: disposable DinD data volume survived cleanup" >&2
+      cleanup_failed=1
+    fi
   fi
   if test -n "$DIND_NETWORK_ID"; then
-    docker network rm "$DIND_NETWORK_ID" >/dev/null 2>&1
+    docker network rm "$DIND_NETWORK_ID" >/dev/null 2>&1 || cleanup_failed=1
+    remaining="$(docker network ls -q --no-trunc)" || cleanup_failed=1
+    if printf '%s\n' "$remaining" | grep -Fqx -- "$DIND_NETWORK_ID"; then
+      echo "SAFETY ERROR: disposable DinD network survived cleanup" >&2
+      cleanup_failed=1
+    fi
   fi
   if test "$STACK_STARTED" = "1"; then
-    "${compose[@]}" --profile prep --profile tools down --volumes --remove-orphans >/dev/null 2>&1
+    "${compose[@]}" --profile prep --profile tools down --volumes --remove-orphans >/dev/null 2>&1 || cleanup_failed=1
+    compose_containers="$(docker ps -aq --no-trunc --filter "label=com.docker.compose.project=$PROJECT")" || cleanup_failed=1
+    compose_volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")" || cleanup_failed=1
+    compose_networks="$(docker network ls -q --no-trunc --filter "label=com.docker.compose.project=$PROJECT")" || cleanup_failed=1
+    if test -n "$compose_containers" || test -n "$compose_volumes" || test -n "$compose_networks"; then
+      echo "SAFETY ERROR: disposable Compose resources survived cleanup" >&2
+      cleanup_failed=1
+    fi
   fi
-  cleanup_dind_certs
-  cleanup_token
+  cleanup_token || cleanup_failed=1
+  if test "$cleanup_failed" = "1"; then
+    original_status=1
+  fi
+  trap - EXIT
+  exit "$original_status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -301,9 +328,6 @@ run_evidence image-save-report.json python3 "$SCRIPT_DIR/image_archive.py" save 
   --image-id "$M0_WEB_IMAGE_ID" \
   --image-id "$M0_REDIS_IMAGE_ID"
 
-DIND_CERT_IDENTITY="$(python3 "$DIND_TLS" create \
-  --path "$DIND_CERT_ROOT" --allowed-root "$ALLOWED_ROOT")"
-read -r DIND_CERT_DEVICE DIND_CERT_INODE <<< "$DIND_CERT_IDENTITY"
 DIND_NETWORK_ID="$(docker network create --driver bridge --internal \
   --label "com.edge-iot.m0.project=$PROJECT" "$DIND_NETWORK_NAME")"
 test -n "$DIND_NETWORK_ID"
@@ -311,64 +335,27 @@ DIND_ID="$(docker run -d --pull=never --privileged --name "$DIND_NAME" \
   --label "com.edge-iot.m0.project=$PROJECT" \
   --network "$DIND_NETWORK_ID" \
   --memory 768m --cpus 1.50 --pids-limit 512 \
-  -p 127.0.0.1::2376 -e DOCKER_TLS_CERTDIR=/certs \
-  "$M0_DIND_IMAGE_ID")"
+  -e DOCKER_TLS_CERTDIR= \
+  "$M0_DIND_IMAGE_ID" \
+  dockerd --host=unix:///var/run/docker.sock)"
 test -n "$DIND_ID"
-TLS_READY=0
+DIND_VOLUME_NAME="$(docker container inspect "$DIND_ID" | python3 "$SAFETY" dind-container \
+  --container-id "$DIND_ID" --image-id "$M0_DIND_IMAGE_ID" \
+  --network-id "$DIND_NETWORK_ID" --network-name "$DIND_NETWORK_NAME" \
+  --project "$PROJECT")"
+test -n "$DIND_VOLUME_NAME"
+docker network inspect "$DIND_NETWORK_ID" | python3 "$SAFETY" dind-network \
+  --network-id "$DIND_NETWORK_ID" --network-name "$DIND_NETWORK_NAME" \
+  --container-id "$DIND_ID" --project "$PROJECT"
 for _attempt in $(seq 1 60); do
-  if docker exec "$DIND_ID" sh -ec '
-    test -s /certs/client/ca.pem
-    test -s /certs/client/cert.pem
-    test -s /certs/client/key.pem
-    openssl verify -CAfile /certs/client/ca.pem /certs/client/cert.pem >/dev/null
-    openssl pkey -in /certs/client/key.pem -noout >/dev/null
-  ' >/dev/null 2>&1; then
-    TLS_READY=1
-    break
-  fi
+  if docker exec "$DIND_ID" docker info >/dev/null 2>&1; then break; fi
   sleep 1
 done
-test "$TLS_READY" = "1"
-# Capture only the documented client set directly into held, exclusive files;
-# CA/server private material remains in the disposable container and is
-# destroyed with it.
-for certificate in ca.pem cert.pem key.pem; do
-  python3 "$DIND_TLS" capture \
-    --path "$DIND_CERT_ROOT" \
-    --device "$DIND_CERT_DEVICE" --inode "$DIND_CERT_INODE" \
-    --name "$certificate" -- \
-    docker exec "$DIND_ID" cat "/certs/client/$certificate"
-done
-python3 "$DIND_TLS" secure \
-  --path "$DIND_CERT_ROOT" \
-  --device "$DIND_CERT_DEVICE" --inode "$DIND_CERT_INODE"
-
-DIND_BINDING="$(docker port "$DIND_ID" 2376/tcp | awk 'NR == 1 {print; exit}')"
-case "$DIND_BINDING" in
-  127.0.0.1:*) ;;
-  *) echo "ERROR: DinD TLS port is not loopback-bound" >&2; exit 2 ;;
-esac
-DIND_PORT="${DIND_BINDING##*:}"
-test -n "$DIND_PORT"
-DIND_HOST="tcp://127.0.0.1:$DIND_PORT"
-dind_docker=(
-  docker --host "$DIND_HOST" --tlsverify
-  --tlscacert "$DIND_CERT_ROOT/ca.pem"
-  --tlscert "$DIND_CERT_ROOT/cert.pem"
-  --tlskey "$DIND_CERT_ROOT/key.pem"
-)
-for _attempt in $(seq 1 60); do
-  if "${dind_docker[@]}" info >/dev/null 2>&1; then break; fi
-  sleep 1
-done
-"${dind_docker[@]}" info >/dev/null
+docker exec "$DIND_ID" docker info >/dev/null
 run_evidence image-load-report.json python3 "$SCRIPT_DIR/image_archive.py" load \
   --path "$EVIDENCE_ROOT/rollback-images.tar" \
   --checksum "$EVIDENCE_ROOT/rollback-images.sha256.json" \
-  --docker-host "$DIND_HOST" \
-  --docker-tls-ca "$DIND_CERT_ROOT/ca.pem" \
-  --docker-tls-cert "$DIND_CERT_ROOT/cert.pem" \
-  --docker-tls-key "$DIND_CERT_ROOT/key.pem"
+  --docker-container "$DIND_ID"
 
 "${compose[@]}" up -d --wait django celery-acq celery-short web
 for service in redis influx django celery-acq celery-short web; do

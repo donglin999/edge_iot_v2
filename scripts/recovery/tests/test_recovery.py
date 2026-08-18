@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -27,7 +28,6 @@ def load_module(name: str, filename: str):
 safety = load_module("m0_safety", "safety.py")
 sys.modules["safety"] = safety
 evidence_io = load_module("m0_evidence_io", "evidence_io.py")
-dind_tls = load_module("m0_dind_tls", "dind_tls.py")
 archive = load_module("m0_image_archive", "image_archive.py")
 smoke = load_module("m0_stack_smoke", "stack_smoke.py")
 celery_smoke = load_module("m0_celery_smoke", "celery_smoke.py")
@@ -132,9 +132,9 @@ class SafetyTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(completed.returncode, 2)
-            self.assertIn("broad cleanup", completed.stderr)
+            self.assertIn("approved executable allowlist", completed.stderr)
 
-    def test_static_scan_rejects_unsafe_evidence_and_plaintext_dind(self):
+    def test_static_scan_rejects_unsafe_evidence_and_exposed_dind(self):
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             script = root / "unsafe.sh"
@@ -145,7 +145,32 @@ class SafetyTests(unittest.TestCase):
                     + "23"
                     + "75 image --tls="
                     + "false\n",
-                    "plaintext",
+                    "internal exec",
+                ),
+                ("docker --host=tcp://127.0.0.1:42376 info\n", "internal exec"),
+                ("tool --docker-host tcp://127.0.0.1:42376\n", "internal exec"),
+                ("docker run -P image\n", "internal exec"),
+                ("docker run -p127.0.0.1::42376 image\n", "internal exec"),
+                ("docker run --publish=127.0.0.1::42376 image\n", "internal exec"),
+                ("docker run --publish-all image\n", "internal exec"),
+                ("docker run -H tcp://127.0.0.1:42376 image\n", "internal exec"),
+                ("docker run --host tcp://127.0.0.1:42376 image\n", "internal exec"),
+                ("docker run --network host image\n", "internal exec"),
+                ("DOCKER_HOST=tcp://127.0.0.1:42376 docker run image\n", "internal exec"),
+                ("docker run \"$M0_DIND_IMAGE_ID\"\n", "internal exec"),
+                (
+                    "DIND_FLAGS=(-P)\n"
+                    "docker run \"${DIND_FLAGS[@]}\" \"$M0_DIND_IMAGE_ID\" "
+                    "dockerd --host=unix:///var/run/docker.sock\n",
+                    "internal exec",
+                ),
+                (
+                    "launch() { DIND_ID=\"$(docker run -d --pull=never --privileged "
+                    "--name \"$DIND_NAME\" --label \"com.edge-iot.m0.project=$PROJECT\" "
+                    "--network \"$DIND_NETWORK_ID\" --memory 768m --cpus 1.50 "
+                    "--pids-limit 512 -e DOCKER_TLS_CERTDIR= \"$M0_DIND_IMAGE_ID\" "
+                    "dockerd --host=unix:///var/run/docker.sock)\"; }\n",
+                    "internal exec",
                 ),
                 ("docker cp container:/cert.pem client.pem\n", "mutable-path"),
             )
@@ -153,7 +178,217 @@ class SafetyTests(unittest.TestCase):
                 with self.subTest(message=message):
                     script.write_text("#!/bin/sh\n" + source, encoding="utf-8")
                     with self.assertRaisesRegex(safety.SafetyError, message):
+                        safety._validate_recovery_script_structure(
+                            script.read_text(encoding="utf-8")
+                        )
+
+    def test_static_scan_accepts_canonical_run_and_ignores_comment_text(self):
+        canonical = (
+            'DIND_ID="$(docker run -d --pull=never --privileged --name "$DIND_NAME" '
+            '--label "com.edge-iot.m0.project=$PROJECT" '
+            '--network "$DIND_NETWORK_ID" --memory 768m --cpus 1.50 '
+            '--pids-limit 512 -e DOCKER_TLS_CERTDIR= "$M0_DIND_IMAGE_ID" '
+            'dockerd --host=unix:///var/run/docker.sock)"\n'
+        )
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            script = root / "recovery.sh"
+            script.write_text(
+                "#!/bin/sh\n# historical port 2375 is intentionally not used\n" + canonical,
+                encoding="utf-8",
+            )
+            safety._validate_recovery_script_structure(
+                script.read_text(encoding="utf-8")
+            )
+
+            script.write_text(
+                "#!/bin/sh\ncat <<'EOF'\n" + canonical + "EOF\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(safety.SafetyError, "exactly one"):
+                safety._validate_recovery_script_structure(
+                    script.read_text(encoding="utf-8")
+                )
+
+    def test_recovery_script_source_digest_and_file_set_are_frozen(self):
+        source = (RECOVERY_ROOT / "m0_ci_drill.sh").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(source).hexdigest(), safety.RECOVERY_SCRIPT_SHA256
+        )
+        self.assertEqual(
+            safety.validate_recovery_scripts(str(RECOVERY_ROOT)),
+            RECOVERY_ROOT.resolve(),
+        )
+        mutations = (
+            b"\n# changed comment\n",
+            b"\necho 'docker run -P is forbidden'\n",
+            b'\nx=(docker); x+=(run); "${x[@]}" -P image\n',
+            b"\n. ./external-recovery.sh\n",
+            b"\neval 'docker run -P image'\n",
+            b"\nbash <<'PAYLOAD'\ndocker run -P image\nPAYLOAD\n",
+        )
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            script = root / "m0_ci_drill.sh"
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    script.write_bytes(source + mutation)
+                    with self.assertRaisesRegex(safety.SafetyError, "source digest"):
                         safety.validate_recovery_scripts(str(root))
+
+            script.write_bytes(source)
+            extra = root / "second.sh"
+            extra.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            with self.assertRaisesRegex(safety.SafetyError, "executable allowlist"):
+                safety.validate_recovery_scripts(str(root))
+            extra.unlink()
+            script.unlink()
+            script.symlink_to(RECOVERY_ROOT / "m0_ci_drill.sh")
+            with self.assertRaisesRegex(safety.SafetyError, "regular non-symlink"):
+                safety.validate_recovery_scripts(str(root))
+
+    def test_dind_runtime_inspect_is_exact_and_returns_anonymous_volume(self):
+        project = "m0ci-run-123456"
+        container_id = "c" * 64
+        image_id = "sha256:" + "a" * 64
+        network_id = "e" * 64
+        network_name = f"{project}-dind-net"
+        volume_name = "f" * 64
+        document = [
+            {
+                "Id": container_id,
+                "Image": image_id,
+                "Name": f"/{project}-dind",
+                "State": {"Running": True},
+                "Config": {
+                    "Image": image_id,
+                    "Cmd": ["dockerd", "--host=unix:///var/run/docker.sock"],
+                    "Env": ["PATH=/usr/local/bin", "DOCKER_TLS_CERTDIR="],
+                    "Labels": {"com.edge-iot.m0.project": project},
+                },
+                "HostConfig": {
+                    "PublishAllPorts": False,
+                    "PortBindings": {},
+                    "NetworkMode": network_id,
+                    "Privileged": True,
+                    "Memory": 768 * 1024 * 1024,
+                    "NanoCpus": 1_500_000_000,
+                    "PidsLimit": 512,
+                    "Binds": None,
+                },
+                "NetworkSettings": {
+                    "Networks": {network_name: {"NetworkID": network_id}}
+                },
+                "Mounts": [
+                    {
+                        "Type": "volume",
+                        "Name": volume_name,
+                        "Destination": "/var/lib/docker",
+                    }
+                ],
+            }
+        ]
+        raw = json.dumps(document)
+        self.assertEqual(
+            safety.validate_dind_container(
+                raw, container_id, image_id, network_id, network_name, project
+            ),
+            volume_name,
+        )
+        mutations = (
+            ("command", lambda item: item["Config"].update(Cmd=["dockerd", "-H", "tcp://0.0.0.0:2375"])),
+            ("publish all", lambda item: item["HostConfig"].update(PublishAllPorts=True)),
+            (
+                "binding",
+                lambda item: item["HostConfig"].update(
+                    PortBindings={"2375/tcp": [{"HostPort": "42375"}]}
+                ),
+            ),
+            ("host network", lambda item: item["HostConfig"].update(NetworkMode="host")),
+            (
+                "extra network",
+                lambda item: item["NetworkSettings"]["Networks"].update(
+                    extra={"NetworkID": "b" * 64}
+                ),
+            ),
+            ("wrong image", lambda item: item.update(Image="sha256:" + "b" * 64)),
+            ("wrong label", lambda item: item["Config"]["Labels"].update({"com.edge-iot.m0.project": "wrong"})),
+            ("bind mount", lambda item: item["Mounts"][0].update(Type="bind")),
+            (
+                "extra mount",
+                lambda item: item["Mounts"].append(
+                    {"Type": "bind", "Source": "/", "Destination": "/host"}
+                ),
+            ),
+            ("resource drift", lambda item: item["HostConfig"].update(PidsLimit=0)),
+        )
+        for label, mutate in mutations:
+            candidate = json.loads(raw)
+            mutate(candidate[0])
+            with self.subTest(label=label), self.assertRaises(safety.SafetyError):
+                safety.validate_dind_container(
+                    json.dumps(candidate),
+                    container_id,
+                    image_id,
+                    network_id,
+                    network_name,
+                    project,
+                )
+
+    def test_dind_runtime_network_is_exact_and_internal(self):
+        project = "m0ci-run-123456"
+        container_id = "c" * 64
+        network_id = "e" * 64
+        network_name = f"{project}-dind-net"
+        document = [
+            {
+                "Id": network_id,
+                "Name": network_name,
+                "Driver": "bridge",
+                "Scope": "local",
+                "Internal": True,
+                "Attachable": False,
+                "Ingress": False,
+                "Labels": {"com.edge-iot.m0.project": project},
+                "Containers": {
+                    container_id: {"Name": f"{project}-dind"}
+                },
+            }
+        ]
+        raw = json.dumps(document)
+        safety.validate_dind_network(
+            raw, network_id, network_name, container_id, project
+        )
+        mutations = (
+            ("not internal", lambda item: item.update(Internal=False)),
+            ("wrong driver", lambda item: item.update(Driver="overlay")),
+            ("wrong scope", lambda item: item.update(Scope="swarm")),
+            ("attachable", lambda item: item.update(Attachable=True)),
+            ("ingress", lambda item: item.update(Ingress=True)),
+            (
+                "wrong label",
+                lambda item: item["Labels"].update(
+                    {"com.edge-iot.m0.project": "wrong"}
+                ),
+            ),
+            (
+                "extra container",
+                lambda item: item["Containers"].update(
+                    {"d" * 64: {"Name": "intruder"}}
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            candidate = json.loads(raw)
+            mutate(candidate[0])
+            with self.subTest(label=label), self.assertRaises(safety.SafetyError):
+                safety.validate_dind_network(
+                    json.dumps(candidate),
+                    network_id,
+                    network_name,
+                    container_id,
+                    project,
+                )
 
     def test_recovery_tool_uses_one_pinned_verified_cli(self):
         source_path = RECOVERY_ROOT / "Dockerfile.tool"
@@ -406,76 +641,6 @@ class EvidenceIOTests(unittest.TestCase):
             self.assertEqual((root / "inherited.txt").stat().st_mode & 0o777, 0o600)
 
 
-class DinDTLSTests(unittest.TestCase):
-    PEM = b"-----BEGIN TEST-----\nvalue\n-----END TEST-----\n"
-
-    def _capture_command(self):
-        return [
-            sys.executable,
-            "-c",
-            "import sys; sys.stdout.buffer.write(" + repr(self.PEM) + ")",
-        ]
-
-    def test_client_material_is_private_regular_pem(self):
-        with tempfile.TemporaryDirectory() as raw_root:
-            allowed = Path(raw_root)
-            os.chmod(allowed, 0o700)
-            path = allowed / ".m0ci-run-123456.dind-client"
-            identity = dind_tls.create_directory(str(path), str(allowed))
-            for name in dind_tls.REQUIRED_FILES:
-                dind_tls.capture_client_file(
-                    path,
-                    identity,
-                    name,
-                    self._capture_command(),
-                )
-            dind_tls.secure_client_files(path, identity)
-            for name in dind_tls.REQUIRED_FILES:
-                self.assertEqual((path / name).stat().st_mode & 0o777, 0o600)
-                self.assertEqual((path / name).stat().st_nlink, 1)
-                self.assertEqual((path / name).read_bytes(), self.PEM)
-            dind_tls.cleanup_directory(path, identity)
-            self.assertFalse(path.exists())
-
-    def test_capture_rejects_precreated_symlink_before_command(self):
-        with tempfile.TemporaryDirectory() as raw_root:
-            allowed = Path(raw_root)
-            os.chmod(allowed, 0o700)
-            path = allowed / ".m0ci-run-123456.dind-client"
-            identity = dind_tls.create_directory(str(path), str(allowed))
-            victim = allowed / "victim-key"
-            victim.write_text("private-victim", encoding="utf-8")
-            os.chmod(victim, 0o640)
-            (path / "key.pem").symlink_to(victim)
-            with mock.patch.object(dind_tls.subprocess, "run") as run:
-                with self.assertRaises(dind_tls.TLSMaterialError):
-                    dind_tls.capture_client_file(
-                        path, identity, "key.pem", self._capture_command()
-                    )
-                run.assert_not_called()
-            self.assertEqual(victim.read_text(encoding="utf-8"), "private-victim")
-            self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
-
-    def test_capture_rejects_precreated_hardlink_before_command(self):
-        with tempfile.TemporaryDirectory() as raw_root:
-            allowed = Path(raw_root)
-            os.chmod(allowed, 0o700)
-            path = allowed / ".m0ci-run-123456.dind-client"
-            identity = dind_tls.create_directory(str(path), str(allowed))
-            victim = allowed / "victim-cert"
-            victim.write_bytes(b"must-not-change")
-            os.chmod(victim, 0o640)
-            os.link(victim, path / "cert.pem")
-            with mock.patch.object(dind_tls.subprocess, "run") as run:
-                with self.assertRaises(dind_tls.TLSMaterialError):
-                    dind_tls.capture_client_file(
-                        path, identity, "cert.pem", self._capture_command()
-                    )
-                run.assert_not_called()
-            self.assertEqual(victim.read_bytes(), b"must-not-change")
-            self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
-
-
 class WorkflowBoundaryTests(unittest.TestCase):
     def test_runner_local_evidence_has_no_artifact_uploader(self):
         workflow = (
@@ -527,7 +692,7 @@ class ArchiveTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
-    def test_docker_tls_client_options_are_complete_and_explicit(self):
+    def test_remote_or_implicit_docker_load_is_rejected(self):
         arguments = argparse.Namespace(
             docker_bin="docker",
             docker_host="tcp://127.0.0.1:42376",
@@ -535,13 +700,29 @@ class ArchiveTests(unittest.TestCase):
             docker_tls_cert="/private/cert.pem",
             docker_tls_key="/private/key.pem",
         )
-        command = archive._docker_base_command(arguments)
-        self.assertEqual(command[0:3], ["docker", "--host", arguments.docker_host])
-        self.assertIn("--tlsverify", command)
-        self.assertEqual(command[command.index("--tlskey") + 1], "/private/key.pem")
+        with self.assertRaisesRegex(archive.ArchiveError, "remote Docker"):
+            archive._docker_base_command(arguments)
 
+        arguments.docker_host = None
+        arguments.docker_tls_ca = None
+        arguments.docker_tls_cert = None
         arguments.docker_tls_key = None
-        with self.assertRaisesRegex(archive.ArchiveError, "required together"):
+        with self.assertRaisesRegex(archive.ArchiveError, "container is required"):
+            archive._docker_base_command(arguments)
+
+    def test_docker_exec_uses_one_immutable_container_without_network_transport(self):
+        container_id = "d" * 64
+        arguments = argparse.Namespace(
+            docker_bin="docker",
+            docker_container=container_id,
+        )
+        self.assertEqual(
+            archive._docker_base_command(arguments),
+            ["docker", "exec", "-i", container_id, "docker"],
+        )
+
+        arguments.docker_container = "mutable-name"
+        with self.assertRaisesRegex(archive.ArchiveError, "immutable container ID"):
             archive._docker_base_command(arguments)
 
     def test_fake_docker_archive_save_and_independent_load(self):
@@ -567,7 +748,7 @@ class ArchiveTests(unittest.TestCase):
                     path=str(archive_path),
                     checksum=str(checksum_path),
                     docker_bin=str(docker),
-                    docker_host="tcp://127.0.0.1:42376",
+                    docker_container="d" * 64,
                     timeout=10.0,
                 )
             )
@@ -581,7 +762,7 @@ class ArchiveTests(unittest.TestCase):
                         path=str(archive_path),
                         checksum=str(checksum_path),
                         docker_bin=str(docker),
-                        docker_host="tcp://127.0.0.1:42376",
+                        docker_container="d" * 64,
                         timeout=10.0,
                     )
                 )

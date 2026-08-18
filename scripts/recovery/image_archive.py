@@ -20,6 +20,7 @@ from typing import Optional, Sequence
 
 
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ArchiveError(RuntimeError):
@@ -254,29 +255,20 @@ def _stream_load_to_docker(
 
 
 def _docker_base_command(args: argparse.Namespace) -> list[str]:
-    command = [args.docker_bin]
-    if args.docker_host:
-        command += ["--host", args.docker_host]
-    tls_values = (
+    docker_container = getattr(args, "docker_container", None)
+    remote_values = (
+        getattr(args, "docker_host", None),
         getattr(args, "docker_tls_ca", None),
         getattr(args, "docker_tls_cert", None),
         getattr(args, "docker_tls_key", None),
     )
-    if any(tls_values):
-        if not all(tls_values):
-            raise ArchiveError("all Docker TLS client files are required together")
-        if not args.docker_host:
-            raise ArchiveError("Docker TLS client files require an explicit host")
-        command += [
-            "--tlsverify",
-            "--tlscacert",
-            tls_values[0],
-            "--tlscert",
-            tls_values[1],
-            "--tlskey",
-            tls_values[2],
-        ]
-    return command
+    if any(remote_values):
+        raise ArchiveError("remote Docker transport is not supported")
+    if not docker_container:
+        raise ArchiveError("Docker container is required for isolated archive load")
+    if CONTAINER_ID_RE.fullmatch(docker_container) is None:
+        raise ArchiveError("Docker container must be one immutable container ID")
+    return [args.docker_bin, "exec", "-i", docker_container, "docker"]
 
 
 def _ctypes_function(name: str):
@@ -563,10 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
         if command == "save":
             child.add_argument("--image-id", action="append", required=True)
         else:
-            child.add_argument("--docker-host")
-            child.add_argument("--docker-tls-ca")
-            child.add_argument("--docker-tls-cert")
-            child.add_argument("--docker-tls-key")
+            child.add_argument("--docker-container", required=True)
     return parser
 
 
