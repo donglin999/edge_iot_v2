@@ -14,9 +14,7 @@ import {
   Alert as AAlert,
   Button as AButton,
   Card as ACard,
-  Col as ACol,
   Empty as AEmpty,
-  Row as ARow,
   Statistic as AStatistic,
   Table as ATable,
   Tag as ATag,
@@ -163,6 +161,7 @@ onBeforeUnmount(() => {
   >
     <div class="page-heading">
       <div>
+        <div class="page-kicker">系统概览</div>
         <ATypographyTitle :level="3" class="page-title">数据采集平台</ATypographyTitle>
         <ATypographyText type="secondary">实时监控和管理 IoT 设备数据采集</ATypographyText>
       </div>
@@ -184,20 +183,20 @@ onBeforeUnmount(() => {
       :message="errorMessage"
     />
 
-    <ARow :gutter="[16, 16]" class="dashboard-section">
-      <ACol :xs="12" :md="6">
+    <div class="metric-grid dashboard-section">
+      <div>
         <ACard :bordered="false" :loading="initialLoading">
           <AStatistic title="任务总数" :value="overview?.total_tasks ?? 0">
             <template #prefix><DatabaseOutlined /></template>
           </AStatistic>
         </ACard>
-      </ACol>
-      <ACol :xs="12" :md="6">
+      </div>
+      <div>
         <ACard :bordered="false" :loading="initialLoading">
           <AStatistic title="启用任务" :value="overview?.active_tasks ?? 0" />
         </ACard>
-      </ACol>
-      <ACol :xs="12" :md="6">
+      </div>
+      <div>
         <ACard :bordered="false" :loading="initialLoading">
           <AStatistic
             title="运行中会话"
@@ -207,8 +206,8 @@ onBeforeUnmount(() => {
             <template #prefix><PlayCircleOutlined /></template>
           </AStatistic>
         </ACard>
-      </ACol>
-      <ACol :xs="12" :md="6">
+      </div>
+      <div>
         <ACard :bordered="false" :loading="initialLoading">
           <AStatistic
             title="设备在线"
@@ -221,11 +220,11 @@ onBeforeUnmount(() => {
             <template #prefix><ApiOutlined /></template>
           </AStatistic>
         </ACard>
-      </ACol>
-    </ARow>
+      </div>
+    </div>
 
-    <ARow :gutter="[16, 16]" class="dashboard-section">
-      <ACol :xs="24" :lg="12">
+    <div class="content-grid dashboard-section">
+      <div>
         <ACard :bordered="false" title="任务列表">
           <template #extra>
             <RouterLink to="/acquisition">采集控制 <RightOutlined /></RouterLink>
@@ -258,9 +257,9 @@ onBeforeUnmount(() => {
             </template>
           </ATable>
         </ACard>
-      </ACol>
+      </div>
 
-      <ACol :xs="24" :lg="12">
+      <div>
         <ACard :bordered="false" title="最近运行">
           <AEmpty
             v-if="!initialLoading && !overview?.recent_runs.length"
@@ -295,23 +294,26 @@ onBeforeUnmount(() => {
             </template>
           </ATable>
         </ACard>
-      </ACol>
-    </ARow>
+      </div>
+    </div>
 
     <ACard :bordered="false" title="快速操作">
-      <ARow :gutter="[16, 16]">
-        <ACol v-for="action in quickActions" :key="action.to" :xs="12" :md="8" :lg="4">
-          <RouterLink :to="action.to" class="quick-action-link">
-            <ACard size="small" hoverable class="quick-action-card">
-              <component :is="action.icon" class="quick-action-icon" />
-              <div class="quick-action-title">{{ action.title }}</div>
-              <ATypographyText type="secondary" class="table-note">
-                {{ action.description }}
-              </ATypographyText>
-            </ACard>
-          </RouterLink>
-        </ACol>
-      </ARow>
+      <div class="quick-action-grid">
+        <RouterLink
+          v-for="action in quickActions"
+          :key="action.to"
+          :to="action.to"
+          class="quick-action-link"
+        >
+          <ACard size="small" hoverable class="quick-action-card">
+            <component :is="action.icon" class="quick-action-icon" />
+            <div class="quick-action-title">{{ action.title }}</div>
+            <ATypographyText type="secondary" class="table-note">
+              {{ action.description }}
+            </ATypographyText>
+          </ACard>
+        </RouterLink>
+      </div>
     </ACard>
   </div>
 </template>
@@ -333,6 +335,14 @@ onBeforeUnmount(() => {
   margin: 0;
 }
 
+.page-kicker {
+  margin-bottom: 2px;
+  color: #6e7781;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
 .dashboard-alert,
 .dashboard-section {
   margin-bottom: 16px;
@@ -340,6 +350,25 @@ onBeforeUnmount(() => {
 
 .table-note {
   font-size: 12px;
+}
+
+.metric-grid,
+.content-grid,
+.quick-action-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.metric-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.content-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.quick-action-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
 .quick-action-link {
@@ -364,6 +393,27 @@ onBeforeUnmount(() => {
   .page-heading {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .metric-grid,
+  .quick-action-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 577px) and (max-width: 991px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .quick-action-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 991px) {
+  .content-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>

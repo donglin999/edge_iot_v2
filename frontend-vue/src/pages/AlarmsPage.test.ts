@@ -84,27 +84,6 @@ function deferred<T>(): {
   return { promise, resolve };
 }
 
-beforeAll(() => {
-  const nativeGetComputedStyle = window.getComputedStyle.bind(window);
-  Object.defineProperty(window, 'getComputedStyle', {
-    configurable: true,
-    value: (element: Element) => nativeGetComputedStyle(element),
-  });
-  Object.defineProperty(window, 'matchMedia', {
-    configurable: true,
-    value: vi.fn().mockImplementation((query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-      addListener: vi.fn(),
-      removeListener: vi.fn(),
-      dispatchEvent: vi.fn(),
-    })),
-  });
-});
-
 beforeEach(() => {
   vi.mocked(fetchAlarms).mockResolvedValue(alarmRecords);
   vi.mocked(fetchAlarmRules).mockResolvedValue(alarmRules);
@@ -167,6 +146,19 @@ describe('AlarmsPage', () => {
       await screen.findByText('告警数据加载失败：network down'),
     ).toBeInTheDocument();
     expect(screen.getByTestId('alarms-page')).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('renders explicit alarm and rule empty states', async () => {
+    vi.mocked(fetchAlarms).mockResolvedValueOnce([]);
+    vi.mocked(fetchAlarmRules).mockResolvedValueOnce([]);
+
+    render(TestHost);
+
+    expect(await screen.findByText('无告警')).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('tab', { name: '阈值规则 (0)' }));
+    expect(
+      await screen.findByText('尚未创建任何规则，点击右上「新建规则」开始'),
+    ).toBeInTheDocument();
   });
 
   it('creates a rule from the rules tab with the complete writable payload', async () => {

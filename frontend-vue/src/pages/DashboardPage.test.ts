@@ -23,22 +23,6 @@ const RouterLinkStub = defineComponent({
   template: '<a :href="to"><slot /></a>',
 });
 
-beforeAll(() => {
-  Object.defineProperty(window, 'matchMedia', {
-    configurable: true,
-    value: vi.fn().mockImplementation((query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-      addListener: vi.fn(),
-      removeListener: vi.fn(),
-      dispatchEvent: vi.fn(),
-    })),
-  });
-});
-
 const overview = {
   total_tasks: 4,
   active_tasks: 3,
@@ -129,6 +113,27 @@ describe('DashboardPage', () => {
     expect(await screen.findByText('部分数据加载失败：设备')).toBeInTheDocument();
     expect(screen.getAllByText('task-a')).toHaveLength(2);
     expect(screen.getByTestId('dashboard-page')).toHaveTextContent('设备在线0/ 0');
+  });
+
+  it('renders explicit task and run empty states', async () => {
+    vi.mocked(fetchDashboardOverview).mockResolvedValueOnce({
+      ...overview,
+      total_tasks: 0,
+      active_tasks: 0,
+      recent_runs: [],
+    });
+    vi.mocked(fetchDashboardTasks).mockResolvedValueOnce([]);
+    vi.mocked(fetchDashboardDevices).mockResolvedValueOnce([]);
+    vi.mocked(fetchDashboardActiveSessions).mockResolvedValueOnce([]);
+
+    renderPage();
+
+    expect(
+      await screen.findByText('暂无任务 —— 导入配置或在采集控制页新建'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('暂无运行记录 —— 启动采集任务后在此显示'),
+    ).toBeInTheDocument();
   });
 
   it('refreshes every dashboard source on demand', async () => {
