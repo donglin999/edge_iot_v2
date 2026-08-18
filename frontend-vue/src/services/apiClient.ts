@@ -40,7 +40,13 @@ export function formatApiError(error: AxiosError): string {
 
 export function reportApiError(error: AxiosError): AxiosError {
   if (!axios.isCancel(error) && !(error.config as SilentRequestConfig | undefined)?.silent) {
-    errorNotifier?.(formatApiError(error));
+    try {
+      errorNotifier?.(formatApiError(error));
+    } catch (notificationError) {
+      // UI notification is best-effort. It must never replace the Axios error
+      // that callers use for their own retry or validation handling.
+      console.error('Failed to display API error notification:', notificationError);
+    }
   }
   return error;
 }

@@ -69,6 +69,17 @@ describe('API error formatting and notification', () => {
     reportApiError(cancellation);
     expect(notify).not.toHaveBeenCalled();
   });
+
+  it('never lets a broken UI notifier mask the original Axios error', () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    setApiErrorNotifier(() => {
+      throw new Error('notification layer unavailable');
+    });
+    const original = errorWithResponse(503, { detail: 'backend unavailable' });
+
+    expect(reportApiError(original)).toBe(original);
+    expect(consoleSpy).toHaveBeenCalledOnce();
+  });
 });
 
 describe('buildWebSocketUrl', () => {
