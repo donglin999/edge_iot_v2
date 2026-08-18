@@ -31,6 +31,7 @@ dind_tls = load_module("m0_dind_tls", "dind_tls.py")
 archive = load_module("m0_image_archive", "image_archive.py")
 smoke = load_module("m0_stack_smoke", "stack_smoke.py")
 celery_smoke = load_module("m0_celery_smoke", "celery_smoke.py")
+influx_value_check = load_module("m0_influx_value_check", "influx_value_check.py")
 
 
 class SafetyTests(unittest.TestCase):
@@ -210,6 +211,50 @@ class SafetyTests(unittest.TestCase):
                 safety.validate_recovery_tool_dockerfile(str(candidate)),
                 candidate.resolve(),
             )
+
+
+class InfluxKnownValueTests(unittest.TestCase):
+    def test_accepts_one_equivalent_numeric_value(self):
+        samples = (
+            "#datatype,string,long,double\n,result,table,_value\n,,0,42.5\n",
+            "#datatype,string,long,double\r\n,result,table,_value\r\n,,0,4.25e1\r\n",
+            '#datatype,string,long,double\n,result,table,_value\n,,0,"42.500"\n',
+        )
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "query.csv"
+            for raw_csv in samples:
+                with self.subTest(raw_csv=raw_csv):
+                    path.write_bytes(raw_csv.encode("utf-8"))
+                    report = influx_value_check.verify_known_value(str(path), "42.5")
+                    self.assertEqual(report["numeric_row_count"], 1)
+
+    def test_rejects_missing_wrong_duplicate_and_nonfinite_values(self):
+        samples = (
+            "#datatype,string,long,double\n,result,table,_value\n",
+            "#datatype,string,long,double\n,result,table,_value\n,,0,41.5\n",
+            "#datatype,string,long,double\n,result,table,_value\n,,0,42.5\n,,0,42.5\n",
+            "#datatype,string,long,double\n,result,table,_value\n,,0,NaN\n",
+        )
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "query.csv"
+            for raw_csv in samples:
+                with self.subTest(raw_csv=raw_csv):
+                    path.write_text(raw_csv, encoding="utf-8")
+                    with self.assertRaises(influx_value_check.ValueCheckError):
+                        influx_value_check.verify_known_value(str(path), "42.5")
+
+    def test_rejects_symlinked_query_result(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            target = root / "target.csv"
+            target.write_text(
+                "#datatype,string,long,double\n,result,table,_value\n,,0,42.5\n",
+                encoding="utf-8",
+            )
+            link = root / "query.csv"
+            link.symlink_to(target)
+            with self.assertRaises(influx_value_check.ValueCheckError):
+                influx_value_check.verify_known_value(str(link), "42.5")
 
 
 class EvidenceIOTests(unittest.TestCase):

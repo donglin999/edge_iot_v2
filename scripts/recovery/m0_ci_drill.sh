@@ -290,10 +290,9 @@ flux_query='from(bucket: "m0-restored") |> range(start: time(v: 0)) |> filter(fn
 run_evidence influx-known-value.csv \
   "${compose[@]}" --profile tools run --rm --no-deps -T recovery-tool \
   influx query --host http://influx:8086 --org m0-ci --raw "$flux_query"
-grep -Eq '(^|,)42\.5(,|$)' "$EVIDENCE_ROOT/influx-known-value.csv" || {
-  echo "ERROR: restored Influx bucket does not contain the known value" >&2
-  exit 2
-}
+run_evidence influx-known-value-report.json \
+  python3 "$SCRIPT_DIR/influx_value_check.py" \
+  --path "$EVIDENCE_ROOT/influx-known-value.csv" --expected 42.5
 
 run_evidence image-save-report.json python3 "$SCRIPT_DIR/image_archive.py" save \
   --path "$EVIDENCE_ROOT/rollback-images.tar" \
@@ -444,6 +443,7 @@ required = (
     "influx-backup-report.json",
     "influx-verify-report.json",
     "influx-restore-report.json",
+    "influx-known-value-report.json",
     "image-save-report.json",
     "image-load-report.json",
     "stack-smoke-report.json",

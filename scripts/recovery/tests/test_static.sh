@@ -15,6 +15,7 @@ python3 -m py_compile \
   "$RECOVERY_DIR/dind_tls.py" \
   "$RECOVERY_DIR/evidence_io.py" \
   "$RECOVERY_DIR/image_archive.py" \
+  "$RECOVERY_DIR/influx_value_check.py" \
   "$RECOVERY_DIR/stack_smoke.py" \
   "$RECOVERY_DIR/seed_fixture.py"
 python3 -m unittest discover -s "$SCRIPT_DIR" -p 'test_*.py' -v
